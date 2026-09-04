@@ -1,4 +1,3 @@
-//update only
 {
   "$schema": "node_modules/wrangler/config-schema.json",
 
@@ -10,5 +9,13 @@
 
   "observability": {
     "enabled": true
-  }
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "top-signal-db",
+      "database_id": "8520ce9d-6685-4128-9bbc-2064aecb8fca"
+    }
+  ]
 }
