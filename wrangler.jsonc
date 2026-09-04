@@ -17,5 +17,12 @@
       "database_name": "top-signal-db",
       "database_id": "8520ce9d-6685-4128-9bbc-2064aecb8fca"
     }
+  ],
+
+  "services": [
+    {
+      "binding": "MATCHER",
+      "service": "cloudbet-match-matcher"
+    }
   ]
 }
