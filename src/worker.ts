@@ -83,7 +83,206 @@ export default {
     // ========================================================
     // RECEIVE ODDS
     // ========================================================
+// ========================================================
+// RECEIVE HUNTER SIGNAL METADATA
+// ========================================================
 
+if (
+  url.pathname === "/api/signal" &&
+  request.method === "POST"
+) {
+
+  try {
+
+    const body =
+      await request.json<any>();
+
+    const eventId =
+      String(
+        body?.eventId ?? ""
+      ).trim();
+
+    const matchName =
+      String(
+        body?.matchName ?? ""
+      ).trim();
+
+    const minute =
+      Number(
+        body?.minute
+      );
+
+    const score =
+      String(
+        body?.score ?? "0:0"
+      ).trim();
+
+    const hunterScore =
+      Number(
+        body?.hunterScore
+      );
+
+    if (!eventId) {
+
+      return json({
+        success: false,
+        error: "MISSING_EVENT_ID"
+      }, 400);
+    }
+
+    const now =
+      new Date().toISOString();
+
+
+    // ====================================================
+    // UPSERT METADATA
+    // ====================================================
+
+    await env.DB
+      .prepare(`
+        INSERT INTO live_odds (
+          event_id,
+
+          match_name,
+          minute,
+          score,
+          hunter_score,
+
+          market,
+          selection,
+
+          over_odds,
+          under_odds,
+
+          source,
+
+          created_at,
+          updated_at
+        )
+
+        VALUES (
+          ?1,
+
+          ?2,
+          ?3,
+          ?4,
+          ?5,
+
+          '1H Total Goals',
+          'Over 0.5',
+
+          NULL,
+          NULL,
+
+          'HUNTER',
+
+          ?6,
+          ?6
+        )
+
+        ON CONFLICT(event_id)
+        DO UPDATE SET
+
+          match_name =
+            excluded.match_name,
+
+          minute =
+            excluded.minute,
+
+          score =
+            excluded.score,
+
+          hunter_score =
+            excluded.hunter_score,
+
+          updated_at =
+            excluded.updated_at
+      `)
+
+      .bind(
+        eventId,
+
+        matchName || null,
+
+        Number.isFinite(minute)
+          ? minute
+          : null,
+
+        score || null,
+
+        Number.isFinite(hunterScore)
+          ? hunterScore
+          : null,
+
+        now
+      )
+
+      .run();
+
+
+    // ====================================================
+    // READ COMPLETE RECORD
+    // ====================================================
+
+    const saved =
+      await env.DB
+        .prepare(`
+          SELECT
+            event_id,
+
+            match_name,
+            minute,
+            score,
+            hunter_score,
+
+            market,
+            selection,
+
+            over_odds,
+            under_odds,
+
+            source,
+
+            created_at,
+            updated_at
+
+          FROM live_odds
+
+          WHERE event_id = ?1
+
+          LIMIT 1
+        `)
+
+        .bind(
+          eventId
+        )
+
+        .first();
+
+
+    return json({
+      success: true,
+      action: "SIGNAL_SAVED",
+      data: saved
+    });
+
+
+  } catch (error: any) {
+
+    console.error(
+      "POST /api/signal",
+      error
+    );
+
+    return json({
+      success: false,
+
+      error:
+        error?.message ??
+        String(error)
+    }, 500);
+  }
+}
     if (
       url.pathname === "/api/odds" &&
       request.method === "POST"
