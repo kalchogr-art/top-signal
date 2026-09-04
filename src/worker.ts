@@ -1,52 +1,21 @@
 // ============================================================
-// TOP SIGNAL
-// V1.6 — MATCHER TARGET BRIDGE
+// TOP SIGNAL V1.7
+// TRACKER -> MATCHER -> EVENT ID -> FRONTEND ODDS -> D1
 //
-// D1 PERSISTENT
-// HUNTER + MATCHER + CLOUDBET FRONTEND ODDS
 // READ ONLY
-//
-// FLOW:
-//
-// MATCHER /match
-//   -> hunter_results
-//   -> secure_match only
-//   -> Cloudbet eventId
-//   -> D1
-//
-// Violentmonkey
-//   -> Cloudbet frontend
-//   -> REAL 1H O0.5 odds
-//   -> POST /api/odds
-//
-// NO BETTING
+// REAL BETTING DISABLED
 // ============================================================
 
+const VERSION = "V1.7";
 const APP_NAME = "top-signal";
-const VERSION = "V1.6";
+
+type Obj = Record<string, any>;
 
 interface Env {
   DB: D1Database;
+  TRACKER: Fetcher;
   MATCHER: Fetcher;
 }
-
-type AnyObj =
-  Record<string, any>;
-
-type OddsPayload = {
-  eventId?: string;
-  overOdds?: number;
-  underOdds?: number;
-  source?: string;
-};
-
-type SignalPayload = {
-  eventId?: string;
-  matchName?: string;
-  minute?: number;
-  score?: string;
-  hunterScore?: number;
-};
 
 
 // ============================================================
@@ -76,8 +45,7 @@ export default {
         null,
         {
           status: 204,
-          headers:
-            corsHeaders()
+          headers: corsHeaders()
         }
       );
     }
@@ -88,110 +56,128 @@ export default {
     // ========================================================
 
     if (
-      url.pathname === "/api/status" &&
-      request.method === "GET"
+      url.pathname === "/api/status"
     ) {
 
       return json({
         success: true,
+        worker: APP_NAME,
+        version: VERSION,
 
-        worker:
-          APP_NAME,
+        mode: "READ_ONLY",
+        betting: "DISABLED",
 
-        version:
-          VERSION,
-
-        mode:
-          "READ_ONLY",
-
-        status:
-          "ONLINE",
-
-        betting:
-          "DISABLED",
-
-        storage:
-          "D1",
-
-        database:
-          "top-signal-db",
+        storage: "D1",
 
         bindings: {
-          DB:
-            !!env.DB,
-
-          MATCHER:
-            !!env.MATCHER
+          DB: !!env.DB,
+          TRACKER: !!env.TRACKER,
+          MATCHER: !!env.MATCHER
         },
 
-        endpoints: {
-          status:
-            "GET /api/status",
-
-          target:
-            "GET /api/target",
-
-          targets:
-            "GET /api/targets",
-
-          sync:
-            "GET /api/sync",
-
-          odds_post:
-            "POST /api/odds",
-
-          odds_get:
-            "GET /api/odds",
-
-          signal_post:
-            "POST /api/signal"
-        }
+        flow:
+          "TRACKER /entries -> MATCHER /match?signals= -> CLOUDBET FRONTEND READER -> D1"
       });
     }
 
 
     // ========================================================
-    // SYNC MATCHER -> D1
-    //
-    // Reads ALL secure Hunter targets.
-    // Saves every secure target.
+    // DEBUG TRACKER
     // ========================================================
 
     if (
-      url.pathname === "/api/sync" &&
-      request.method === "GET"
+      url.pathname === "/api/debug/tracker"
     ) {
 
       try {
 
-        const result =
-          await syncMatcherTargets(
-            env
+        const data =
+          await fetchServiceJSON(
+            env.TRACKER,
+            "/entries"
           );
 
+        const signals =
+          extractHunterSignals(
+            data
+          );
 
         return json({
           success: true,
-          action:
-            "MATCHER_SYNC",
 
-          ...result
+          raw_type:
+            Array.isArray(data)
+              ? "ARRAY"
+              : typeof data,
+
+          signals_found:
+            signals.length,
+
+          signals
         });
 
-
-      } catch (
-        error: any
-      ) {
-
-        console.error(
-          "GET /api/sync",
-          error
-        );
-
+      } catch (error: any) {
 
         return json({
           success: false,
+          error:
+            error?.message ??
+            String(error)
+        }, 500);
+      }
+    }
 
+
+    // ========================================================
+    // DEBUG MATCHER
+    // ========================================================
+
+    if (
+      url.pathname === "/api/debug/matcher"
+    ) {
+
+      try {
+
+        const tracker =
+          await fetchServiceJSON(
+            env.TRACKER,
+            "/entries"
+          );
+
+        const signals =
+          extractHunterSignals(
+            tracker
+          );
+
+        const matcher =
+          await callMatcher(
+            env,
+            signals
+          );
+
+        return json({
+          success: true,
+
+          tracker_signals:
+            signals.length,
+
+          matcher_version:
+            matcher?.version ??
+            null,
+
+          matcher_stats:
+            matcher?.stats ??
+            null,
+
+          hunter_results:
+            matcher?.hunter_results ??
+            []
+        });
+
+      } catch (error: any) {
+
+        return json({
+          success: false,
           error:
             error?.message ??
             String(error)
@@ -203,8 +189,7 @@ export default {
     // ========================================================
     // TARGET
     //
-    // Synchronizes Matcher first,
-    // then returns ONE primary secure target.
+    // This is the endpoint that the browser reader will poll.
     // ========================================================
 
     if (
@@ -214,43 +199,32 @@ export default {
 
       try {
 
-        const synced =
-          await syncMatcherTargets(
+        const result =
+          await buildTargets(
             env
           );
 
-
-        const targets =
-          synced.targets;
-
-
-        const primary =
-          targets.length
-            ? targets[0]
-            : null;
-
+        const target =
+          result.targets[0] ??
+          null;
 
         return json({
           success: true,
 
           found:
-            !!primary,
+            !!target,
 
-          target:
-            primary,
+          target,
 
-          total_targets:
-            targets.length,
+          stats: {
+            tracker_signals:
+              result.trackerSignals,
 
-          matcher: {
-            version:
-              synced.matcherVersion,
-
-            hunter_results:
-              synced.hunterResults,
+            matcher_hunter_results:
+              result.matcherHunterResults,
 
             secure_targets:
-              targets.length
+              result.targets.length
           },
 
           timestamp:
@@ -258,25 +232,17 @@ export default {
               .toISOString()
         });
 
-
-      } catch (
-        error: any
-      ) {
+      } catch (error: any) {
 
         console.error(
-          "GET /api/target",
+          "TARGET ERROR",
           error
         );
 
-
         return json({
           success: false,
-
-          found:
-            false,
-
-          target:
-            null,
+          found: false,
+          target: null,
 
           error:
             error?.message ??
@@ -287,9 +253,7 @@ export default {
 
 
     // ========================================================
-    // TARGETS
-    //
-    // Returns ALL secure current Hunter targets.
+    // ALL TARGETS
     // ========================================================
 
     if (
@@ -299,39 +263,31 @@ export default {
 
       try {
 
-        const synced =
-          await syncMatcherTargets(
+        const result =
+          await buildTargets(
             env
           );
-
 
         return json({
           success: true,
 
           count:
-            synced.targets.length,
+            result.targets.length,
+
+          tracker_signals:
+            result.trackerSignals,
+
+          matcher_hunter_results:
+            result.matcherHunterResults,
 
           targets:
-            synced.targets,
-
-          matcher_version:
-            synced.matcherVersion,
-
-          timestamp:
-            new Date()
-              .toISOString()
+            result.targets
         });
 
-
-      } catch (
-        error: any
-      ) {
+      } catch (error: any) {
 
         return json({
           success: false,
-
-          count: 0,
-
           targets: [],
 
           error:
@@ -343,7 +299,9 @@ export default {
 
 
     // ========================================================
-    // RECEIVE REAL CLOUDBET FRONTEND ODDS
+    // FRONTEND ODDS POST
+    //
+    // Existing Violentmonkey reader sends here.
     // ========================================================
 
     if (
@@ -354,64 +312,42 @@ export default {
       try {
 
         const body =
-          await request
-            .json<OddsPayload>();
-
+          await request.json<Obj>();
 
         const eventId =
-          String(
-            body?.eventId ??
-            ""
-          ).trim();
-
+          safe(
+            body?.eventId
+          );
 
         const overOdds =
-          Number(
+          numberOrNull(
             body?.overOdds
           );
 
-
         const underOdds =
-          Number(
+          numberOrNull(
             body?.underOdds
           );
 
 
         if (
           !eventId ||
-          !Number.isFinite(
-            overOdds
-          ) ||
+          overOdds === null ||
           overOdds <= 1
         ) {
 
           return json({
             success: false,
-
             error:
               "INVALID_ODDS_PAYLOAD"
           }, 400);
         }
 
 
-        const source =
-          String(
-            body?.source ??
-            "CLOUDBET_FRONTEND"
-          );
-
-
         const now =
           new Date()
             .toISOString();
 
-
-        // ====================================================
-        // ODDS UPSERT
-        //
-        // IMPORTANT:
-        // Existing Hunter metadata is preserved.
-        // ====================================================
 
         await env.DB
           .prepare(`
@@ -449,10 +385,10 @@ export default {
               ?2,
               ?3,
 
-              ?4,
+              'CLOUDBET_FRONTEND',
 
-              ?5,
-              ?5
+              ?4,
+              ?4
             )
 
             ON CONFLICT(event_id)
@@ -470,25 +406,16 @@ export default {
 
           .bind(
             eventId,
-
             overOdds,
-
-            Number.isFinite(
-              underOdds
-            )
-              ? underOdds
-              : null,
-
-            source,
-
+            underOdds,
             now
           )
 
           .run();
 
 
-        const saved =
-          await getEventRow(
+        const stored =
+          await getStoredEvent(
             env,
             eventId
           );
@@ -496,24 +423,11 @@ export default {
 
         return json({
           success: true,
-
-          action:
-            "ODDS_SAVED",
-
-          data:
-            saved
+          action: "ODDS_SAVED",
+          data: stored
         });
 
-
-      } catch (
-        error: any
-      ) {
-
-        console.error(
-          "POST /api/odds",
-          error
-        );
-
+      } catch (error: any) {
 
         return json({
           success: false,
@@ -527,119 +441,7 @@ export default {
 
 
     // ========================================================
-    // MANUAL SIGNAL INGEST
-    //
-    // Kept for diagnostics / fallback.
-    // ========================================================
-
-    if (
-      url.pathname === "/api/signal" &&
-      request.method === "POST"
-    ) {
-
-      try {
-
-        const body =
-          await request
-            .json<SignalPayload>();
-
-
-        const eventId =
-          String(
-            body?.eventId ??
-            ""
-          ).trim();
-
-
-        if (!eventId) {
-
-          return json({
-            success: false,
-            error:
-              "MISSING_EVENT_ID"
-          }, 400);
-        }
-
-
-        const matchName =
-          String(
-            body?.matchName ??
-            ""
-          ).trim();
-
-
-        const minute =
-          numberOrNull(
-            body?.minute
-          );
-
-
-        const score =
-          String(
-            body?.score ??
-            "0:0"
-          ).trim();
-
-
-        const hunterScore =
-          numberOrNull(
-            body?.hunterScore
-          );
-
-
-        await saveHunterTarget(
-          env,
-          {
-            eventId,
-            matchName,
-            minute,
-            score,
-            hunterScore,
-            cloudbetMatch:
-              null,
-            cloudbetMinute:
-              null,
-            cloudbetScore:
-              null
-          }
-        );
-
-
-        const saved =
-          await getEventRow(
-            env,
-            eventId
-          );
-
-
-        return json({
-          success: true,
-
-          action:
-            "SIGNAL_SAVED",
-
-          data:
-            saved
-        });
-
-
-      } catch (
-        error: any
-      ) {
-
-        return json({
-          success: false,
-
-          error:
-            error?.message ??
-            String(error)
-        }, 500);
-      }
-    }
-
-
-    // ========================================================
-    // READ LATEST RECORD
+    // LATEST STORED RECORD
     // ========================================================
 
     if (
@@ -649,26 +451,10 @@ export default {
 
       try {
 
-        const latest =
+        const row =
           await env.DB
             .prepare(`
-              SELECT
-                event_id,
-                match_name,
-                minute,
-                score,
-                hunter_score,
-
-                market,
-                selection,
-
-                over_odds,
-                under_odds,
-
-                source,
-
-                created_at,
-                updated_at
+              SELECT *
 
               FROM live_odds
 
@@ -677,75 +463,14 @@ export default {
 
               LIMIT 1
             `)
-
             .first();
 
-
         return json({
           success: true,
-
-          data:
-            latest ??
-            null
+          data: row ?? null
         });
 
-
-      } catch (
-        error: any
-      ) {
-
-        return json({
-          success: false,
-
-          error:
-            error?.message ??
-            String(error)
-        }, 500);
-      }
-    }
-
-
-    // ========================================================
-    // READ SPECIFIC EVENT
-    // ========================================================
-
-    if (
-      url.pathname.startsWith(
-        "/api/odds/"
-      ) &&
-      request.method === "GET"
-    ) {
-
-      try {
-
-        const eventId =
-          decodeURIComponent(
-            url.pathname.replace(
-              "/api/odds/",
-              ""
-            )
-          );
-
-
-        const row =
-          await getEventRow(
-            env,
-            eventId
-          );
-
-
-        return json({
-          success: true,
-
-          data:
-            row ??
-            null
-        });
-
-
-      } catch (
-        error: any
-      ) {
+      } catch (error: any) {
 
         return json({
           success: false,
@@ -765,8 +490,6 @@ export default {
     return new Response(
       renderHtml(),
       {
-        status: 200,
-
         headers: {
           "content-type":
             "text/html; charset=UTF-8",
@@ -781,108 +504,114 @@ export default {
 
 
 // ============================================================
-// MATCHER SYNC
+// BUILD TARGETS
 // ============================================================
 
-async function syncMatcherTargets(
+async function buildTargets(
   env: Env
 ): Promise<{
-  matcherVersion: string | null;
-  hunterResults: number;
-  targets: AnyObj[];
+  trackerSignals: number;
+  matcherHunterResults: number;
+  targets: Obj[];
 }> {
 
   // ==========================================================
-  // CALL CURRENT MATCHER
-  //
-  // V7.1 exposes:
-  // /match
-  // /live
-  //
-  // We use /match.
+  // 1. TRACKER
   // ==========================================================
 
-  const response =
-    await env.MATCHER.fetch(
-      new Request(
-        "https://matcher.internal/match",
-        {
-          method:
-            "GET"
-        }
-      )
+  const trackerData =
+    await fetchServiceJSON(
+      env.TRACKER,
+      "/entries"
+    );
+
+
+  const signals =
+    extractHunterSignals(
+      trackerData
     );
 
 
   if (
-    !response.ok
+    signals.length === 0
   ) {
 
-    throw new Error(
-      "MATCHER_HTTP_" +
-      response.status
-    );
+    return {
+      trackerSignals: 0,
+      matcherHunterResults: 0,
+      targets: []
+    };
   }
 
 
-  const data: AnyObj =
-    await response.json();
+  // ==========================================================
+  // 2. MATCHER WITH REAL SIGNALS
+  // ==========================================================
 
-
-  if (
-    data?.success !== true
-  ) {
-
-    throw new Error(
-      "MATCHER_NOT_SUCCESS"
+  const matcherData =
+    await callMatcher(
+      env,
+      signals
     );
-  }
 
 
   const hunterResults =
     Array.isArray(
-      data?.hunter_results
+      matcherData?.hunter_results
     )
-      ? data.hunter_results
+      ? matcherData.hunter_results
       : [];
 
 
   // ==========================================================
-  // SECURE TARGETS ONLY
+  // 3. SECURE MATCHES ONLY
   // ==========================================================
 
-  const secure =
+  const secureResults =
     hunterResults.filter(
-      (item: AnyObj) => {
+      (item: Obj) => {
+
+        const eventId =
+          safe(
+            item?.cloudbet?.id ??
+            item?.cloudbet?.event_id
+          );
+
+        const secure =
+          item?.security
+            ?.secure_match === true;
+
+        const classification =
+          safe(
+            item?.classification
+          );
 
         return (
-          item?.status ===
-            "MATCH" &&
-
-          item?.security
-            ?.secure_match ===
-            true &&
-
-          item?.classification ===
-            "CONFIDENT_MATCH" &&
-
-          item?.cloudbet?.id
+          eventId &&
+          secure &&
+          classification ===
+            "CONFIDENT_MATCH"
         );
       }
     );
 
 
-  const targets:
-    AnyObj[] = [];
+  const targets: Obj[] =
+    [];
 
+
+  // ==========================================================
+  // 4. BUILD + STORE
+  // ==========================================================
 
   for (
-    const item of secure
+    const result
+    of secureResults
   ) {
 
     const target =
       buildTarget(
-        item
+        result
       );
 
 
@@ -893,14 +622,14 @@ async function syncMatcherTargets(
     }
 
 
-    await saveHunterTarget(
+    await saveTarget(
       env,
       target
     );
 
 
     const stored =
-      await getEventRow(
+      await getStoredEvent(
         env,
         target.eventId
       );
@@ -917,6 +646,10 @@ async function syncMatcherTargets(
         stored?.under_odds ??
         null,
 
+      oddsUpdatedAt:
+        stored?.updated_at ??
+        null,
+
       ready:
         stored?.over_odds !==
           null &&
@@ -926,12 +659,33 @@ async function syncMatcherTargets(
   }
 
 
-  return {
-    matcherVersion:
-      data?.version ??
-      null,
+  // ==========================================================
+  // NEWEST / LATEST ENTRY FIRST
+  // ==========================================================
 
-    hunterResults:
+  targets.sort(
+    (a, b) => {
+
+      const ai =
+        Number(
+          a.signalId ?? 0
+        );
+
+      const bi =
+        Number(
+          b.signalId ?? 0
+        );
+
+      return bi - ai;
+    }
+  );
+
+
+  return {
+    trackerSignals:
+      signals.length,
+
+    matcherHunterResults:
       hunterResults.length,
 
     targets
@@ -940,41 +694,316 @@ async function syncMatcherTargets(
 
 
 // ============================================================
-// BUILD TARGET FROM MATCHER V7.1
+// CALL MATCHER WITH ?signals=
+// ============================================================
+
+async function callMatcher(
+  env: Env,
+  signals: Obj[]
+): Promise<Obj> {
+
+  const encoded =
+    encodeURIComponent(
+      JSON.stringify(
+        signals
+      )
+    );
+
+
+  const path =
+    "/match?signals=" +
+    encoded;
+
+
+  return await fetchServiceJSON(
+    env.MATCHER,
+    path
+  );
+}
+
+
+// ============================================================
+// TRACKER SIGNAL EXTRACTION
+// ============================================================
+
+function extractHunterSignals(
+  data: any
+): Obj[] {
+
+  let raw: any[] =
+    [];
+
+
+  if (
+    Array.isArray(data)
+  ) {
+
+    raw = data;
+
+  } else if (
+    Array.isArray(
+      data?.hunter_entries
+    )
+  ) {
+
+    raw =
+      data.hunter_entries;
+
+  } else if (
+    Array.isArray(
+      data?.entries
+    )
+  ) {
+
+    raw =
+      data.entries;
+
+  } else if (
+    Array.isArray(
+      data?.signals
+    )
+  ) {
+
+    raw =
+      data.signals;
+
+  } else if (
+    Array.isArray(
+      data?.data
+    )
+  ) {
+
+    raw =
+      data.data;
+  }
+
+
+  return raw
+    .filter(
+      isHunterEntry
+    )
+    .map(
+      normalizeSignal
+    )
+    .filter(
+      Boolean
+    ) as Obj[];
+}
+
+
+// ============================================================
+// HUNTER FILTER
+// ============================================================
+
+function isHunterEntry(
+  item: Obj
+): boolean {
+
+  const type =
+    safe(
+      item?.type ??
+      item?.signal ??
+      item?.event_type
+    )
+      .toUpperCase();
+
+
+  const action =
+    safe(
+      item?.action
+    )
+      .toUpperCase();
+
+
+  const status =
+    safe(
+      item?.status
+    )
+      .toUpperCase();
+
+
+  if (
+    type === "HUNTER_ENTRY"
+  ) {
+    return true;
+  }
+
+
+  if (
+    action === "ENTRY" &&
+    status === "TRACKING"
+  ) {
+    return true;
+  }
+
+
+  return false;
+}
+
+
+// ============================================================
+// NORMALIZE TRACKER SIGNAL
+// ============================================================
+
+function normalizeSignal(
+  item: Obj
+): Obj | null {
+
+  const matchName =
+    safe(
+      item?.match_name ??
+      item?.match ??
+      item?.name
+    );
+
+
+  const split =
+    splitMatch(
+      matchName
+    );
+
+
+  const home =
+    extractTeamName(
+      item?.home
+    ) ||
+    split.home;
+
+
+  const away =
+    extractTeamName(
+      item?.away
+    ) ||
+    split.away;
+
+
+  if (
+    !matchName &&
+    !home &&
+    !away
+  ) {
+    return null;
+  }
+
+
+  return {
+
+    type:
+      "HUNTER_ENTRY",
+
+    signal:
+      "HUNTER_ENTRY",
+
+    action:
+      "ENTRY",
+
+    status:
+      safe(
+        item?.status
+      ) || "TRACKING",
+
+    id:
+      item?.id ??
+      null,
+
+    match_id:
+      item?.match_id ??
+      null,
+
+    match_name:
+      matchName,
+
+    match:
+      matchName,
+
+    league:
+      item?.league ??
+      null,
+
+    entry_time:
+      item?.entry_time ??
+      null,
+
+    entry_minute:
+      numberOrNull(
+        item?.entry_minute ??
+        item?.minute
+      ),
+
+    hunter_score:
+      numberOrNull(
+        item?.hunter_score ??
+        item?.goal_signal?.score
+      ),
+
+    goal_pressure:
+      numberOrNull(
+        item?.goal_pressure
+      ),
+
+    danger_index:
+      numberOrNull(
+        item?.danger_index
+      ),
+
+    attack_score:
+      numberOrNull(
+        item?.attack_score
+      ),
+
+    score:
+      item?.score ??
+      {
+        home: 0,
+        away: 0
+      },
+
+    home:
+      home || null,
+
+    away:
+      away || null
+  };
+}
+
+
+// ============================================================
+// BUILD TARGET FROM MATCHER
 // ============================================================
 
 function buildTarget(
-  item: AnyObj
-): AnyObj {
+  result: Obj
+): Obj {
 
   const signal =
-    item?.signal ??
+    result?.signal ??
     {};
 
+
   const cloudbet =
-    item?.cloudbet ??
+    result?.cloudbet ??
     {};
 
 
   const eventId =
-    String(
+    safe(
       cloudbet?.id ??
-      ""
-    ).trim();
+      cloudbet?.event_id
+    );
 
 
   const matchName =
-    String(
+    safe(
+      signal?.match_name ??
       signal?.match ??
-      cloudbet?.match ??
-      ""
-    ).trim();
+      cloudbet?.match
+    );
 
 
   const minute =
     numberOrNull(
       signal?.entry_minute ??
-      cloudbet?.minute
+      signal?.minute
     );
 
 
@@ -986,8 +1015,11 @@ function buildTarget(
 
   const score =
     scoreToString(
+      signal?.score
+    ) ||
+    scoreToString(
       cloudbet?.score
-    ) ??
+    ) ||
     "0:0";
 
 
@@ -995,11 +1027,31 @@ function buildTarget(
 
     eventId,
 
-    matchName,
+    signalId:
+      signal?.id ??
+      null,
 
     matchId:
       signal?.match_id ??
       null,
+
+    matchName,
+
+    home:
+      extractTeamName(
+        signal?.home
+      ) ||
+      extractTeamName(
+        cloudbet?.home
+      ),
+
+    away:
+      extractTeamName(
+        signal?.away
+      ) ||
+      extractTeamName(
+        cloudbet?.away
+      ),
 
     minute,
 
@@ -1007,73 +1059,46 @@ function buildTarget(
 
     hunterScore,
 
-    home:
-      signal?.home ??
-      null,
-
-    away:
-      signal?.away ??
-      null,
-
     cloudbetMatch:
-      cloudbet?.match ??
-      null,
+      safe(
+        cloudbet?.match
+      ),
 
     cloudbetHome:
-      cloudbet?.home ??
-      null,
+      extractTeamName(
+        cloudbet?.home
+      ),
 
     cloudbetAway:
-      cloudbet?.away ??
-      null,
-
-    cloudbetMinute:
-      numberOrNull(
-        cloudbet?.minute
+      extractTeamName(
+        cloudbet?.away
       ),
 
-    cloudbetScore:
-      scoreToString(
-        cloudbet?.score
-      ),
-
-    competition:
-      cloudbet?.competition ??
+    classification:
+      result?.classification ??
       null,
 
-    matcherClassification:
-      item?.classification ??
-      null,
+    secureMatch:
+      result?.security
+        ?.secure_match === true,
 
     matcherScore:
       numberOrNull(
-        item?.matcher_scoring
-          ?.total
-      ),
-
-    secureMatch:
-      item?.security
-        ?.secure_match ===
-        true,
-
-    matchMethod:
-      item?.security
-        ?.match_method ??
-      null
+        result?.scoring?.total ??
+        result?.matcher_scoring?.total ??
+        result?.score
+      )
   };
 }
 
 
 // ============================================================
-// SAVE HUNTER TARGET
-//
-// IMPORTANT:
-// Does NOT delete existing odds.
+// SAVE TARGET TO D1
 // ============================================================
 
-async function saveHunterTarget(
+async function saveTarget(
   env: Env,
-  target: AnyObj
+  target: Obj
 ): Promise<void> {
 
   const now =
@@ -1117,7 +1142,7 @@ async function saveHunterTarget(
         NULL,
         NULL,
 
-        'MATCHER_HUNTER',
+        'TRACKER_MATCHER',
 
         ?6,
         ?6
@@ -1136,10 +1161,7 @@ async function saveHunterTarget(
           excluded.score,
 
         hunter_score =
-          excluded.hunter_score,
-
-        updated_at =
-          excluded.updated_at
+          excluded.hunter_score
     `)
 
     .bind(
@@ -1163,33 +1185,18 @@ async function saveHunterTarget(
 
 
 // ============================================================
-// EVENT ROW
+// READ STORED EVENT
 // ============================================================
 
-async function getEventRow(
+async function getStoredEvent(
   env: Env,
   eventId: string
-): Promise<AnyObj | null> {
+): Promise<Obj | null> {
 
   return await env.DB
     .prepare(`
       SELECT
-        event_id,
-        match_name,
-        minute,
-        score,
-        hunter_score,
-
-        market,
-        selection,
-
-        over_odds,
-        under_odds,
-
-        source,
-
-        created_at,
-        updated_at
+        *
 
       FROM live_odds
 
@@ -1207,20 +1214,192 @@ async function getEventRow(
 
 
 // ============================================================
-// NUMBER
+// SERVICE FETCH
 // ============================================================
 
-function numberOrNull(
+async function fetchServiceJSON(
+  service: Fetcher,
+  path: string
+): Promise<any> {
+
+  const response =
+    await service.fetch(
+      new Request(
+        "https://service" +
+        path,
+        {
+          method: "GET",
+
+          headers: {
+            "accept":
+              "application/json"
+          }
+        }
+      )
+    );
+
+
+  const text =
+    await response.text();
+
+
+  if (
+    !response.ok
+  ) {
+
+    throw new Error(
+      "SERVICE_HTTP_" +
+      response.status +
+      ": " +
+      text.slice(
+        0,
+        300
+      )
+    );
+  }
+
+
+  try {
+
+    return JSON.parse(
+      text
+    );
+
+  } catch {
+
+    throw new Error(
+      "INVALID_SERVICE_JSON: " +
+      text.slice(
+        0,
+        300
+      )
+    );
+  }
+}
+
+
+// ============================================================
+// TEAM
+// ============================================================
+
+function extractTeamName(
   value: any
-): number | null {
+): string {
 
-  const n =
-    Number(value);
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
 
 
-  return Number.isFinite(n)
-    ? n
-    : null;
+  if (
+    typeof value === "string" ||
+    typeof value === "number"
+  ) {
+
+    return safe(value);
+  }
+
+
+  if (
+    typeof value === "object"
+  ) {
+
+    return safe(
+      value?.name ??
+      value?.team_name ??
+      value?.title ??
+      value?.shortName ??
+      value?.short_name
+    );
+  }
+
+
+  return "";
+}
+
+
+// ============================================================
+// MATCH SPLIT
+// ============================================================
+
+function splitMatch(
+  value: any
+): {
+  home: string;
+  away: string;
+} {
+
+  const text =
+    safe(value);
+
+
+  if (!text) {
+
+    return {
+      home: "",
+      away: ""
+    };
+  }
+
+
+  const separators = [
+    " - ",
+    " vs ",
+    " v ",
+    " @ ",
+    " — ",
+    " – ",
+    " : "
+  ];
+
+
+  for (
+    const separator
+    of separators
+  ) {
+
+    const index =
+      text
+        .toLowerCase()
+        .indexOf(
+          separator
+            .toLowerCase()
+        );
+
+
+    if (
+      index >= 0
+    ) {
+
+      return {
+
+        home:
+          text
+            .slice(
+              0,
+              index
+            )
+            .trim(),
+
+        away:
+          text
+            .slice(
+              index +
+              separator.length
+            )
+            .trim()
+      };
+    }
+  }
+
+
+  return {
+    home: "",
+    away: ""
+  };
 }
 
 
@@ -1241,15 +1420,13 @@ function scoreToString(
 
 
   if (
-    typeof value ===
-    "string"
+    typeof value === "string"
   ) {
 
-    const s =
-      value.trim();
-
-    return s ||
-      null;
+    return (
+      value.trim() ||
+      null
+    );
   }
 
 
@@ -1267,14 +1444,14 @@ function scoreToString(
 
 
   if (
-    typeof value ===
-    "object"
+    typeof value === "object"
   ) {
 
     const home =
       value?.home ??
       value?.homeScore ??
       value?.home_score;
+
 
     const away =
       value?.away ??
@@ -1297,6 +1474,53 @@ function scoreToString(
 
 
   return null;
+}
+
+
+// ============================================================
+// BASIC HELPERS
+// ============================================================
+
+function safe(
+  value: any
+): string {
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+
+  return String(
+    value
+  ).trim();
+}
+
+
+function numberOrNull(
+  value: any
+): number | null {
+
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return null;
+  }
+
+
+  const number =
+    Number(value);
+
+
+  return Number.isFinite(
+    number
+  )
+    ? number
+    : null;
 }
 
 
@@ -1324,7 +1548,7 @@ function corsHeaders() {
 // ============================================================
 
 function json(
-  data: unknown,
+  data: any,
   status = 200
 ): Response {
 
@@ -1379,8 +1603,12 @@ function renderHtml(): string {
 
 body {
   margin: 0;
-  background: #0b0e13;
-  color: #ffffff;
+
+  background:
+    #0b0e13;
+
+  color:
+    #ffffff;
 
   font-family:
     Arial,
@@ -1389,107 +1617,139 @@ body {
 }
 
 .app {
-  max-width: 650px;
-  margin: 0 auto;
-  padding: 18px;
+  max-width:
+    650px;
+
+  margin:
+    0 auto;
+
+  padding:
+    18px;
 }
 
 .title {
-  font-size: 26px;
-  font-weight: 900;
+  font-size:
+    26px;
+
+  font-weight:
+    900;
 }
 
 .subtitle {
-  margin-top: 5px;
+  margin-top:
+    5px;
 
-  color: #8d96a5;
+  color:
+    #8d96a5;
 
-  font-size: 12px;
+  font-size:
+    12px;
 }
 
 .card {
-  margin-top: 22px;
+  margin-top:
+    22px;
 
-  background: #151a22;
+  padding:
+    18px;
+
+  background:
+    #151a22;
 
   border:
     1px solid #252c38;
 
-  border-radius: 16px;
-
-  padding: 18px;
+  border-radius:
+    16px;
 }
 
 .match {
-  font-size: 19px;
-  font-weight: 800;
+  font-size:
+    19px;
+
+  font-weight:
+    800;
 }
 
 .meta {
-  margin-top: 9px;
+  display:
+    flex;
 
-  display: flex;
+  flex-wrap:
+    wrap;
 
-  flex-wrap: wrap;
+  gap:
+    7px;
 
-  gap: 7px;
+  margin-top:
+    9px;
 }
 
 .badge {
-  background: #202632;
+  padding:
+    6px 8px;
 
-  border-radius: 8px;
+  background:
+    #202632;
 
-  padding: 6px 8px;
+  border-radius:
+    8px;
 
-  font-size: 12px;
+  color:
+    #c5ccd8;
 
-  color: #c5ccd8;
+  font-size:
+    12px;
 }
 
 .market {
-  margin-top: 20px;
+  margin-top:
+    20px;
 
-  font-size: 11px;
+  color:
+    #8d96a5;
 
-  color: #8d96a5;
+  font-size:
+    11px;
 }
 
 .odds {
-  margin-top: 3px;
+  margin-top:
+    3px;
 
-  font-size: 50px;
+  font-size:
+    50px;
 
-  font-weight: 900;
-}
-
-.under {
-  margin-top: 5px;
-
-  color: #8d96a5;
-
-  font-size: 12px;
+  font-weight:
+    900;
 }
 
 .status {
-  margin-top: 18px;
+  margin-top:
+    18px;
 
-  font-size: 12px;
+  color:
+    #fbbf24;
 
-  color: #fbbf24;
+  font-size:
+    12px;
 }
 
-.updated {
-  margin-top: 6px;
+.small {
+  margin-top:
+    6px;
 
-  font-size: 10px;
+  color:
+    #697281;
 
-  color: #697281;
+  font-size:
+    10px;
 }
 
 </style>
 
 </head>
+
 
 <body>
 
@@ -1500,7 +1760,7 @@ body {
   </div>
 
   <div class="subtitle">
-    V1.6 · MATCHER TARGET BRIDGE · READ ONLY
+    V1.7 · TRACKER → MATCHER → FRONTEND ODDS
   </div>
 
 
@@ -1561,14 +1821,6 @@ body {
 
 
     <div
-      id="under"
-      class="under"
-    >
-      Under: —
-    </div>
-
-
-    <div
       id="status"
       class="status"
     >
@@ -1577,8 +1829,8 @@ body {
 
 
     <div
-      id="updated"
-      class="updated"
+      id="debug"
+      class="small"
     ></div>
 
   </div>
@@ -1588,7 +1840,7 @@ body {
 
 <script>
 
-async function refreshTarget() {
+async function refresh() {
 
   try {
 
@@ -1611,12 +1863,36 @@ async function refreshTarget() {
       result?.target;
 
 
-    if (!target) {
-
+    const status =
       document.getElementById(
         'status'
+      );
+
+
+    if (!target) {
+
+      status.textContent =
+        'NO SECURE HUNTER TARGET';
+
+      status.style.color =
+        '#fbbf24';
+
+
+      document.getElementById(
+        'debug'
       ).textContent =
-        'NO CURRENT HUNTER TARGET';
+        'Tracker: ' +
+        (
+          result?.stats
+            ?.tracker_signals ??
+          0
+        ) +
+        ' · Matcher Hunter: ' +
+        (
+          result?.stats
+            ?.matcher_hunter_results ??
+          0
+        );
 
       return;
     }
@@ -1627,7 +1903,7 @@ async function refreshTarget() {
     ).textContent =
       target.matchName ||
       target.cloudbetMatch ||
-      'Hunter Target';
+      'Hunter target';
 
 
     document.getElementById(
@@ -1676,29 +1952,12 @@ async function refreshTarget() {
         : '@ —';
 
 
-    document.getElementById(
-      'under'
-    ).textContent =
-      target.underOdds !== null
-        ? 'Under: @ ' +
-          Number(
-            target.underOdds
-          ).toFixed(2)
-        : 'Under: —';
-
-
-    const status =
-      document.getElementById(
-        'status'
-      );
-
-
     if (
       target.ready
     ) {
 
       status.textContent =
-        'READY ✅ · HUNTER + MATCHER + REAL ODDS';
+        'READY ✅ · REAL FRONTEND ODDS';
 
       status.style.color =
         '#86efac';
@@ -1706,7 +1965,7 @@ async function refreshTarget() {
     } else {
 
       status.textContent =
-        'HUNTER MATCHED ✅ · WAITING FOR REAL ODDS';
+        'MATCHED ✅ · WAITING FOR FRONTEND ODDS';
 
       status.style.color =
         '#fbbf24';
@@ -1714,28 +1973,32 @@ async function refreshTarget() {
 
 
     document.getElementById(
-      'updated'
+      'debug'
     ).textContent =
-      'Cloudbet event: ' +
-      target.eventId;
+      'Matcher ' +
+      (
+        target.matcherScore ??
+        '—'
+      ) +
+      ' · secure=' +
+      target.secureMatch;
+  }
 
-  } catch (
-    error
-  ) {
+  catch (error) {
 
     document.getElementById(
       'status'
     ).textContent =
-      'MATCHER CONNECTION ERROR';
+      'CONNECTION ERROR';
   }
 }
 
 
-refreshTarget();
+refresh();
 
 
 setInterval(
-  refreshTarget,
+  refresh,
   3000
 );
 
@@ -1743,4 +2006,4 @@ setInterval(
 
 </body>
 </html>`;
-          }
+}
