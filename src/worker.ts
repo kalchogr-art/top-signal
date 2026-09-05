@@ -18,7 +18,7 @@
 // - browser/Monkey logic is unchanged
 // ============================================================
 
-const VERSION = "V2.0.1 DAILY LOG + ANTI-OVERLAP";
+const VERSION = "V2.0.2 CPU SAFE";
 const APP_NAME = "top-signal";
 const TIME_ZONE = "Europe/Sofia";
 
@@ -29,6 +29,8 @@ interface Env {
   TRACKER: Fetcher;
   MATCHER: Fetcher;
 }
+
+let tablesReady: Promise<void> | null = null;
 
 
 // ============================================================
@@ -47,8 +49,13 @@ export default {
     }
 
     try {
-      await ensureTables(env);
+      if (!tablesReady) {
+        tablesReady = ensureTables(env);
+      }
+
+      await tablesReady;
     } catch (error: any) {
+      tablesReady = null;
       return json({
         success: false,
         worker: APP_NAME,
@@ -489,9 +496,6 @@ async function buildTargets(env: Env) {
   const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
   const signals = extractHunterSignals(tracker);
 
-  // Keep daily results in sync using the same Tracker response.
-  await syncDailyFromTrackerData(env, tracker);
-
   if (!signals.length) {
     return {
       trackerSignals: 0,
@@ -720,111 +724,212 @@ async function callMatcher(env: Env, signals: Obj[]) {
 // ============================================================
 
 function extractHunterSignals(data: any): Obj[] {
+  let raw: any[] = [];
+
+  if (Array.isArray(data)) {
+    raw = data;
+  } else if (Array.isArray(data?.signals)) {
+    raw = data.signals;
+  } else if (Array.isArray(data?.entries)) {
+    raw = data.entries;
+  } else if (Array.isArray(data?.hunter_entries)) {
+    raw = data.hunter_entries;
+  } else if (Array.isArray(data?.data)) {
+    raw = data.data;
+  }
+
   const out: Obj[] = [];
   const seen = new Set<string>();
 
-  const walk = (value: any) => {
-    if (!value) return;
-
-    if (Array.isArray(value)) {
-      for (const x of value) walk(x);
-      return;
+  for (const item of raw) {
+    if (!item || typeof item !== "object") {
+      continue;
     }
 
-    if (typeof value !== "object") return;
+    const marker = [
+      item?.type,
+      typeof item?.signal === "string" ? item.signal : "",
+      item?.action
+    ]
+      .map(safe)
+      .join(" ")
+      .toUpperCase();
 
-    if (looksLikeHunterSignal(value)) {
-      const normalized = normalizeHunterSignal(value);
+    const status =
+      safe(item?.status)
+        .toUpperCase();
 
-      if (normalized) {
-        const key =
-          safe(normalized.id) ||
-          safe(normalized.match_id) + "|" +
-          safe(normalized.entry_time) + "|" +
-          safe(normalized.match_name);
+    const isHunter =
+      marker.includes("HUNTER_ENTRY") ||
+      marker.includes("HUNTER") ||
+      (
+        safe(item?.action).toUpperCase() === "ENTRY" &&
+        status === "TRACKING"
+      );
 
-        if (!seen.has(key)) {
-          seen.add(key);
-          out.push(normalized);
-        }
-      }
+    if (!isHunter) {
+      continue;
     }
 
-    for (const child of Object.values(value)) {
-      if (child && typeof child === "object") {
-        walk(child);
-      }
+    const normalized =
+      normalizeHunterSignal(item);
+
+    if (!normalized) {
+      continue;
     }
-  };
 
-  walk(data);
+    const key =
+      safe(normalized.id) ||
+      (
+        safe(normalized.match_id) +
+        "|" +
+        safe(normalized.entry_time) +
+        "|" +
+        safe(normalized.match_name)
+      );
 
-  return out.filter(x =>
-    safe(x.status).toUpperCase() === "TRACKING" ||
-    !safe(x.status)
-  );
-}
+    if (seen.has(key)) {
+      continue;
+    }
 
+    seen.add(key);
+    out.push(normalized);
+  }
 
-function looksLikeHunterSignal(x: Obj): boolean {
-  const marker = [
-    x?.type,
-    x?.signal,
-    x?.action
-  ].map(safe).join(" ").toUpperCase();
-
-  const hasHunterMarker =
-    marker.includes("HUNTER") ||
-    x?.hunter_score !== undefined;
-
-  const hasMatch =
-    !!safe(x?.match_name ?? x?.match) ||
-    !!safe(x?.match_id);
-
-  return hasHunterMarker && hasMatch;
+  return out;
 }
 
 
 function normalizeHunterSignal(x: Obj): Obj | null {
-  const matchName = safe(x?.match_name ?? x?.match);
+  const matchName =
+    safe(
+      x?.match_name ??
+      x?.match
+    );
 
-  let home = safe(x?.home);
-  let away = safe(x?.away);
+  let home =
+    safe(
+      typeof x?.home === "object"
+        ? x?.home?.name
+        : x?.home
+    );
 
-  if ((!home || !away) && matchName) {
-    const parts = matchName.split(/\s+-\s+|\s+v\s+|\s+vs\.?\s+/i);
+  let away =
+    safe(
+      typeof x?.away === "object"
+        ? x?.away?.name
+        : x?.away
+    );
+
+  if (
+    (!home || !away) &&
+    matchName
+  ) {
+    const parts =
+      matchName.split(
+        /\s+-\s+|\s+v\s+|\s+vs\.?\s+/i
+      );
 
     if (parts.length >= 2) {
-      home = home || safe(parts[0]);
-      away = away || safe(parts.slice(1).join(" - "));
+      home =
+        home ||
+        safe(parts[0]);
+
+      away =
+        away ||
+        safe(
+          parts
+            .slice(1)
+            .join(" - ")
+        );
     }
   }
 
-  if (!matchName && (!home || !away)) {
+  if (
+    !matchName &&
+    (!home || !away)
+  ) {
     return null;
   }
 
   return {
-    id: x?.id ?? null,
-    type: "HUNTER_ENTRY",
-    action: safe(x?.action) || "ENTRY",
-    status: safe(x?.status) || "TRACKING",
-    match_id: safe(x?.match_id),
-    match_name: matchName || (home + " - " + away),
-    match: matchName || (home + " - " + away),
-    league: safe(x?.league),
-    entry_time: safe(x?.entry_time ?? x?.created_at),
-    entry_minute: numberOrNull(x?.entry_minute ?? x?.minute),
-    hunter_score: numberOrNull(x?.hunter_score),
-    goal_pressure: numberOrNull(x?.goal_pressure),
-    danger_index: numberOrNull(x?.danger_index),
-    attack_score: numberOrNull(x?.attack_score),
+    id:
+      x?.id ??
+      null,
+
+    type:
+      "HUNTER_ENTRY",
+
+    action:
+      safe(x?.action) ||
+      "ENTRY",
+
+    status:
+      safe(x?.status) ||
+      "TRACKING",
+
+    match_id:
+      safe(x?.match_id),
+
+    match_name:
+      matchName ||
+      (home + " - " + away),
+
+    match:
+      matchName ||
+      (home + " - " + away),
+
+    league:
+      safe(x?.league),
+
+    entry_time:
+      safe(
+        x?.entry_time ??
+        x?.created_at
+      ),
+
+    entry_minute:
+      numberOrNull(
+        x?.entry_minute ??
+        x?.minute
+      ),
+
+    hunter_score:
+      numberOrNull(
+        x?.hunter_score ??
+        x?.goal_signal?.score
+      ),
+
+    goal_pressure:
+      numberOrNull(
+        x?.goal_pressure
+      ),
+
+    danger_index:
+      numberOrNull(
+        x?.danger_index
+      ),
+
+    attack_score:
+      numberOrNull(
+        x?.attack_score
+      ),
+
     home,
     away,
-    score: x?.score ?? {
-      home: numberOrNull(x?.entry_home_score) ?? 0,
-      away: numberOrNull(x?.entry_away_score) ?? 0
-    }
+
+    score:
+      x?.score ?? {
+        home:
+          numberOrNull(
+            x?.entry_home_score
+          ) ?? 0,
+
+        away:
+          numberOrNull(
+            x?.entry_away_score
+          ) ?? 0
+      }
   };
 }
 
@@ -963,42 +1068,58 @@ async function syncDailyFromTrackerData(env: Env, tracker: any) {
 
 
 function extractTrackerRecords(data: any): Obj[] {
+  const candidates: any[][] = [];
+
+  if (Array.isArray(data)) {
+    candidates.push(data);
+  }
+
+  if (Array.isArray(data?.signals)) {
+    candidates.push(data.signals);
+  }
+
+  if (Array.isArray(data?.entries)) {
+    candidates.push(data.entries);
+  }
+
+  if (Array.isArray(data?.hunter_entries)) {
+    candidates.push(data.hunter_entries);
+  }
+
+  if (Array.isArray(data?.data)) {
+    candidates.push(data.data);
+  }
+
   const out: Obj[] = [];
-  const seen = new Set<any>();
+  const seen = new Set<string>();
 
-  const walk = (value: any) => {
-    if (!value || typeof value !== "object") return;
-    if (seen.has(value)) return;
-    seen.add(value);
-
-    if (!Array.isArray(value)) {
-      const hasIdentity =
-        value?.id !== undefined ||
-        value?.match_id !== undefined ||
-        value?.match_name !== undefined ||
-        value?.match !== undefined;
-
-      const hasState =
-        value?.status !== undefined ||
-        value?.result !== undefined ||
-        value?.action !== undefined ||
-        value?.type !== undefined;
-
-      if (hasIdentity && hasState) {
-        out.push(value);
+  for (const arr of candidates) {
+    for (const value of arr) {
+      if (!value || typeof value !== "object") {
+        continue;
       }
-    }
 
-    if (Array.isArray(value)) {
-      for (const x of value) walk(x);
-    } else {
-      for (const x of Object.values(value)) {
-        if (x && typeof x === "object") walk(x);
+      const key =
+        safe(value?.id) ||
+        (
+          safe(value?.match_id) +
+          "|" +
+          safe(value?.match_name ?? value?.match) +
+          "|" +
+          safe(value?.status) +
+          "|" +
+          safe(value?.result)
+        );
+
+      if (seen.has(key)) {
+        continue;
       }
-    }
-  };
 
-  walk(data);
+      seen.add(key);
+      out.push(value);
+    }
+  }
+
   return out;
 }
 
@@ -1477,7 +1598,7 @@ body{
 
 <div class="title">⚡ TOP SIGNAL MANUAL</div>
 <div class="subtitle">
-V2.0.1 DAILY LOG · ANTI-OVERLAP · TRACKER → MATCHER
+V2.0.2 CPU SAFE · TRACKER → MATCHER
 </div>
 
 <div class="summary">
