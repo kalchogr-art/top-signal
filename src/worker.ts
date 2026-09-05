@@ -18,7 +18,7 @@
 // - browser/Monkey logic is unchanged
 // ============================================================
 
-const VERSION = "V2.0.2 CPU SAFE";
+const VERSION = "V2.0.3 WINDOW.NAME HANDOFF";
 const APP_NAME = "top-signal";
 const TIME_ZONE = "Europe/Sofia";
 
@@ -1598,7 +1598,7 @@ body{
 
 <div class="title">⚡ TOP SIGNAL MANUAL</div>
 <div class="subtitle">
-V2.0.2 CPU SAFE · TRACKER → MATCHER
+V2.0.3 WINDOW.NAME HANDOFF · TRACKER → MATCHER
 </div>
 
 <div class="summary">
@@ -1670,6 +1670,7 @@ function eventUrl(target,action){
   u.searchParams.set('markets-tab','goals');
   u.searchParams.set('ts-action',action);
   u.searchParams.set('ts-event',id);
+  u.searchParams.set('ts-launch',Date.now().toString());
 
   u.hash=
     'ts-action='+encodeURIComponent(action)+
@@ -1681,6 +1682,24 @@ function eventUrl(target,action){
 function go(target,action){
   if(!target?.eventId)return;
   if(action==='bet'&&target?.betPlaced)return;
+
+  const id=String(target.eventId).trim();
+
+  try{
+    window.name=
+      'TOP_SIGNAL::'+
+      JSON.stringify({
+        action,
+        eventId:id,
+        createdAt:Date.now()
+      });
+  }catch(e){
+    console.warn(
+      'TOP SIGNAL window.name save failed',
+      e
+    );
+  }
+
   location.href=eventUrl(target,action);
 }
 
@@ -1982,4 +2001,4 @@ setInterval(
 </script>
 </body>
 </html>`;
-  }
+}
