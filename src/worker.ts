@@ -1,40 +1,54 @@
 // ============================================================
-// TOP SIGNAL V1.9.0 — BET STATUS
+// TOP SIGNAL V2.0.0 — DAILY LOG
 //
 // TRACKER -> MATCHER -> DASHBOARD
 // -> CHECK ODDS / BET NOW
 //
-// NEW V1.9.0:
-// - POST /api/bet-status
-// - D1 table bet_status
-// - exact event_id marked PLACED
-// - dashboard shows ✅ ЗАЛОЖЕНО
-// - BET NOW disabled after confirmed placement
-// - survives refresh/reopen
+// NEW V2.0.0:
+// 1. COMPACT ACTIVE TARGET CARDS
+// 2. DAILY MATCH LOG IN D1
+// 3. COLLAPSED "ДНЕШНИ МАЧОВЕ" TAB
+// 4. PLACED / NOT PLACED
+// 5. GOAL HIT -> WIN
+// 6. NO GOAL -> LOSS
+// 7. DAILY SUMMARY:
+//    ДНЕС
+//    ЗАЛОЖЕНИ
+//    ПЕЧЕЛИ
+//    НЕ ПЕЧЕЛИ
+//    НЕЗАЛОЖЕНИ
+//    УСПЕХ
 //
-// CHECK ODDS:
-// - exact Cloudbet event
-// - frontend reads 1H O0.5 odds
-// - POST /api/odds
-// - returns to dashboard
+// SUCCESS RATE:
+// WIN / (WIN + LOSS) * 100
 //
-// BET NOW:
-// - exact Cloudbet event
-// - selects 1H O0.5
-// - fills 1 USDT
-// - NEVER clicks final Place bet
+// PENDING DOES NOT ENTER SUCCESS RATE.
 //
-// Keeps V1.8.1:
+// Keeps:
+// - D1 live_odds
+// - D1 bet_status
+// - CHECK ODDS
+// - BET NOW handoff
 // - QUERY + HASH handoff
+// - secure CONFIDENT_MATCH only
+// - signal:"HUNTER_ENTRY" matcher fix
 //
-// Keeps V1.7.1 matcher fix:
-// - signal: "HUNTER_ENTRY" is NOT forwarded
+// IMPORTANT:
+// - NO INVALID_SCORE LOGIC IN THIS VERSION
+// - MONKEY LOGIC IS NOT CHANGED
 // ============================================================
 
-const VERSION = "V1.9.0 BET STATUS";
-const APP_NAME = "top-signal";
+const VERSION =
+  "V2.0.0 DAILY LOG";
 
-type Obj = Record<string, any>;
+const APP_NAME =
+  "top-signal";
+
+const TIME_ZONE =
+  "Europe/Sofia";
+
+type Obj =
+  Record<string, any>;
 
 interface Env {
   DB: D1Database;
@@ -55,28 +69,28 @@ export default {
   ): Promise<Response> {
 
     const url =
-      new URL(request.url);
+      new URL(
+        request.url
+      );
 
 
     if (
-      request.method === "OPTIONS"
+      request.method ===
+      "OPTIONS"
     ) {
 
       return new Response(
         null,
         {
           status: 204,
-          headers: corsHeaders()
+          headers:
+            corsHeaders()
         }
       );
     }
 
 
-    // ========================================================
-    // ENSURE BET STATUS TABLE
-    // ========================================================
-
-    await ensureBetStatusTable(
+    await ensureTables(
       env
     );
 
@@ -108,8 +122,11 @@ export default {
         storage:
           "D1",
 
-        bet_tracking:
-          "CONFIRMED_MANUAL_BETS",
+        daily_log:
+          true,
+
+        timezone:
+          TIME_ZONE,
 
         bindings: {
 
@@ -124,7 +141,7 @@ export default {
         },
 
         flow:
-          "TRACKER -> MATCHER -> DASHBOARD -> CLOUDBET FRONTEND -> D1"
+          "TRACKER -> MATCHER -> TOP SIGNAL -> DAILY LOG"
       });
     }
 
@@ -146,8 +163,15 @@ export default {
             "/entries"
           );
 
+
         const signals =
           extractHunterSignals(
+            data
+          );
+
+
+        const allRecords =
+          extractTrackerRecords(
             data
           );
 
@@ -163,7 +187,13 @@ export default {
           signals_found:
             signals.length,
 
-          signals
+          tracker_records:
+            allRecords.length,
+
+          signals,
+
+          records:
+            allRecords
         });
 
       } catch (
@@ -201,10 +231,12 @@ export default {
             "/entries"
           );
 
+
         const signals =
           extractHunterSignals(
             tracker
           );
+
 
         const matcher =
           await callMatcher(
@@ -228,7 +260,8 @@ export default {
             null,
 
           hunter_results:
-            matcher?.hunter_results ??
+            matcher
+              ?.hunter_results ??
             []
         });
 
@@ -268,6 +301,7 @@ export default {
             env
           );
 
+
         const target =
           result.targets[0] ??
           null;
@@ -294,7 +328,8 @@ export default {
 
             placed:
               result.targets.filter(
-                x => x.betPlaced
+                x =>
+                  x.betPlaced
               ).length
           },
 
@@ -367,7 +402,8 @@ export default {
 
           placed:
             result.targets.filter(
-              x => x.betPlaced
+              x =>
+                x.betPlaced
             ).length,
 
           targets:
@@ -383,6 +419,73 @@ export default {
             success: false,
 
             targets: [],
+
+            error:
+              error?.message ??
+              String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // DAILY MATCHES
+    // ========================================================
+
+    if (
+      url.pathname ===
+        "/api/daily" &&
+      request.method ===
+        "GET"
+    ) {
+
+      try {
+
+        // Try to sync latest Tracker result state
+        // before returning daily list.
+        await syncDailyFromTracker(
+          env
+        );
+
+
+        const daily =
+          await getDailyMatches(
+            env
+          );
+
+
+        return json({
+          success: true,
+
+          version:
+            VERSION,
+
+          date:
+            sofiaDate(),
+
+          timezone:
+            TIME_ZONE,
+
+          summary:
+            buildDailySummary(
+              daily
+            ),
+
+          matches:
+            daily
+        });
+
+      } catch (
+        error: any
+      ) {
+
+        return json(
+          {
+            success: false,
+
+            matches: [],
 
             error:
               error?.message ??
@@ -512,6 +615,32 @@ export default {
           .run();
 
 
+        // Also update today's permanent row.
+        await env.DB
+          .prepare(`
+            UPDATE daily_matches
+
+            SET
+              found_odds =
+                ?2,
+
+              updated_at =
+                ?3
+
+            WHERE
+              event_id =
+                ?1
+          `)
+
+          .bind(
+            eventId,
+            overOdds,
+            now
+          )
+
+          .run();
+
+
         const stored =
           await getStoredEvent(
             env,
@@ -563,7 +692,9 @@ export default {
         const eventId =
           safe(
             url.searchParams
-              .get("eventId")
+              .get(
+                "eventId"
+              )
           );
 
 
@@ -593,7 +724,8 @@ export default {
             .prepare(`
               SELECT *
               FROM live_odds
-              ORDER BY updated_at DESC
+              ORDER BY
+                updated_at DESC
               LIMIT 1
             `)
             .first();
@@ -657,7 +789,8 @@ export default {
 
         if (
           !eventId ||
-          status !== "PLACED"
+          status !==
+            "PLACED"
         ) {
 
           return json(
@@ -801,17 +934,53 @@ export default {
             null,
 
             market,
-
             selection,
-
             stake,
-
             odds,
-
             source,
-
             placedAt,
+            now
+          )
 
+          .run();
+
+
+        // Daily row gets PLACED as well.
+        await env.DB
+          .prepare(`
+            UPDATE daily_matches
+
+            SET
+
+              bet_status =
+                'PLACED',
+
+              bet_odds =
+                COALESCE(
+                  ?2,
+                  bet_odds,
+                  found_odds
+                ),
+
+              bet_stake =
+                ?3,
+
+              placed_at =
+                ?4,
+
+              updated_at =
+                ?5
+
+            WHERE
+              event_id =
+                ?1
+          `)
+
+          .bind(
+            eventId,
+            odds,
+            stake,
+            placedAt,
             now
           )
 
@@ -880,7 +1049,9 @@ export default {
         const eventId =
           safe(
             url.searchParams
-              .get("eventId")
+              .get(
+                "eventId"
+              )
           );
 
 
@@ -920,8 +1091,10 @@ export default {
             .prepare(`
               SELECT *
               FROM bet_status
-              WHERE status = 'PLACED'
-              ORDER BY placed_at DESC
+              WHERE
+                status = 'PLACED'
+              ORDER BY
+                placed_at DESC
               LIMIT 100
             `)
             .all();
@@ -980,8 +1153,22 @@ export default {
 
 
 // ============================================================
-// BET STATUS TABLE
+// TABLES
 // ============================================================
+
+async function ensureTables(
+  env: Env
+): Promise<void> {
+
+  await ensureBetStatusTable(
+    env
+  );
+
+  await ensureDailyMatchesTable(
+    env
+  );
+}
+
 
 async function ensureBetStatusTable(
   env: Env
@@ -1018,6 +1205,88 @@ async function ensureBetStatusTable(
 }
 
 
+async function ensureDailyMatchesTable(
+  env: Env
+): Promise<void> {
+
+  await env.DB
+    .prepare(`
+      CREATE TABLE IF NOT EXISTS daily_matches (
+
+        event_id TEXT PRIMARY KEY,
+
+        signal_id TEXT,
+
+        match_id TEXT,
+
+        match_name TEXT NOT NULL,
+
+        entry_minute REAL,
+
+        hunter_score REAL,
+
+        found_odds REAL,
+
+        bet_status TEXT NOT NULL
+          DEFAULT 'NOT_PLACED',
+
+        bet_odds REAL,
+
+        bet_stake REAL,
+
+        tracker_status TEXT
+          DEFAULT 'PENDING',
+
+        tracker_result TEXT
+          DEFAULT 'PENDING',
+
+        result_status TEXT
+          DEFAULT 'PENDING',
+
+        day_key TEXT NOT NULL,
+
+        entry_time TEXT,
+
+        placed_at TEXT,
+
+        first_seen_at TEXT NOT NULL,
+
+        updated_at TEXT NOT NULL,
+
+        finished_at TEXT
+      )
+    `)
+    .run();
+
+
+  await env.DB
+    .prepare(`
+      CREATE INDEX IF NOT EXISTS
+        idx_daily_matches_day
+      ON daily_matches(day_key)
+    `)
+    .run();
+
+
+  await env.DB
+    .prepare(`
+      CREATE INDEX IF NOT EXISTS
+        idx_daily_matches_match_id
+      ON daily_matches(match_id)
+    `)
+    .run();
+
+
+  await env.DB
+    .prepare(`
+      CREATE INDEX IF NOT EXISTS
+        idx_daily_matches_signal_id
+      ON daily_matches(signal_id)
+    `)
+    .run();
+}
+
+
 // ============================================================
 // BUILD TARGETS
 // ============================================================
@@ -1026,11 +1295,14 @@ async function buildTargets(
   env: Env
 ): Promise<{
 
-  trackerSignals: number;
+  trackerSignals:
+    number;
 
-  matcherHunterResults: number;
+  matcherHunterResults:
+    number;
 
-  targets: Obj[];
+  targets:
+    Obj[];
 
 }> {
 
@@ -1041,6 +1313,14 @@ async function buildTargets(
     );
 
 
+  // Update previously stored matches if Tracker
+  // already exposes GOAL HIT / NO GOAL.
+  await syncDailyFromTrackerData(
+    env,
+    trackerData
+  );
+
+
   const signals =
     extractHunterSignals(
       trackerData
@@ -1048,16 +1328,20 @@ async function buildTargets(
 
 
   if (
-    signals.length === 0
+    signals.length ===
+    0
   ) {
 
     return {
 
-      trackerSignals: 0,
+      trackerSignals:
+        0,
 
-      matcherHunterResults: 0,
+      matcherHunterResults:
+        0,
 
-      targets: []
+      targets:
+        []
     };
   }
 
@@ -1080,48 +1364,50 @@ async function buildTargets(
 
 
   const secureResults =
-    hunterResults.filter(
-      (
-        item: Obj
-      ) => {
+    hunterResults
+      .filter(
+        (
+          item: Obj
+        ) => {
 
-        const eventId =
-          safe(
+          const eventId =
+            safe(
+              item
+                ?.cloudbet
+                ?.id ??
+              item
+                ?.cloudbet
+                ?.event_id
+            );
+
+
+          const secure =
             item
-              ?.cloudbet
-              ?.id ??
-            item
-              ?.cloudbet
-              ?.event_id
+              ?.security
+              ?.secure_match ===
+            true;
+
+
+          const classification =
+            safe(
+              item
+                ?.classification
+            );
+
+
+          return (
+            !!eventId &&
+            secure &&
+            classification ===
+              "CONFIDENT_MATCH"
           );
-
-
-        const secure =
-          item
-            ?.security
-            ?.secure_match ===
-          true;
-
-
-        const classification =
-          safe(
-            item
-              ?.classification
-          );
-
-
-        return (
-          !!eventId &&
-          secure &&
-          classification ===
-            "CONFIDENT_MATCH"
-        );
-      }
-    );
+        }
+      );
 
 
   const targets:
-    Obj[] = [];
+    Obj[] =
+    [];
 
 
   for (
@@ -1143,6 +1429,12 @@ async function buildTargets(
 
 
     await saveTarget(
+      env,
+      target
+    );
+
+
+    await saveDailyTarget(
       env,
       target
     );
@@ -1176,6 +1468,19 @@ async function buildTargets(
       "PLACED";
 
 
+    // Keep daily row synchronized with bet_status.
+    if (
+      betPlaced
+    ) {
+
+      await updateDailyPlaced(
+        env,
+        target.eventId,
+        betStatus
+      );
+    }
+
+
     targets.push({
 
       ...target,
@@ -1185,7 +1490,8 @@ async function buildTargets(
 
       underOdds:
         numberOrNull(
-          stored?.under_odds
+          stored
+            ?.under_odds
         ),
 
       oddsUpdatedAt:
@@ -1199,7 +1505,8 @@ async function buildTargets(
         null,
 
       ready:
-        storedOdds !== null,
+        storedOdds !==
+        null,
 
       betPlaced,
 
@@ -1215,12 +1522,14 @@ async function buildTargets(
 
       betStake:
         numberOrNull(
-          betStatus?.stake
+          betStatus
+            ?.stake
         ),
 
       betOdds:
         numberOrNull(
-          betStatus?.odds
+          betStatus
+            ?.odds
         )
     });
   }
@@ -1268,6 +1577,982 @@ async function buildTargets(
 
 
 // ============================================================
+// DAILY TARGET SAVE
+// ============================================================
+
+async function saveDailyTarget(
+  env: Env,
+  target: Obj
+): Promise<void> {
+
+  const now =
+    new Date()
+      .toISOString();
+
+
+  const dayKey =
+    target?.entryTime
+
+      ? sofiaDate(
+          target.entryTime
+        )
+
+      : sofiaDate();
+
+
+  await env.DB
+    .prepare(`
+      INSERT INTO daily_matches (
+
+        event_id,
+        signal_id,
+        match_id,
+        match_name,
+        entry_minute,
+        hunter_score,
+        found_odds,
+        bet_status,
+        tracker_status,
+        tracker_result,
+        result_status,
+        day_key,
+        entry_time,
+        first_seen_at,
+        updated_at
+      )
+
+      VALUES (
+
+        ?1,
+        ?2,
+        ?3,
+        ?4,
+        ?5,
+        ?6,
+        NULL,
+        'NOT_PLACED',
+        'TRACKING',
+        'PENDING',
+        'PENDING',
+        ?7,
+        ?8,
+        ?9,
+        ?9
+      )
+
+      ON CONFLICT(event_id)
+
+      DO UPDATE SET
+
+        signal_id =
+          COALESCE(
+            excluded.signal_id,
+            daily_matches.signal_id
+          ),
+
+        match_id =
+          COALESCE(
+            excluded.match_id,
+            daily_matches.match_id
+          ),
+
+        match_name =
+          COALESCE(
+            excluded.match_name,
+            daily_matches.match_name
+          ),
+
+        entry_minute =
+          COALESCE(
+            excluded.entry_minute,
+            daily_matches.entry_minute
+          ),
+
+        hunter_score =
+          COALESCE(
+            excluded.hunter_score,
+            daily_matches.hunter_score
+          ),
+
+        entry_time =
+          COALESCE(
+            daily_matches.entry_time,
+            excluded.entry_time
+          ),
+
+        tracker_status =
+          CASE
+
+            WHEN
+              daily_matches.result_status
+              IN ('WIN','LOSS')
+
+            THEN
+              daily_matches.tracker_status
+
+            ELSE
+              'TRACKING'
+
+          END,
+
+        updated_at =
+          excluded.updated_at
+    `)
+
+    .bind(
+      target.eventId,
+
+      target.signalId !==
+        null &&
+      target.signalId !==
+        undefined
+
+        ? String(
+            target.signalId
+          )
+
+        : null,
+
+      target.matchId !==
+        null &&
+      target.matchId !==
+        undefined
+
+        ? String(
+            target.matchId
+          )
+
+        : null,
+
+      target.matchName ||
+        target.cloudbetMatch ||
+        "Hunter target",
+
+      target.minute,
+
+      target.hunterScore,
+
+      dayKey,
+
+      target.entryTime ??
+        null,
+
+      now
+    )
+
+    .run();
+}
+
+
+// ============================================================
+// DAILY BET UPDATE
+// ============================================================
+
+async function updateDailyPlaced(
+  env: Env,
+  eventId: string,
+  betStatus: Obj
+): Promise<void> {
+
+  const now =
+    new Date()
+      .toISOString();
+
+
+  await env.DB
+    .prepare(`
+      UPDATE daily_matches
+
+      SET
+
+        bet_status =
+          'PLACED',
+
+        bet_odds =
+          COALESCE(
+            ?2,
+            bet_odds,
+            found_odds
+          ),
+
+        bet_stake =
+          COALESCE(
+            ?3,
+            bet_stake
+          ),
+
+        placed_at =
+          COALESCE(
+            ?4,
+            placed_at
+          ),
+
+        updated_at =
+          ?5
+
+      WHERE
+        event_id =
+          ?1
+    `)
+
+    .bind(
+      eventId,
+
+      numberOrNull(
+        betStatus?.odds
+      ),
+
+      numberOrNull(
+        betStatus?.stake
+      ),
+
+      betStatus
+        ?.placed_at ??
+      null,
+
+      now
+    )
+
+    .run();
+}
+
+
+// ============================================================
+// DAILY TRACKER SYNC
+// ============================================================
+
+async function syncDailyFromTracker(
+  env: Env
+): Promise<void> {
+
+  try {
+
+    const trackerData =
+      await fetchServiceJSON(
+        env.TRACKER,
+        "/entries"
+      );
+
+
+    await syncDailyFromTrackerData(
+      env,
+      trackerData
+    );
+
+  } catch (
+    error
+  ) {
+
+    console.log(
+      "DAILY TRACKER SYNC SKIPPED",
+      error
+    );
+  }
+}
+
+
+async function syncDailyFromTrackerData(
+  env: Env,
+  trackerData: any
+): Promise<void> {
+
+  const records =
+    extractTrackerRecords(
+      trackerData
+    );
+
+
+  if (
+    !records.length
+  ) {
+    return;
+  }
+
+
+  for (
+    const item
+    of records
+  ) {
+
+    const normalized =
+      normalizeTrackerResult(
+        item
+      );
+
+
+    if (
+      !normalized
+    ) {
+      continue;
+    }
+
+
+    const {
+      signalId,
+      matchId,
+      matchName,
+      trackerStatus,
+      trackerResult,
+      resultStatus
+    } =
+      normalized;
+
+
+    // We only finalize when Tracker provides
+    // a clear GOAL / NO GOAL result.
+    if (
+      resultStatus !==
+        "WIN" &&
+      resultStatus !==
+        "LOSS"
+    ) {
+      continue;
+    }
+
+
+    const now =
+      new Date()
+        .toISOString();
+
+
+    // Try strongest key first: signal ID.
+    if (
+      signalId
+    ) {
+
+      const r =
+        await env.DB
+          .prepare(`
+            UPDATE daily_matches
+
+            SET
+
+              tracker_status =
+                ?2,
+
+              tracker_result =
+                ?3,
+
+              result_status =
+                ?4,
+
+              finished_at =
+                COALESCE(
+                  finished_at,
+                  ?5
+                ),
+
+              updated_at =
+                ?5
+
+            WHERE
+              signal_id =
+                ?1
+          `)
+
+          .bind(
+            signalId,
+            trackerStatus,
+            trackerResult,
+            resultStatus,
+            now
+          )
+
+          .run();
+
+
+      if (
+        Number(
+          r.meta
+            ?.changes ??
+          0
+        ) > 0
+      ) {
+        continue;
+      }
+    }
+
+
+    // Then match_id.
+    if (
+      matchId
+    ) {
+
+      const r =
+        await env.DB
+          .prepare(`
+            UPDATE daily_matches
+
+            SET
+
+              tracker_status =
+                ?2,
+
+              tracker_result =
+                ?3,
+
+              result_status =
+                ?4,
+
+              finished_at =
+                COALESCE(
+                  finished_at,
+                  ?5
+                ),
+
+              updated_at =
+                ?5
+
+            WHERE
+              match_id =
+                ?1
+          `)
+
+          .bind(
+            matchId,
+            trackerStatus,
+            trackerResult,
+            resultStatus,
+            now
+          )
+
+          .run();
+
+
+      if (
+        Number(
+          r.meta
+            ?.changes ??
+          0
+        ) > 0
+      ) {
+        continue;
+      }
+    }
+
+
+    // Last fallback: exact match name.
+    if (
+      matchName
+    ) {
+
+      await env.DB
+        .prepare(`
+          UPDATE daily_matches
+
+          SET
+
+            tracker_status =
+              ?2,
+
+            tracker_result =
+              ?3,
+
+            result_status =
+              ?4,
+
+            finished_at =
+              COALESCE(
+                finished_at,
+                ?5
+              ),
+
+            updated_at =
+              ?5
+
+          WHERE
+            match_name =
+              ?1
+        `)
+
+        .bind(
+          matchName,
+          trackerStatus,
+          trackerResult,
+          resultStatus,
+          now
+        )
+
+        .run();
+    }
+  }
+}
+
+
+// ============================================================
+// EXTRACT ALL TRACKER RECORDS
+// ============================================================
+
+function extractTrackerRecords(
+  data: any
+): Obj[] {
+
+  const output:
+    Obj[] =
+    [];
+
+
+  const seen =
+    new Set<any>();
+
+
+  function walk(
+    value: any,
+    depth = 0
+  ) {
+
+    if (
+      value === null ||
+      value === undefined ||
+      depth > 5
+    ) {
+      return;
+    }
+
+
+    if (
+      typeof value !==
+      "object"
+    ) {
+      return;
+    }
+
+
+    if (
+      seen.has(
+        value
+      )
+    ) {
+      return;
+    }
+
+
+    seen.add(
+      value
+    );
+
+
+    if (
+      Array.isArray(
+        value
+      )
+    ) {
+
+      for (
+        const item
+        of value
+      ) {
+
+        walk(
+          item,
+          depth + 1
+        );
+      }
+
+      return;
+    }
+
+
+    const looksLikeRecord =
+      value?.id !==
+        undefined ||
+      value?.match_id !==
+        undefined ||
+      value?.match_name !==
+        undefined ||
+      value?.result !==
+        undefined ||
+      value?.status !==
+        undefined;
+
+
+    if (
+      looksLikeRecord
+    ) {
+
+      const matchName =
+        safe(
+          value
+            ?.match_name ??
+          value
+            ?.match
+        );
+
+
+      if (
+        matchName ||
+        value?.match_id ||
+        value?.id
+      ) {
+
+        output.push(
+          value
+        );
+      }
+    }
+
+
+    for (
+      const v
+      of Object.values(
+        value
+      )
+    ) {
+
+      if (
+        v &&
+        typeof v ===
+          "object"
+      ) {
+
+        walk(
+          v,
+          depth + 1
+        );
+      }
+    }
+  }
+
+
+  walk(
+    data
+  );
+
+
+  return output;
+}
+
+
+// ============================================================
+// TRACKER RESULT NORMALIZATION
+// ============================================================
+
+function normalizeTrackerResult(
+  item: Obj
+): Obj | null {
+
+  const signalId =
+    item?.id !==
+      null &&
+    item?.id !==
+      undefined
+
+      ? String(
+          item.id
+        )
+
+      : "";
+
+
+  const matchId =
+    item?.match_id !==
+      null &&
+    item?.match_id !==
+      undefined
+
+      ? String(
+          item.match_id
+        )
+
+      : "";
+
+
+  const matchName =
+    safe(
+      item
+        ?.match_name ??
+      item
+        ?.match
+    );
+
+
+  if (
+    !signalId &&
+    !matchId &&
+    !matchName
+  ) {
+    return null;
+  }
+
+
+  const status =
+    safe(
+      item?.status
+    )
+      .toUpperCase();
+
+
+  const result =
+    safe(
+      item
+        ?.result ??
+      item
+        ?.result_status ??
+      item
+        ?.outcome
+    )
+      .toUpperCase();
+
+
+  const type =
+    safe(
+      item
+        ?.type ??
+      (
+        typeof item
+          ?.signal ===
+          "string"
+
+          ? item.signal
+          : ""
+      )
+    )
+      .toUpperCase();
+
+
+  const combined =
+    (
+      status +
+      " " +
+      result +
+      " " +
+      type
+    )
+      .trim();
+
+
+  let resultStatus =
+    "PENDING";
+
+
+  if (
+    combined.includes(
+      "NO_GOAL"
+    ) ||
+    combined.includes(
+      "NO GOAL"
+    )
+  ) {
+
+    resultStatus =
+      "LOSS";
+
+  } else if (
+    combined.includes(
+      "GOAL HIT"
+    ) ||
+    combined.includes(
+      "GOAL_HIT"
+    ) ||
+    (
+      combined.includes(
+        "GOAL"
+      ) &&
+      !combined.includes(
+        "NO GOAL"
+      )
+    )
+  ) {
+
+    resultStatus =
+      "WIN";
+  }
+
+
+  return {
+
+    signalId,
+
+    matchId,
+
+    matchName,
+
+    trackerStatus:
+      status ||
+      "UNKNOWN",
+
+    trackerResult:
+      result ||
+      type ||
+      "UNKNOWN",
+
+    resultStatus
+  };
+}
+
+
+// ============================================================
+// DAILY QUERY
+// ============================================================
+
+async function getDailyMatches(
+  env: Env
+): Promise<Obj[]> {
+
+  const day =
+    sofiaDate();
+
+
+  const result =
+    await env.DB
+      .prepare(`
+        SELECT
+
+          event_id,
+          signal_id,
+          match_id,
+          match_name,
+          entry_minute,
+          hunter_score,
+          found_odds,
+          bet_status,
+          bet_odds,
+          bet_stake,
+          tracker_status,
+          tracker_result,
+          result_status,
+          day_key,
+          entry_time,
+          placed_at,
+          first_seen_at,
+          updated_at,
+          finished_at
+
+        FROM daily_matches
+
+        WHERE
+          day_key =
+            ?1
+
+        ORDER BY
+
+          COALESCE(
+            entry_time,
+            first_seen_at
+          ) DESC
+      `)
+
+      .bind(
+        day
+      )
+
+      .all();
+
+
+  return (
+    result.results ??
+    []
+  ) as Obj[];
+}
+
+
+// ============================================================
+// DAILY SUMMARY
+// ============================================================
+
+function buildDailySummary(
+  matches: Obj[]
+): Obj {
+
+  const total =
+    matches.length;
+
+
+  const placedMatches =
+    matches.filter(
+      x =>
+        safe(
+          x?.bet_status
+        )
+          .toUpperCase() ===
+        "PLACED"
+    );
+
+
+  const placed =
+    placedMatches.length;
+
+
+  const notPlaced =
+    total -
+    placed;
+
+
+  // Result counts are intentionally based only
+  // on actually placed bets.
+  const wins =
+    placedMatches.filter(
+      x =>
+        safe(
+          x?.result_status
+        )
+          .toUpperCase() ===
+        "WIN"
+    ).length;
+
+
+  const losses =
+    placedMatches.filter(
+      x =>
+        safe(
+          x?.result_status
+        )
+          .toUpperCase() ===
+        "LOSS"
+    ).length;
+
+
+  const pending =
+    placed -
+    wins -
+    losses;
+
+
+  const settled =
+    wins +
+    losses;
+
+
+  const successRate =
+    settled > 0
+
+      ? Number(
+          (
+            wins /
+            settled *
+            100
+          )
+            .toFixed(
+              1
+            )
+        )
+
+      : null;
+
+
+  return {
+
+    today:
+      total,
+
+    placed,
+
+    wins,
+
+    losses,
+
+    notPlaced,
+
+    pending,
+
+    settled,
+
+    successRate
+  };
+}
+
+
+// ============================================================
 // MATCHER
 // ============================================================
 
@@ -1286,6 +2571,7 @@ async function callMatcher(
 
   return await fetchServiceJSON(
     env.MATCHER,
+
     "/match?signals=" +
       encoded
   );
@@ -1301,7 +2587,8 @@ function extractHunterSignals(
 ): Obj[] {
 
   let raw:
-    any[] = [];
+    any[] =
+    [];
 
 
   if (
@@ -1674,6 +2961,11 @@ function buildTarget(
 
     matchName,
 
+    entryTime:
+      signal
+        ?.entry_time ??
+      null,
+
     home:
 
       extractTeamName(
@@ -1746,7 +3038,7 @@ function buildTarget(
 
 
 // ============================================================
-// D1
+// LIVE_ODDS
 // ============================================================
 
 async function saveTarget(
@@ -1837,7 +3129,9 @@ async function getStoredEvent(
     .prepare(`
       SELECT *
       FROM live_odds
-      WHERE event_id = ?1
+      WHERE
+        event_id =
+          ?1
       LIMIT 1
     `)
 
@@ -1858,7 +3152,9 @@ async function getBetStatus(
     .prepare(`
       SELECT *
       FROM bet_status
-      WHERE event_id = ?1
+      WHERE
+        event_id =
+          ?1
       LIMIT 1
     `)
 
@@ -1944,6 +3240,99 @@ async function fetchServiceJSON(
         )
     );
   }
+}
+
+
+// ============================================================
+// TIME
+// ============================================================
+
+function sofiaDate(
+  value?: any
+): string {
+
+  let date:
+    Date;
+
+
+  if (
+    value
+  ) {
+
+    const parsed =
+      new Date(
+        value
+      );
+
+
+    date =
+      Number.isNaN(
+        parsed.getTime()
+      )
+
+        ? new Date()
+
+        : parsed;
+
+  } else {
+
+    date =
+      new Date();
+  }
+
+
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone:
+          TIME_ZONE,
+
+        year:
+          "numeric",
+
+        month:
+          "2-digit",
+
+        day:
+          "2-digit"
+      }
+    )
+      .formatToParts(
+        date
+      );
+
+
+  const map:
+    Record<string, string> =
+    {};
+
+
+  for (
+    const part
+    of parts
+  ) {
+
+    if (
+      part.type !==
+      "literal"
+    ) {
+
+      map[
+        part.type
+      ] =
+        part.value;
+    }
+  }
+
+
+  return (
+    map.year +
+    "-" +
+    map.month +
+    "-" +
+    map.day
+  );
 }
 
 
@@ -2058,7 +3447,8 @@ function splitMatch(
 
 
     if (
-      index >= 0
+      index >=
+      0
     ) {
 
       return {
@@ -2157,8 +3547,10 @@ function scoreToString(
 
 
     if (
-      home !== undefined &&
-      away !== undefined
+      home !==
+        undefined &&
+      away !==
+        undefined
     ) {
 
       return (
@@ -2182,6 +3574,7 @@ function safe(
     value === null ||
     value === undefined
   ) {
+
     return "";
   }
 
@@ -2215,7 +3608,9 @@ function numberOrNull(
   return Number.isFinite(
     number
   )
+
     ? number
+
     : null;
 }
 
@@ -2294,20 +3689,16 @@ Top Signal Control
 <style>
 
 * {
-  box-sizing:
-    border-box;
+  box-sizing: border-box;
 }
 
 body {
 
-  margin:
-    0;
+  margin: 0;
 
-  background:
-    #0b0e13;
+  background: #0b0e13;
 
-  color:
-    #ffffff;
+  color: #ffffff;
 
   font-family:
     Arial,
@@ -2317,365 +3708,276 @@ body {
 
 .app {
 
-  max-width:
-    760px;
+  max-width: 760px;
 
-  margin:
-    0 auto;
+  margin: 0 auto;
 
-  padding:
-    16px;
+  padding: 12px;
 }
 
 .title {
 
-  font-size:
-    25px;
+  font-size: 22px;
 
-  font-weight:
-    900;
+  font-weight: 900;
 }
 
 .subtitle {
 
-  margin-top:
-    6px;
+  margin-top: 4px;
 
-  color:
-    #8d96a5;
+  color: #8d96a5;
 
-  font-size:
-    11px;
+  font-size: 10px;
 
-  line-height:
-    1.5;
+  line-height: 1.4;
 }
+
+
+/* ==========================================================
+   TOP SUMMARY
+   ========================================================== */
 
 .summary {
 
-  margin-top:
-    16px;
+  margin-top: 11px;
 
-  display:
-    grid;
+  display: grid;
 
   grid-template-columns:
-    repeat(
-      4,
-      1fr
-    );
+    repeat(4, 1fr);
 
-  gap:
-    8px;
+  gap: 6px;
 }
 
 .sum {
 
-  background:
-    #151a22;
+  background: #151a22;
 
   border:
-    1px solid
-    #252c38;
+    1px solid #252c38;
 
-  border-radius:
-    13px;
+  border-radius: 10px;
 
-  padding:
-    12px 6px;
+  padding: 8px 4px;
 
-  text-align:
-    center;
+  text-align: center;
 }
 
 .sum .v {
 
-  font-size:
-    22px;
+  font-size: 18px;
 
-  font-weight:
-    900;
+  font-weight: 900;
 }
 
 .sum .l {
 
-  margin-top:
-    3px;
+  margin-top: 2px;
 
-  font-size:
-    9px;
+  font-size: 8px;
 
-  color:
-    #8d96a5;
+  color: #8d96a5;
 }
 
 .stats {
 
-  margin-top:
-    10px;
+  margin-top: 7px;
 
-  color:
-    #7d8797;
+  color: #7d8797;
 
-  font-size:
-    11px;
+  font-size: 9px;
 
-  line-height:
-    1.5;
+  line-height: 1.4;
 }
+
+
+/* ==========================================================
+   COMPACT ACTIVE CARDS
+   ========================================================== */
 
 .card {
 
-  margin-top:
-    14px;
+  margin-top: 9px;
 
-  padding:
-    16px;
+  padding: 10px;
 
-  background:
-    #151a22;
+  background: #151a22;
 
   border:
-    1px solid
-    #252c38;
+    1px solid #252c38;
 
-  border-radius:
-    16px;
+  border-radius: 12px;
 }
 
 .card.placed {
 
   border:
-    2px solid
-    #16a34a;
+    1px solid #16a34a;
 
-  background:
-    #101d16;
+  background: #101d16;
 }
 
 .placedBanner {
 
-  margin-bottom:
-    12px;
+  margin-bottom: 7px;
 
-  padding:
-    10px;
+  padding: 5px 7px;
 
-  border-radius:
-    10px;
+  border-radius: 7px;
 
-  background:
-    #14532d;
+  background: #14532d;
 
-  color:
-    #bbf7d0;
+  color: #bbf7d0;
 
-  font-size:
-    14px;
+  font-size: 10px;
 
-  font-weight:
-    900;
+  font-weight: 900;
 
-  text-align:
-    center;
+  text-align: center;
 }
 
 .match {
 
-  font-size:
-    18px;
+  font-size: 15px;
 
-  font-weight:
-    900;
+  font-weight: 900;
 
-  line-height:
-    1.3;
+  line-height: 1.25;
 }
 
 .event {
 
-  margin-top:
-    6px;
+  margin-top: 3px;
 
-  color:
-    #7d8797;
+  color: #646f80;
 
-  font-size:
-    10px;
+  font-size: 8px;
 
-  word-break:
-    break-all;
+  word-break: break-all;
 }
 
-.meta {
+.compactMeta {
 
-  display:
-    flex;
+  margin-top: 5px;
 
-  flex-wrap:
-    wrap;
+  display: flex;
 
-  gap:
-    6px;
+  flex-wrap: wrap;
 
-  margin-top:
-    10px;
+  gap: 5px;
+
+  color: #adb5c2;
+
+  font-size: 10px;
 }
 
-.badge {
+.compactMeta span {
 
-  padding:
-    6px 8px;
-
-  background:
-    #202632;
-
-  border-radius:
-    8px;
-
-  color:
-    #c5ccd8;
-
-  font-size:
-    11px;
+  padding-right: 5px;
 }
 
-.market {
+.marketLine {
 
-  margin-top:
-    16px;
+  margin-top: 8px;
 
-  color:
-    #8d96a5;
+  display: flex;
 
-  font-size:
-    10px;
+  align-items: center;
+
+  justify-content: space-between;
+
+  gap: 8px;
 }
 
-.oddsline {
+.marketName {
 
-  display:
-    flex;
+  color: #a7b0bd;
 
-  align-items:
-    center;
+  font-size: 11px;
 
-  justify-content:
-    space-between;
-
-  gap:
-    10px;
-
-  margin-top:
-    4px;
+  font-weight: 800;
 }
 
 .odds {
 
-  font-size:
-    38px;
+  font-size: 22px;
 
-  font-weight:
-    900;
+  font-weight: 900;
 }
 
 .state {
 
-  font-size:
-    10px;
+  margin-top: 2px;
 
-  text-align:
-    right;
+  font-size: 8px;
 
-  line-height:
-    1.4;
+  text-align: right;
 }
 
 .ready {
-
-  color:
-    #86efac;
+  color: #86efac;
 }
 
 .waiting {
-
-  color:
-    #fbbf24;
+  color: #fbbf24;
 }
 
 .placedState {
 
-  color:
-    #4ade80;
+  color: #4ade80;
 
-  font-weight:
-    900;
+  font-weight: 900;
 }
 
 .actions {
 
-  display:
-    grid;
+  display: grid;
 
   grid-template-columns:
     1fr 1fr;
 
-  gap:
-    8px;
+  gap: 6px;
 
-  margin-top:
-    14px;
+  margin-top: 8px;
 }
 
 .btn {
 
-  border:
-    0;
+  border: 0;
 
-  border-radius:
-    11px;
+  border-radius: 8px;
 
-  padding:
-    13px 10px;
+  padding: 9px 7px;
 
-  font-size:
-    12px;
+  font-size: 10px;
 
-  font-weight:
-    900;
+  font-weight: 900;
 
-  cursor:
-    pointer;
+  cursor: pointer;
 }
 
 .check {
 
-  background:
-    #2563eb;
+  background: #2563eb;
 
-  color:
-    white;
+  color: white;
 }
 
 .bet {
 
-  background:
-    #16a34a;
+  background: #16a34a;
 
-  color:
-    white;
+  color: white;
 }
 
 .bet[disabled] {
 
-  background:
-    #26303c;
+  background: #26303c;
 
-  color:
-    #788393;
+  color: #788393;
 
-  cursor:
-    not-allowed;
+  cursor: not-allowed;
 }
 
 .placedBtn {
@@ -2687,136 +3989,307 @@ body {
     #86efac !important;
 }
 
-.copy {
-
-  margin-top:
-    8px;
-
-  width:
-    100%;
-
-  background:
-    #202632;
-
-  color:
-    #cbd5e1;
-
-  border:
-    1px solid
-    #303947;
-}
-
 .empty {
 
-  margin-top:
-    18px;
+  margin-top: 10px;
 
-  padding:
-    28px 20px;
+  padding: 18px 12px;
 
-  background:
-    #151a22;
+  background: #151a22;
 
   border:
-    1px solid
-    #252c38;
+    1px solid #252c38;
 
-  border-radius:
-    16px;
+  border-radius: 12px;
 
-  text-align:
-    center;
+  text-align: center;
 
-  color:
-    #9aa4b3;
+  color: #9aa4b3;
 
-  font-size:
-    13px;
+  font-size: 11px;
 
-  line-height:
-    1.8;
+  line-height: 1.6;
+}
+
+
+/* ==========================================================
+   DAILY LOG
+   ========================================================== */
+
+.daily {
+
+  margin-top: 16px;
+
+  background: #151a22;
+
+  border:
+    1px solid #252c38;
+
+  border-radius: 12px;
+
+  overflow: hidden;
+}
+
+.dailyHead {
+
+  width: 100%;
+
+  padding: 12px;
+
+  border: 0;
+
+  background: #151a22;
+
+  color: #fff;
+
+  display: flex;
+
+  justify-content: space-between;
+
+  align-items: center;
+
+  font-size: 12px;
+
+  font-weight: 900;
+
+  cursor: pointer;
+
+  text-align: left;
+}
+
+.dailyArrow {
+
+  color: #8d96a5;
+
+  font-size: 14px;
+}
+
+.dailyBody {
+
+  display: none;
+
+  padding:
+    0 10px 10px 10px;
+
+  border-top:
+    1px solid #252c38;
+}
+
+.daily.open
+.dailyBody {
+
+  display: block;
+}
+
+.dailySummary {
+
+  margin-top: 9px;
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(2, 1fr);
+
+  gap: 5px;
+}
+
+.ds {
+
+  background: #0f1319;
+
+  border-radius: 8px;
+
+  padding: 7px 8px;
+
+  font-size: 10px;
+
+  display: flex;
+
+  justify-content: space-between;
+
+  gap: 8px;
+}
+
+.ds strong {
+
+  font-size: 11px;
+}
+
+.dailyList {
+
+  margin-top: 9px;
+}
+
+.dailyRow {
+
+  padding: 9px 3px;
+
+  border-top:
+    1px solid #242a34;
+}
+
+.dailyRow:first-child {
+
+  border-top: 0;
+}
+
+.dailyMatch {
+
+  font-size: 11px;
+
+  font-weight: 900;
+
+  line-height: 1.3;
+}
+
+.dailyStatus {
+
+  margin-top: 4px;
+
+  display: flex;
+
+  flex-wrap: wrap;
+
+  align-items: center;
+
+  gap: 5px;
+
+  font-size: 9px;
+
+  color: #929baa;
+}
+
+.pill {
+
+  padding: 3px 6px;
+
+  border-radius: 6px;
+
+  background: #202632;
+}
+
+.pillPlaced {
+
+  background: #123b22;
+
+  color: #86efac;
+}
+
+.pillNotPlaced {
+
+  background: #292f38;
+
+  color: #a6afbc;
+}
+
+.win {
+
+  color: #4ade80;
+
+  font-weight: 900;
+}
+
+.loss {
+
+  color: #f87171;
+
+  font-weight: 900;
+}
+
+.pending {
+
+  color: #fbbf24;
+
+  font-weight: 900;
 }
 
 .footer {
 
-  margin-top:
-    20px;
+  margin-top: 16px;
 
-  text-align:
-    center;
+  text-align: center;
 
-  color:
-    #596273;
+  color: #596273;
 
-  font-size:
-    9px;
+  font-size: 8px;
 
-  line-height:
-    1.5;
+  line-height: 1.5;
 }
 
 .err {
 
-  color:
-    #fca5a5;
+  color: #fca5a5;
 }
 
-.small {
 
-  font-size:
-    9px;
-
-  color:
-    #697281;
-
-  margin-top:
-    8px;
-
-  line-height:
-    1.5;
-}
-
+/* ==========================================================
+   MOBILE
+   ========================================================== */
 
 @media (
-  max-width:
-  430px
+  max-width: 430px
 ) {
 
   .app {
-    padding:
-      12px;
+    padding: 9px;
   }
 
   .title {
-    font-size:
-      22px;
-  }
-
-  .odds {
-    font-size:
-      34px;
+    font-size: 19px;
   }
 
   .summary {
 
     grid-template-columns:
-      repeat(
-        2,
-        1fr
-      );
+      repeat(4, 1fr);
 
-    gap:
-      6px;
+    gap: 4px;
   }
 
   .sum {
+
     padding:
-      10px 6px;
+      7px 2px;
+  }
+
+  .sum .v {
+
+    font-size: 16px;
+  }
+
+  .sum .l {
+
+    font-size: 7px;
+  }
+
+  .card {
+
+    padding: 9px;
+  }
+
+  .match {
+
+    font-size: 14px;
   }
 
   .actions {
+
+    /* KEEP CHECK + BET SIDE BY SIDE */
     grid-template-columns:
-      1fr;
+      1fr 1fr;
+  }
+
+  .btn {
+
+    padding:
+      8px 5px;
+
+    font-size: 9px;
+  }
+
+  .odds {
+
+    font-size: 20px;
   }
 }
 
@@ -2836,17 +4309,14 @@ body {
 
   <div class="subtitle">
 
-    V1.9.0 BET STATUS
+    V2.0.0 DAILY LOG
 
-    · TRACKER → MATCHER → SELECT MATCH
-
-    → CHECK ODDS / BET NOW
+    · TRACKER → MATCHER → CHECK / BET
 
   </div>
 
 
   <div class="summary">
-
 
     <div class="sum">
 
@@ -2911,7 +4381,6 @@ body {
 
     </div>
 
-
   </div>
 
 
@@ -2927,13 +4396,69 @@ body {
   </div>
 
 
+  <!-- ======================================================
+       DAILY MATCHES
+       ====================================================== -->
+
+  <div
+    id="daily"
+    class="daily"
+  >
+
+    <button
+      id="dailyHead"
+      class="dailyHead"
+      type="button"
+    >
+
+      <span>
+
+        📊 ДНЕШНИ МАЧОВЕ ·
+
+        <span id="dailyCount">
+          0
+        </span>
+
+      </span>
+
+      <span
+        id="dailyArrow"
+        class="dailyArrow"
+      >
+        ▸
+      </span>
+
+    </button>
+
+
+    <div
+      id="dailyBody"
+      class="dailyBody"
+    >
+
+      <div
+        id="dailySummary"
+        class="dailySummary"
+      >
+      </div>
+
+
+      <div
+        id="dailyList"
+        class="dailyList"
+      >
+      </div>
+
+    </div>
+
+  </div>
+
+
   <div class="footer">
 
-    CLOUDBET OPENS ONLY FOR THE TARGET YOU CHOOSE
+    DAILY MATCH LOG · EUROPE/SOFIA
 
-    · SAFE STAKE 1 USDT
-
-    · PLACE BET IS NEVER AUTO-CLICKED
+    · SUCCESS = WIN / (WIN + LOSS)
 
   </div>
 
@@ -2949,6 +4474,18 @@ const CLOUDBET_ORIGIN =
 
 const REFRESH_MS =
   3000;
+
+
+let latestTargets =
+  [];
+
+
+let latestDaily =
+  [];
+
+
+let dailyOpen =
+  false;
 
 
 // ==========================================================
@@ -2996,7 +4533,9 @@ function num(v) {
 
   return Number
     .isFinite(x)
+
       ? x
+
       : null;
 }
 
@@ -3010,6 +4549,7 @@ function formatTime(v) {
   if (!v) {
     return '';
   }
+
 
   try {
 
@@ -3033,7 +4573,7 @@ function formatTime(v) {
 
 
 // ==========================================================
-// CLOUDBET EVENT URL
+// CLOUDBET URL
 // ==========================================================
 
 function eventUrl(
@@ -3082,10 +4622,13 @@ function eventUrl(
 
   u.hash =
     'ts-action=' +
+
     encodeURIComponent(
       action
     ) +
+
     '&ts-event=' +
+
     encodeURIComponent(
       id
     );
@@ -3112,7 +4655,8 @@ function go(
 
 
   if (
-    action === 'bet' &&
+    action ===
+      'bet' &&
     target?.betPlaced
   ) {
 
@@ -3129,56 +4673,7 @@ function go(
 
 
 // ==========================================================
-// COPY
-// ==========================================================
-
-async function copyId(
-  id
-) {
-
-  try {
-
-    await navigator
-      .clipboard
-      .writeText(
-        String(id)
-      );
-
-  } catch {
-
-    const ta =
-      document
-        .createElement(
-          'textarea'
-        );
-
-
-    ta.value =
-      String(id);
-
-
-    document.body
-      .appendChild(
-        ta
-      );
-
-
-    ta.select();
-
-
-    document
-      .execCommand(
-        'copy'
-      );
-
-
-    ta.remove();
-  }
-}
-
-
-// ==========================================================
-// CARD
+// ACTIVE CARD
 // ==========================================================
 
 function card(t) {
@@ -3190,11 +4685,13 @@ function card(t) {
 
 
   const ready =
-    odds !== null;
+    odds !==
+    null;
 
 
   const placed =
-    t?.betPlaced === true;
+    t?.betPlaced ===
+    true;
 
 
   const match =
@@ -3217,8 +4714,10 @@ function card(t) {
 
   const minute =
 
-    t?.minute !== null &&
-    t?.minute !== undefined
+    t?.minute !==
+      null &&
+    t?.minute !==
+      undefined
 
       ? esc(
           t.minute
@@ -3229,8 +4728,10 @@ function card(t) {
 
   const hunter =
 
-    t?.hunterScore !== null &&
-    t?.hunterScore !== undefined
+    t?.hunterScore !==
+      null &&
+    t?.hunterScore !==
+      undefined
 
       ? esc(
           t.hunterScore
@@ -3239,40 +4740,9 @@ function card(t) {
       : '—';
 
 
-  const matcher =
-
-    t?.matcherScore !== null &&
-    t?.matcherScore !== undefined
-
-      ? esc(
-          t.matcherScore
-        )
-
-      : '—';
-
-
-  const score =
-    esc(
-      t?.score ||
-      '—'
-    );
-
-
-  const placedTime =
-    formatTime(
-      t?.betPlacedAt
-    );
-
-
   const placedOdds =
     num(
       t?.betOdds
-    );
-
-
-  const placedStake =
-    num(
-      t?.betStake
     );
 
 
@@ -3298,15 +4768,6 @@ function card(t) {
 
               '✅ ЗАЛОЖЕНО' +
 
-              (
-                placedTime
-                  ? ' · ' +
-                    esc(
-                      placedTime
-                    )
-                  : ''
-              ) +
-
             '</div>'
           )
 
@@ -3315,143 +4776,103 @@ function card(t) {
 
 
       '<div class="match">' +
+
+        '⚽ ' +
         match +
+
       '</div>' +
 
 
       '<div class="event">' +
-        'Cloudbet Event ID: ' +
+
+        'Event ' +
         eventId +
+
       '</div>' +
 
 
-      '<div class="meta">' +
+      '<div class="compactMeta">' +
 
-
-        '<div class="badge">' +
-          '⏱ ' +
+        '<span>⏱ ' +
           minute +
-        '</div>' +
+        '</span>' +
 
-
-        '<div class="badge">' +
-          '🎯 Hunter ' +
+        '<span>🎯 Hunter ' +
           hunter +
+        '</span>' +
+
+      '</div>' +
+
+
+      '<div class="marketLine">' +
+
+        '<div class="marketName">' +
+
+          '1H O0.5' +
+
         '</div>' +
 
 
-        '<div class="badge">' +
-          '🔗 Matcher ' +
-          matcher +
-        '</div>' +
+        '<div>' +
 
+          '<div class="odds">' +
 
-        '<div class="badge">' +
-          '⚽ ' +
-          score +
-        '</div>' +
+            (
+              ready
 
-
-        (
-          placed &&
-          placedStake !== null
-
-            ? (
-
-              '<div class="badge">' +
-
-                '💰 ' +
-                esc(
-                  placedStake
-                ) +
-                ' USDT' +
-
-              '</div>'
-            )
-
-            : ''
-        ) +
-
-
-        (
-          placed &&
-          placedOdds !== null
-
-            ? (
-
-              '<div class="badge">' +
-
-                '✅ @ ' +
-                esc(
-                  placedOdds.toFixed(
+                ? '@' +
+                  odds.toFixed(
                     2
                   )
-                ) +
 
-              '</div>'
-            )
+                : '@—'
+            ) +
 
-            : ''
-        ) +
+          '</div>' +
 
 
-      '</div>' +
+          '<div class="state ' +
 
+            (
+              placed
 
-      '<div class="market">' +
+                ? 'placedState'
 
-        '1H TOTAL GOALS · OVER 0.5 · SAFE STAKE 1 USDT' +
+                : ready
 
-      '</div>' +
+                  ? 'ready'
 
+                  : 'waiting'
+            ) +
 
-      '<div class="oddsline">' +
+          '">' +
 
+            (
+              placed
 
-        '<div class="odds">' +
+                ? (
+                  placedOdds !==
+                    null
 
-          (
-            ready
+                    ? 'PLACED @' +
+                      placedOdds
+                        .toFixed(
+                          2
+                        )
 
-              ? '@ ' +
-                odds.toFixed(
-                  2
+                    : 'PLACED ✅'
                 )
 
-              : '@ —'
-          ) +
+                : ready
+
+                  ? 'READY ✅'
+
+                  : 'WAIT'
+            ) +
+
+          '</div>' +
 
         '</div>' +
-
-
-        '<div class="state ' +
-
-          (
-            placed
-
-              ? 'placedState'
-
-              : ready
-                ? 'ready'
-                : 'waiting'
-          ) +
-
-        '">' +
-
-          (
-            placed
-
-              ? '✅ BET PLACED'
-
-              : ready
-
-                ? 'ODDS READY ✅'
-
-                : 'WAITING FOR CHECK'
-          ) +
-
-        '</div>' +
-
 
       '</div>' +
 
@@ -3469,7 +4890,7 @@ function card(t) {
             eventId +
           '">' +
 
-          'CHECK ODDS' +
+          'CHECK' +
 
         '</button>' +
 
@@ -3497,6 +4918,7 @@ function card(t) {
             !ready
 
               ? 'disabled'
+
               : ''
           ) +
 
@@ -3504,54 +4926,14 @@ function card(t) {
 
           (
             placed
+
               ? '✅ ЗАЛОЖЕНО'
+
               : 'BET NOW'
           ) +
 
         '</button>' +
 
-
-      '</div>' +
-
-
-      '<button ' +
-
-        'class="btn copy" ' +
-
-        'data-action="copy" ' +
-
-        'data-id="' +
-          eventId +
-        '">' +
-
-        'COPY EVENT ID' +
-
-      '</button>' +
-
-
-      '<div class="small">' +
-
-        (
-          placed
-
-            ? (
-
-              'Този Event ID вече е маркиран като успешно заложен.<br>' +
-
-              'BET NOW е блокиран за защита от повторен залог.'
-            )
-
-            : (
-
-              'CHECK ODDS → отваря само този мач, ' +
-
-              'чете реалния 1H O0.5 коефициент и се връща тук.<br>' +
-
-              'BET NOW → подготвя O0.5 + stake 1 USDT, ' +
-
-              'без да натиска Place bet.'
-            )
-        ) +
 
       '</div>' +
 
@@ -3562,215 +4944,553 @@ function card(t) {
 
 
 // ==========================================================
-// TARGET STATE
+// DAILY ROW
 // ==========================================================
 
-let latestTargets =
-  [];
+function dailyRow(m) {
+
+  const placed =
+    String(
+      m?.bet_status ??
+      ''
+    )
+      .toUpperCase() ===
+    'PLACED';
+
+
+  const result =
+    String(
+      m?.result_status ??
+      'PENDING'
+    )
+      .toUpperCase();
+
+
+  const odds =
+    num(
+      placed
+
+        ? (
+            m?.bet_odds ??
+            m?.found_odds
+          )
+
+        : m?.found_odds
+    );
+
+
+  const match =
+    esc(
+      m?.match_name ||
+      'Unknown match'
+    );
+
+
+  let resultHtml =
+    '—';
+
+
+  // For NOT PLACED rows we deliberately show —
+  // even if Tracker already knows the result.
+  if (
+    placed
+  ) {
+
+    if (
+      result ===
+      'WIN'
+    ) {
+
+      resultHtml =
+        '<span class="win">' +
+          '✅ ПЕЧЕЛИ' +
+        '</span>';
+
+    } else if (
+      result ===
+      'LOSS'
+    ) {
+
+      resultHtml =
+        '<span class="loss">' +
+          '❌ НЕ ПЕЧЕЛИ' +
+        '</span>';
+
+    } else {
+
+      resultHtml =
+        '<span class="pending">' +
+          '⏳ PENDING' +
+        '</span>';
+    }
+  }
+
+
+  return (
+
+    '<div class="dailyRow">' +
+
+      '<div class="dailyMatch">' +
+
+        match +
+
+      '</div>' +
+
+
+      '<div class="dailyStatus">' +
+
+
+        '<span>' +
+
+          (
+            odds !==
+              null
+
+              ? '@' +
+                odds.toFixed(
+                  2
+                )
+
+              : '@—'
+          ) +
+
+        '</span>' +
+
+
+        '<span class="pill ' +
+
+          (
+            placed
+
+              ? 'pillPlaced'
+
+              : 'pillNotPlaced'
+          ) +
+
+        '">' +
+
+          (
+            placed
+
+              ? 'ЗАЛОЖЕН'
+
+              : 'НЕЗАЛОЖЕН'
+          ) +
+
+        '</span>' +
+
+
+        '<span>' +
+
+          resultHtml +
+
+        '</span>' +
+
+
+      '</div>' +
+
+    '</div>'
+  );
+}
 
 
 // ==========================================================
-// REFRESH
+// DAILY SUMMARY
+// ==========================================================
+
+function renderDailySummary(s) {
+
+  const rate =
+
+    s?.successRate ===
+      null ||
+    s?.successRate ===
+      undefined
+
+      ? '—'
+
+      : Number(
+          s.successRate
+        )
+          .toFixed(
+            1
+          ) + '%';
+
+
+  return (
+
+    '<div class="ds">' +
+      '<span>ДНЕС</span>' +
+      '<strong>' +
+        esc(
+          s?.today ?? 0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+
+    '<div class="ds">' +
+      '<span>ЗАЛОЖЕНИ</span>' +
+      '<strong>' +
+        esc(
+          s?.placed ?? 0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+
+    '<div class="ds">' +
+      '<span>ПЕЧЕЛИ</span>' +
+      '<strong class="win">' +
+        esc(
+          s?.wins ?? 0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+
+    '<div class="ds">' +
+      '<span>НЕ ПЕЧЕЛИ</span>' +
+      '<strong class="loss">' +
+        esc(
+          s?.losses ?? 0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+
+    '<div class="ds">' +
+      '<span>НЕЗАЛОЖЕНИ</span>' +
+      '<strong>' +
+        esc(
+          s?.notPlaced ?? 0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+
+    '<div class="ds">' +
+      '<span>УСПЕХ</span>' +
+      '<strong>' +
+        esc(
+          rate
+        ) +
+      '</strong>' +
+    '</div>'
+  );
+}
+
+
+// ==========================================================
+// REFRESH ACTIVE TARGETS
+// ==========================================================
+
+async function refreshTargets() {
+
+  const r =
+    await fetch(
+
+      '/api/targets?ts=' +
+        Date.now(),
+
+      {
+        cache:
+          'no-store'
+      }
+    );
+
+
+  const d =
+    await r.json();
+
+
+  if (
+    !r.ok ||
+    !d?.success
+  ) {
+
+    throw new Error(
+
+      d?.error ||
+
+      (
+        'HTTP ' +
+        r.status
+      )
+    );
+  }
+
+
+  latestTargets =
+
+    Array.isArray(
+      d.targets
+    )
+
+      ? d.targets
+
+      : [];
+
+
+  const ready =
+    latestTargets
+      .filter(
+        x =>
+          num(
+            x?.overOdds
+          ) !==
+          null
+      );
+
+
+  const placed =
+    latestTargets
+      .filter(
+        x =>
+          x?.betPlaced ===
+          true
+      );
+
+
+  const best =
+
+    ready
+
+      .map(
+        x =>
+          num(
+            x.overOdds
+          )
+      )
+
+      .filter(
+        x =>
+          x !==
+          null
+      )
+
+      .sort(
+        (
+          a,
+          b
+        ) =>
+          b - a
+      )[0] ??
+
+    null;
+
+
+  document
+    .getElementById(
+      'sumTargets'
+    )
+    .textContent =
+      String(
+        latestTargets
+          .length
+      );
+
+
+  document
+    .getElementById(
+      'sumReady'
+    )
+    .textContent =
+      String(
+        ready.length
+      );
+
+
+  document
+    .getElementById(
+      'sumPlaced'
+    )
+    .textContent =
+      String(
+        placed.length
+      );
+
+
+  document
+    .getElementById(
+      'sumBest'
+    )
+    .textContent =
+
+      best ===
+        null
+
+        ? '—'
+
+        : best
+            .toFixed(
+              2
+            );
+
+
+  document
+    .getElementById(
+      'stats'
+    )
+    .textContent =
+
+      'Tracker ' +
+
+      (
+        d.tracker_signals ??
+        0
+      ) +
+
+      ' · Matcher ' +
+
+      (
+        d.matcher_hunter_results ??
+        0
+      ) +
+
+      ' · Secure ' +
+
+      latestTargets.length +
+
+      ' · refresh 3s';
+
+
+  document
+    .getElementById(
+      'list'
+    )
+    .innerHTML =
+
+      latestTargets.length
+
+        ? latestTargets
+            .map(
+              card
+            )
+            .join('')
+
+        : (
+
+          '<div class="empty">' +
+
+            'Няма активен secure Hunter target.<br>' +
+
+            'Чакаме нов сигнал.' +
+
+          '</div>'
+        );
+}
+
+
+// ==========================================================
+// REFRESH DAILY
+// ==========================================================
+
+async function refreshDaily() {
+
+  const r =
+    await fetch(
+
+      '/api/daily?ts=' +
+        Date.now(),
+
+      {
+        cache:
+          'no-store'
+      }
+    );
+
+
+  const d =
+    await r.json();
+
+
+  if (
+    !r.ok ||
+    !d?.success
+  ) {
+
+    throw new Error(
+
+      d?.error ||
+
+      (
+        'DAILY HTTP ' +
+        r.status
+      )
+    );
+  }
+
+
+  latestDaily =
+
+    Array.isArray(
+      d.matches
+    )
+
+      ? d.matches
+
+      : [];
+
+
+  document
+    .getElementById(
+      'dailyCount'
+    )
+    .textContent =
+      String(
+        latestDaily.length
+      );
+
+
+  document
+    .getElementById(
+      'dailySummary'
+    )
+    .innerHTML =
+      renderDailySummary(
+        d.summary ||
+        {}
+      );
+
+
+  document
+    .getElementById(
+      'dailyList'
+    )
+    .innerHTML =
+
+      latestDaily.length
+
+        ? latestDaily
+            .map(
+              dailyRow
+            )
+            .join('')
+
+        : (
+
+          '<div class="empty">' +
+
+            'Още няма мачове за днес.' +
+
+          '</div>'
+        );
+}
+
+
+// ==========================================================
+// MASTER REFRESH
 // ==========================================================
 
 async function refresh() {
 
   try {
 
-    const r =
-      await fetch(
-
-        '/api/targets?ts=' +
-          Date.now(),
-
-        {
-          cache:
-            'no-store'
-        }
-      );
-
-
-    const d =
-      await r.json();
-
-
-    if (
-      !r.ok ||
-      !d?.success
-    ) {
-
-      throw new Error(
-
-        d?.error ||
-
-        (
-          'HTTP ' +
-          r.status
-        )
-      );
-    }
-
-
-    latestTargets =
-
-      Array.isArray(
-        d.targets
-      )
-
-        ? d.targets
-
-        : [];
-
-
-    const ready =
-      latestTargets
-        .filter(
-          x =>
-            num(
-              x?.overOdds
-            ) !== null
-        );
-
-
-    const placed =
-      latestTargets
-        .filter(
-          x =>
-            x?.betPlaced ===
-            true
-        );
-
-
-    const best =
-
-      ready
-
-        .map(
-          x =>
-            num(
-              x.overOdds
-            )
-        )
-
-        .filter(
-          x =>
-            x !== null
-        )
-
-        .sort(
-          (
-            a,
-            b
-          ) =>
-            b - a
-        )[0] ??
-
-      null;
-
-
-    document
-      .getElementById(
-        'sumTargets'
-      )
-      .textContent =
-        String(
-          latestTargets
-            .length
-        );
-
-
-    document
-      .getElementById(
-        'sumReady'
-      )
-      .textContent =
-        String(
-          ready.length
-        );
-
-
-    document
-      .getElementById(
-        'sumPlaced'
-      )
-      .textContent =
-        String(
-          placed.length
-        );
-
-
-    document
-      .getElementById(
-        'sumBest'
-      )
-      .textContent =
-
-        best === null
-
-          ? '—'
-
-          : best
-              .toFixed(
-                2
-              );
-
-
-    document
-      .getElementById(
-        'stats'
-      )
-      .textContent =
-
-        'Tracker ' +
-
-        (
-          d.tracker_signals ??
-          0
-        ) +
-
-        ' · Matcher Hunter ' +
-
-        (
-          d.matcher_hunter_results ??
-          0
-        ) +
-
-        ' · Secure ' +
-
-        latestTargets.length +
-
-        ' · Placed ' +
-
-        placed.length +
-
-        ' · refresh 3s';
-
-
-    document
-      .getElementById(
-        'list'
-      )
-      .innerHTML =
-
-        latestTargets.length
-
-          ? latestTargets
-              .map(
-                card
-              )
-              .join('')
-
-          : (
-
-            '<div class="empty">' +
-
-              'Няма активен secure Hunter target.<br>' +
-
-              'Чакаме нов сигнал.' +
-
-            '</div>'
-          );
-
+    await Promise.all([
+      refreshTargets(),
+      refreshDaily()
+    ]);
 
   } catch (
     e
@@ -3794,6 +5514,62 @@ async function refresh() {
         '</span>';
   }
 }
+
+
+// ==========================================================
+// DAILY TOGGLE
+// ==========================================================
+
+document
+  .getElementById(
+    'dailyHead'
+  )
+  .addEventListener(
+    'click',
+    () => {
+
+      dailyOpen =
+        !dailyOpen;
+
+
+      const el =
+        document
+          .getElementById(
+            'daily'
+          );
+
+
+      const arrow =
+        document
+          .getElementById(
+            'dailyArrow'
+          );
+
+
+      if (
+        dailyOpen
+      ) {
+
+        el.classList
+          .add(
+            'open'
+          );
+
+        arrow.textContent =
+          '▾';
+
+      } else {
+
+        el.classList
+          .remove(
+            'open'
+          );
+
+        arrow.textContent =
+          '▸';
+      }
+    }
+  );
 
 
 // ==========================================================
@@ -3847,19 +5623,6 @@ document
 
 
       if (
-        action ===
-        'copy'
-      ) {
-
-        copyId(
-          id
-        );
-
-        return;
-      }
-
-
-      if (
         !target
       ) {
         return;
@@ -3910,8 +5673,7 @@ setInterval(
 
 </script>
 
-
 </body>
 
 </html>`;
-                     }
+          }
