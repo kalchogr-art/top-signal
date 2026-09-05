@@ -1,38 +1,30 @@
 // ============================================================
-// TOP SIGNAL V1.8.0 — MANUAL TARGET CONTROL
+// TOP SIGNAL V1.8.1 — MANUAL TARGET CONTROL
 //
-// TRACKER
-//   ↓
-// MATCHER
-//   ↓
-// SECURE CLOUDBET EVENT ID
-//   ↓
-// DASHBOARD
-//   ↓
-// USER CHOOSES:
-//   CHECK ODDS
-//   or
-//   BET NOW
+// TRACKER -> MATCHER -> DASHBOARD
+// -> CHECK ODDS / BET NOW
 //
 // CHECK ODDS:
-// Dashboard -> exact Cloudbet event
-// -> Violentmonkey reads 1H O0.5
-// -> POST /api/odds
-// -> returns Dashboard
+// - exact Cloudbet event
+// - frontend reads 1H O0.5 odds
+// - POST /api/odds
+// - returns to dashboard
 //
 // BET NOW:
-// Dashboard -> exact Cloudbet event
-// -> Violentmonkey selects 1H O0.5
-// -> fills 1 USDT
-// -> STOPS BEFORE PLACE BET
+// - exact Cloudbet event
+// - selects 1H O0.5
+// - fills 1 USDT
+// - NEVER clicks final Place bet
 //
-// IMPORTANT:
-// - Keeps V1.7.1 Matcher fix.
-// - signal: "HUNTER_ENTRY" is NOT forwarded to Matcher.
-// - REAL BET SUBMISSION IS DISABLED.
+// FIX V1.8.1:
+// - action/event passed through QUERY + HASH
+// - more robust against Cloudbet redirects
+//
+// Keeps V1.7.1 matcher fix:
+// - signal: "HUNTER_ENTRY" is NOT forwarded
 // ============================================================
 
-const VERSION = "V1.8.0 MANUAL TARGET";
+const VERSION = "V1.8.1 MANUAL TARGET";
 const APP_NAME = "top-signal";
 
 type Obj = Record<string, any>;
@@ -59,13 +51,10 @@ export default {
       new URL(request.url);
 
 
-    // ========================================================
-    // CORS
-    // ========================================================
-
     if (
       request.method === "OPTIONS"
     ) {
+
       return new Response(
         null,
         {
@@ -104,6 +93,7 @@ export default {
           "D1",
 
         bindings: {
+
           DB:
             !!env.DB,
 
@@ -141,6 +131,7 @@ export default {
           extractHunterSignals(
             data
           );
+
 
         return json({
           success: true,
@@ -202,6 +193,7 @@ export default {
             signals
           );
 
+
         return json({
           success: true,
 
@@ -261,6 +253,7 @@ export default {
           result.targets[0] ??
           null;
 
+
         return json({
           success: true,
 
@@ -294,6 +287,7 @@ export default {
           "TARGET ERROR",
           error
         );
+
 
         return json(
           {
@@ -330,6 +324,7 @@ export default {
           await buildTargets(
             env
           );
+
 
         return json({
           success: true,
@@ -386,25 +381,24 @@ export default {
         const body =
           await request.json<Obj>();
 
+
         const eventId =
           safe(
             body?.eventId
           );
+
 
         const overOdds =
           numberOrNull(
             body?.overOdds
           );
 
+
         const underOdds =
           numberOrNull(
             body?.underOdds
           );
 
-
-        // ----------------------------------------------------
-        // VALIDATION
-        // ----------------------------------------------------
 
         if (
           !eventId ||
@@ -416,6 +410,7 @@ export default {
           return json(
             {
               success: false,
+
               error:
                 "INVALID_ODDS_PAYLOAD"
             },
@@ -524,7 +519,7 @@ export default {
 
 
     // ========================================================
-    // GET LAST ODDS
+    // GET ODDS
     // ========================================================
 
     if (
@@ -543,7 +538,9 @@ export default {
           );
 
 
-        if (eventId) {
+        if (
+          eventId
+        ) {
 
           const row =
             await getStoredEvent(
@@ -551,10 +548,13 @@ export default {
               eventId
             );
 
+
           return json({
             success: true,
+
             data:
-              row ?? null
+              row ??
+              null
           });
         }
 
@@ -574,7 +574,8 @@ export default {
           success: true,
 
           data:
-            row ?? null
+            row ??
+            null
         });
 
       } catch (
@@ -677,10 +678,6 @@ async function buildTargets(
       : [];
 
 
-  // ========================================================
-  // SECURE ONLY
-  // ========================================================
-
   const secureResults =
     hunterResults.filter(
       (
@@ -744,19 +741,11 @@ async function buildTargets(
     }
 
 
-    // --------------------------------------------------------
-    // SAVE BASIC TARGET DATA
-    // --------------------------------------------------------
-
     await saveTarget(
       env,
       target
     );
 
-
-    // --------------------------------------------------------
-    // LOAD STORED FRONTEND ODDS
-    // --------------------------------------------------------
 
     const stored =
       await getStoredEvent(
@@ -799,10 +788,6 @@ async function buildTargets(
   }
 
 
-  // ========================================================
-  // NEWEST SIGNAL FIRST
-  // ========================================================
-
   targets.sort(
     (
       a,
@@ -815,11 +800,13 @@ async function buildTargets(
           0
         );
 
+
       const bi =
         Number(
           b.signalId ??
           0
         );
+
 
       return (
         bi -
@@ -843,7 +830,7 @@ async function buildTargets(
 
 
 // ============================================================
-// MATCHER CALL
+// MATCHER
 // ============================================================
 
 async function callMatcher(
@@ -868,7 +855,7 @@ async function callMatcher(
 
 
 // ============================================================
-// EXTRACT HUNTER SIGNALS
+// HUNTER SIGNALS
 // ============================================================
 
 function extractHunterSignals(
@@ -949,10 +936,6 @@ function extractHunterSignals(
 }
 
 
-// ============================================================
-// HUNTER ENTRY FILTER
-// ============================================================
-
 function isHunterEntry(
   item: Obj
 ): boolean {
@@ -1016,14 +999,9 @@ function isHunterEntry(
 // ============================================================
 // NORMALIZE SIGNAL
 //
-// IMPORTANT V1.7.1 FIX:
-//
-// We deliberately DO NOT return:
-//
+// IMPORTANT:
+// No:
 // signal: "HUNTER_ENTRY"
-//
-// because Matcher V7.1 interprets item.signal
-// as a nested signal object.
 // ============================================================
 
 function normalizeSignal(
@@ -1172,7 +1150,7 @@ function normalizeSignal(
 
 
 // ============================================================
-// BUILD TARGET
+// TARGET
 // ============================================================
 
 function buildTarget(
@@ -1334,7 +1312,7 @@ function buildTarget(
 
 
 // ============================================================
-// SAVE TARGET
+// D1
 // ============================================================
 
 async function saveTarget(
@@ -1415,10 +1393,6 @@ async function saveTarget(
     .run();
 }
 
-
-// ============================================================
-// GET STORED EVENT
-// ============================================================
 
 async function getStoredEvent(
   env: Env,
@@ -1519,7 +1493,7 @@ async function fetchServiceJSON(
 
 
 // ============================================================
-// TEAM NAME
+// HELPERS
 // ============================================================
 
 function extractTeamName(
@@ -1571,10 +1545,6 @@ function extractTeamName(
   return "";
 }
 
-
-// ============================================================
-// SPLIT MATCH
-// ============================================================
 
 function splitMatch(
   value: any
@@ -1665,10 +1635,6 @@ function splitMatch(
 }
 
 
-// ============================================================
-// SCORE
-// ============================================================
-
 function scoreToString(
   value: any
 ): string | null {
@@ -1753,10 +1719,6 @@ function scoreToString(
 }
 
 
-// ============================================================
-// SAFE STRING
-// ============================================================
-
 function safe(
   value: any
 ): string {
@@ -1774,10 +1736,6 @@ function safe(
   ).trim();
 }
 
-
-// ============================================================
-// NUMBER
-// ============================================================
 
 function numberOrNull(
   value: any
@@ -1807,10 +1765,6 @@ function numberOrNull(
 }
 
 
-// ============================================================
-// CORS
-// ============================================================
-
 function corsHeaders() {
 
   return {
@@ -1826,10 +1780,6 @@ function corsHeaders() {
   };
 }
 
-
-// ============================================================
-// JSON
-// ============================================================
 
 function json(
   data: any,
@@ -1893,7 +1843,6 @@ Top Signal Control
     border-box;
 }
 
-
 body {
 
   margin:
@@ -1911,7 +1860,6 @@ body {
     sans-serif;
 }
 
-
 .app {
 
   max-width:
@@ -1924,7 +1872,6 @@ body {
     16px;
 }
 
-
 .title {
 
   font-size:
@@ -1933,7 +1880,6 @@ body {
   font-weight:
     900;
 }
-
 
 .subtitle {
 
@@ -1949,7 +1895,6 @@ body {
   line-height:
     1.5;
 }
-
 
 .summary {
 
@@ -1968,7 +1913,6 @@ body {
   gap:
     8px;
 }
-
 
 .sum {
 
@@ -1989,7 +1933,6 @@ body {
     center;
 }
 
-
 .sum .v {
 
   font-size:
@@ -1998,7 +1941,6 @@ body {
   font-weight:
     900;
 }
-
 
 .sum .l {
 
@@ -2011,7 +1953,6 @@ body {
   color:
     #8d96a5;
 }
-
 
 .stats {
 
@@ -2027,7 +1968,6 @@ body {
   line-height:
     1.5;
 }
-
 
 .card {
 
@@ -2048,7 +1988,6 @@ body {
     16px;
 }
 
-
 .match {
 
   font-size:
@@ -2060,7 +1999,6 @@ body {
   line-height:
     1.3;
 }
-
 
 .event {
 
@@ -2077,7 +2015,6 @@ body {
     break-all;
 }
 
-
 .meta {
 
   display:
@@ -2092,7 +2029,6 @@ body {
   margin-top:
     10px;
 }
-
 
 .badge {
 
@@ -2112,7 +2048,6 @@ body {
     11px;
 }
 
-
 .market {
 
   margin-top:
@@ -2124,7 +2059,6 @@ body {
   font-size:
     10px;
 }
-
 
 .oddsline {
 
@@ -2144,7 +2078,6 @@ body {
     4px;
 }
 
-
 .odds {
 
   font-size:
@@ -2153,7 +2086,6 @@ body {
   font-weight:
     900;
 }
-
 
 .state {
 
@@ -2167,20 +2099,17 @@ body {
     1.4;
 }
 
-
 .ready {
 
   color:
     #86efac;
 }
 
-
 .waiting {
 
   color:
     #fbbf24;
 }
-
 
 .actions {
 
@@ -2196,7 +2125,6 @@ body {
   margin-top:
     14px;
 }
-
 
 .btn {
 
@@ -2219,7 +2147,6 @@ body {
     pointer;
 }
 
-
 .check {
 
   background:
@@ -2229,7 +2156,6 @@ body {
     white;
 }
 
-
 .bet {
 
   background:
@@ -2238,7 +2164,6 @@ body {
   color:
     white;
 }
-
 
 .bet[disabled] {
 
@@ -2251,7 +2176,6 @@ body {
   cursor:
     not-allowed;
 }
-
 
 .copy {
 
@@ -2271,7 +2195,6 @@ body {
     1px solid
     #303947;
 }
-
 
 .empty {
 
@@ -2304,7 +2227,6 @@ body {
     1.8;
 }
 
-
 .footer {
 
   margin-top:
@@ -2323,13 +2245,11 @@ body {
     1.5;
 }
 
-
 .err {
 
   color:
     #fca5a5;
 }
-
 
 .small {
 
@@ -2357,30 +2277,25 @@ body {
       12px;
   }
 
-
   .title {
     font-size:
       22px;
   }
-
 
   .odds {
     font-size:
       34px;
   }
 
-
   .summary {
     gap:
       6px;
   }
 
-
   .sum {
     padding:
       10px 6px;
   }
-
 
   .actions {
     grid-template-columns:
@@ -2391,7 +2306,6 @@ body {
 </style>
 
 </head>
-
 
 <body>
 
@@ -2405,7 +2319,7 @@ body {
 
   <div class="subtitle">
 
-    V1.8.0 MANUAL TARGET
+    V1.8.1 MANUAL TARGET
 
     · TRACKER → MATCHER → SELECT MATCH
 
@@ -2505,7 +2419,7 @@ const REFRESH_MS =
 
 
 // ==========================================================
-// HTML ESCAPE
+// ESCAPE
 // ==========================================================
 
 function esc(v) {
@@ -2555,7 +2469,7 @@ function num(v) {
 
 
 // ==========================================================
-// EVENT URL
+// CLOUDBET EVENT URL
 // ==========================================================
 
 function eventUrl(
@@ -2584,12 +2498,14 @@ function eventUrl(
     );
 
 
+  // Goals tab
   u.searchParams.set(
     'markets-tab',
     'goals'
   );
 
 
+  // Query hand-off
   u.searchParams.set(
     'ts-action',
     action
@@ -2602,12 +2518,25 @@ function eventUrl(
   );
 
 
+  // Hash hand-off.
+  // More resistant to frontend redirects.
+  u.hash =
+    'ts-action=' +
+    encodeURIComponent(
+      action
+    ) +
+    '&ts-event=' +
+    encodeURIComponent(
+      id
+    );
+
+
   return u.href;
 }
 
 
 // ==========================================================
-// OPEN EVENT
+// OPEN
 // ==========================================================
 
 function go(
@@ -2631,7 +2560,7 @@ function go(
 
 
 // ==========================================================
-// COPY EVENT ID
+// COPY
 // ==========================================================
 
 async function copyId(
@@ -2930,7 +2859,7 @@ function card(t) {
 
 
 // ==========================================================
-// STATE
+// TARGET STATE
 // ==========================================================
 
 let latestTargets =
