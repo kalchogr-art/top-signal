@@ -1,1250 +1,1625 @@
 // ============================================================
-// TOP SIGNAL V2.0.1 — DAILY LOG + ANTI-OVERLAP
+// CLOUDBET MATCH MATCHER V7.2.0 — FAST HUNTER MODE
+// V27 + CLOUDBET SERVICE BINDINGS
+// READ ONLY
 //
-// TRACKER -> MATCHER -> DASHBOARD
-// -> CHECK ODDS / BET NOW HANDOFF
+// FIX:
+// - When Top Signal calls /match?signals=...
+//   matcher enters FAST_HUNTER mode automatically.
+// - FAST_HUNTER DOES NOT fetch/process V27.
+// - FAST_HUNTER DOES NOT build:
+//     matches
+//     possible_matches
+//     reversed_candidates
+//     false_positive_risks
+//     unmatched
+//     cloudbet_only_first_half
+//     v27_filtered_second_half
+// - It only:
+//     1) reads current Cloudbet /live
+//     2) compares current Hunter signals
+//     3) returns hunter_results
 //
-// V2.0.1:
-// - TARGET polling: 10s
-// - DAILY polling: 30s
-// - no overlapping browser refresh requests
-// - temporary target error keeps last rendered targets
-// - D1 live_odds + bet_status + daily_matches
-// - secure CONFIDENT_MATCH targets only
-// - Europe/Sofia daily log
+// SECURITY / SCORING:
+// - thresholds unchanged
+// - aliases retained
+// - only CONFIDENT_MATCH => secure_match=true
+// - no score-only acceptance
 //
-// IMPORTANT:
-// - final bet submit is NOT performed by this Worker
-// - browser/Monkey logic is unchanged
+// READ ONLY — NO BET PLACEMENT
 // ============================================================
-
-const VERSION = "V2.0.2 CPU SAFE";
-const APP_NAME = "top-signal";
-const TIME_ZONE = "Europe/Sofia";
-
-type Obj = Record<string, any>;
 
 interface Env {
-  DB: D1Database;
-  TRACKER: Fetcher;
-  MATCHER: Fetcher;
+  V27: Fetcher;
+  CLOUDBET: Fetcher;
 }
 
-let tablesReady: Promise<void> | null = null;
+type AnyObj = Record<string, any>;
+
+const VERSION =
+  "V7.2.0-FAST-HUNTER";
+
+const DEFAULT_THRESHOLD =
+  0.45;
+
+const STRONG_TEAM_SCORE =
+  0.78;
+
+const POSSIBLE_TEAM_SCORE =
+  0.60;
+
+const POSSIBLE_TOTAL_SCORE =
+  0.72;
+
+const CONFIDENT_TOTAL_SCORE =
+  0.80;
+
+const REVERSED_CONFIDENT_SCORE =
+  0.90;
+
+const WEAK_SIDE_LIMIT =
+  0.50;
+
+const COMPETITION_BONUS =
+  0.05;
+
+const COUNTRY_BONUS =
+  0.02;
 
 
 // ============================================================
-// MAIN
+// JSON
 // ============================================================
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+function json(
+  data: any,
+  status = 200
+): Response {
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders()
-      });
-    }
+  return new Response(
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
+    {
+      status,
+      headers: {
+        "content-type":
+          "application/json; charset=UTF-8",
 
-    try {
-      if (!tablesReady) {
-        tablesReady = ensureTables(env);
-      }
-
-      await tablesReady;
-    } catch (error: any) {
-      tablesReady = null;
-      return json({
-        success: false,
-        worker: APP_NAME,
-        version: VERSION,
-        error: "DB_INIT_FAILED: " + (error?.message ?? String(error))
-      }, 500);
-    }
-
-    // STATUS
-    if (url.pathname === "/api/status") {
-      return json({
-        success: true,
-        worker: APP_NAME,
-        version: VERSION,
-        mode: "MANUAL_TARGET_CONTROL",
-        betting: "FINAL_SUBMIT_DISABLED",
-        storage: "D1",
-        daily_log: true,
-        anti_overlap: true,
-        timezone: TIME_ZONE,
-        bindings: {
-          DB: !!env.DB,
-          TRACKER: !!env.TRACKER,
-          MATCHER: !!env.MATCHER
-        },
-        polling: {
-          targets_ms: 10000,
-          daily_ms: 30000
-        },
-        flow: "TRACKER -> MATCHER -> TOP SIGNAL -> DAILY LOG"
-      });
-    }
-
-    // DEBUG TRACKER
-    if (url.pathname === "/api/debug/tracker") {
-      try {
-        const data = await fetchServiceJSON(env.TRACKER, "/entries");
-        const signals = extractHunterSignals(data);
-        const records = extractTrackerRecords(data);
-
-        return json({
-          success: true,
-          signals_found: signals.length,
-          tracker_records: records.length,
-          signals,
-          records
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
+        "cache-control":
+          "no-store"
       }
     }
-
-    // DEBUG MATCHER
-    if (url.pathname === "/api/debug/matcher") {
-      try {
-        const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
-        const signals = extractHunterSignals(tracker);
-        const matcher = await callMatcher(env, signals);
-
-        return json({
-          success: true,
-          tracker_signals: signals.length,
-          matcher_version: matcher?.version ?? null,
-          matcher_stats: matcher?.stats ?? null,
-          hunter_results: matcher?.hunter_results ?? []
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // PRIMARY TARGET
-    if (url.pathname === "/api/target" && request.method === "GET") {
-      try {
-        const result = await buildTargets(env);
-        const target = result.targets[0] ?? null;
-
-        return json({
-          success: true,
-          found: !!target,
-          target,
-          stats: {
-            tracker_signals: result.trackerSignals,
-            matcher_hunter_results: result.matcherHunterResults,
-            secure_targets: result.targets.length,
-            placed: result.targets.filter(x => x.betPlaced).length
-          },
-          timestamp: new Date().toISOString()
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          found: false,
-          target: null,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // ALL TARGETS
-    if (url.pathname === "/api/targets" && request.method === "GET") {
-      try {
-        const result = await buildTargets(env);
-
-        return json({
-          success: true,
-          version: VERSION,
-          count: result.targets.length,
-          tracker_signals: result.trackerSignals,
-          matcher_hunter_results: result.matcherHunterResults,
-          placed: result.targets.filter(x => x.betPlaced).length,
-          targets: result.targets
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          targets: [],
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // DAILY
-    if (url.pathname === "/api/daily" && request.method === "GET") {
-      try {
-        await syncDailyFromTracker(env);
-        const matches = await getDailyMatches(env);
-
-        return json({
-          success: true,
-          version: VERSION,
-          date: sofiaDate(),
-          timezone: TIME_ZONE,
-          summary: buildDailySummary(matches),
-          matches
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          matches: [],
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // SAVE FRONTEND ODDS
-    if (url.pathname === "/api/odds" && request.method === "POST") {
-      try {
-        const body = await request.json<Obj>();
-        const eventId = safe(body?.eventId);
-        const overOdds = numberOrNull(body?.overOdds);
-        const underOdds = numberOrNull(body?.underOdds);
-
-        if (!eventId || overOdds === null || overOdds <= 1 || overOdds > 50) {
-          return json({
-            success: false,
-            error: "INVALID_ODDS_PAYLOAD"
-          }, 400);
-        }
-
-        const now = new Date().toISOString();
-
-        await env.DB.prepare(`
-          INSERT INTO live_odds (
-            event_id, match_name, minute, score, hunter_score,
-            market, selection, over_odds, under_odds,
-            source, created_at, updated_at
-          )
-          VALUES (
-            ?1, NULL, NULL, NULL, NULL,
-            '1H Total Goals', 'Over 0.5', ?2, ?3,
-            'CLOUDBET_FRONTEND', ?4, ?4
-          )
-          ON CONFLICT(event_id) DO UPDATE SET
-            over_odds = excluded.over_odds,
-            under_odds = excluded.under_odds,
-            source = excluded.source,
-            updated_at = excluded.updated_at
-        `).bind(eventId, overOdds, underOdds, now).run();
-
-        await env.DB.prepare(`
-          UPDATE daily_matches
-          SET found_odds = ?2, updated_at = ?3
-          WHERE event_id = ?1
-        `).bind(eventId, overOdds, now).run();
-
-        return json({
-          success: true,
-          action: "ODDS_SAVED",
-          data: await getStoredEvent(env, eventId)
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // GET ODDS
-    if (url.pathname === "/api/odds" && request.method === "GET") {
-      try {
-        const eventId = safe(url.searchParams.get("eventId"));
-
-        if (eventId) {
-          return json({
-            success: true,
-            data: await getStoredEvent(env, eventId)
-          });
-        }
-
-        const row = await env.DB.prepare(`
-          SELECT * FROM live_odds
-          ORDER BY updated_at DESC
-          LIMIT 1
-        `).first();
-
-        return json({
-          success: true,
-          data: row ?? null
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // SAVE BET STATUS
-    if (url.pathname === "/api/bet-status" && request.method === "POST") {
-      try {
-        const body = await request.json<Obj>();
-        const eventId = safe(body?.eventId);
-        const status = safe(body?.status).toUpperCase();
-
-        if (!eventId || status !== "PLACED") {
-          return json({
-            success: false,
-            error: "INVALID_BET_STATUS_PAYLOAD"
-          }, 400);
-        }
-
-        const market = safe(body?.market) || "1st Half Total Goals";
-        const selection = safe(body?.selection) || "O 0.5";
-        const stake = numberOrNull(body?.stake);
-        const odds = numberOrNull(body?.odds);
-        const source = safe(body?.source) || "CLOUDBET_FRONTEND";
-        const placedAt = safe(body?.placedAt) || new Date().toISOString();
-        const now = new Date().toISOString();
-        const stored = await getStoredEvent(env, eventId);
-
-        await env.DB.prepare(`
-          INSERT INTO bet_status (
-            event_id, match_name, status, market, selection,
-            stake, odds, source, placed_at, created_at, updated_at
-          )
-          VALUES (
-            ?1, ?2, 'PLACED', ?3, ?4,
-            ?5, ?6, ?7, ?8, ?9, ?9
-          )
-          ON CONFLICT(event_id) DO UPDATE SET
-            match_name = COALESCE(excluded.match_name, bet_status.match_name),
-            status = 'PLACED',
-            market = excluded.market,
-            selection = excluded.selection,
-            stake = excluded.stake,
-            odds = COALESCE(excluded.odds, bet_status.odds),
-            source = excluded.source,
-            placed_at = excluded.placed_at,
-            updated_at = excluded.updated_at
-        `).bind(
-          eventId,
-          stored?.match_name ?? null,
-          market,
-          selection,
-          stake,
-          odds,
-          source,
-          placedAt,
-          now
-        ).run();
-
-        await updateDailyPlaced(
-          env,
-          eventId,
-          odds,
-          stake,
-          placedAt
-        );
-
-        return json({
-          success: true,
-          action: "BET_PLACED_SAVED",
-          eventId
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // GET BET STATUS
-    if (url.pathname === "/api/bet-status" && request.method === "GET") {
-      try {
-        const eventId = safe(url.searchParams.get("eventId"));
-
-        if (!eventId) {
-          return json({
-            success: false,
-            error: "EVENT_ID_REQUIRED"
-          }, 400);
-        }
-
-        const row = await getBetStatus(env, eventId);
-
-        return json({
-          success: true,
-          data: row
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    if (url.pathname === "/" || url.pathname === "/dashboard") {
-      return new Response(renderHtml(), {
-        headers: {
-          "content-type": "text/html; charset=UTF-8",
-          "cache-control": "no-store"
-        }
-      });
-    }
-
-    return json({
-      success: false,
-      error: "NOT_FOUND"
-    }, 404);
-  }
-};
-
-
-// ============================================================
-// TABLES
-// ============================================================
-
-async function ensureTables(env: Env) {
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS live_odds (
-      event_id TEXT PRIMARY KEY,
-      match_name TEXT,
-      minute REAL,
-      score TEXT,
-      hunter_score REAL,
-      market TEXT,
-      selection TEXT,
-      over_odds REAL,
-      under_odds REAL,
-      source TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS bet_status (
-      event_id TEXT PRIMARY KEY,
-      match_name TEXT,
-      status TEXT NOT NULL,
-      market TEXT,
-      selection TEXT,
-      stake REAL,
-      odds REAL,
-      source TEXT,
-      placed_at TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS daily_matches (
-      event_id TEXT PRIMARY KEY,
-      signal_id TEXT,
-      match_id TEXT,
-      match_name TEXT NOT NULL,
-      entry_minute REAL,
-      hunter_score REAL,
-      found_odds REAL,
-      bet_status TEXT NOT NULL DEFAULT 'NOT_PLACED',
-      bet_odds REAL,
-      bet_stake REAL,
-      tracker_status TEXT DEFAULT 'PENDING',
-      tracker_result TEXT DEFAULT 'PENDING',
-      result_status TEXT DEFAULT 'PENDING',
-      day_key TEXT NOT NULL,
-      entry_time TEXT,
-      placed_at TEXT,
-      first_seen_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      finished_at TEXT
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_daily_matches_day
-    ON daily_matches(day_key)
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_daily_matches_match_id
-    ON daily_matches(match_id)
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_daily_matches_signal_id
-    ON daily_matches(signal_id)
-  `).run();
-}
-
-
-// ============================================================
-// TARGET BUILD
-// ============================================================
-
-async function buildTargets(env: Env) {
-  const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
-  const signals = extractHunterSignals(tracker);
-
-  if (!signals.length) {
-    return {
-      trackerSignals: 0,
-      matcherHunterResults: 0,
-      targets: []
-    };
-  }
-
-  const matcher = await callMatcher(env, signals);
-  const hunterResults = Array.isArray(matcher?.hunter_results)
-    ? matcher.hunter_results
-    : [];
-
-  const targets: Obj[] = [];
-
-  for (const item of hunterResults) {
-    const classification = safe(
-      item?.classification ??
-      item?.match_classification ??
-      item?.result?.classification
-    ).toUpperCase();
-
-    const secure =
-      item?.secure_match === true ||
-      item?.secure === true ||
-      classification === "CONFIDENT_MATCH";
-
-    if (!secure || classification && classification !== "CONFIDENT_MATCH") {
-      continue;
-    }
-
-    const signal =
-      item?.signal && typeof item.signal === "object"
-        ? item.signal
-        : item?.hunter ?? item?.tracker ?? {};
-
-    const cloudbet =
-      item?.cloudbet ??
-      item?.match ??
-      item?.matched ??
-      item?.event ??
-      {};
-
-    const eventId = safe(
-      cloudbet?.id ??
-      cloudbet?.eventId ??
-      cloudbet?.event_id ??
-      item?.cloudbet_event_id ??
-      item?.eventId
-    );
-
-    if (!eventId) continue;
-
-    const matchName = safe(
-      signal?.match_name ??
-      signal?.match ??
-      item?.signal_match ??
-      cloudbet?.name ??
-      cloudbet?.match
-    ) || "Hunter target";
-
-    const minute = numberOrNull(
-      signal?.entry_minute ??
-      signal?.minute ??
-      item?.entry_minute
-    );
-
-    const hunterScore = numberOrNull(
-      signal?.hunter_score ??
-      signal?.score ??
-      item?.hunter_score
-    );
-
-    const signalId = safe(signal?.id ?? item?.signal_id);
-    const matchId = safe(signal?.match_id ?? item?.match_id);
-    const entryTime = safe(signal?.entry_time ?? signal?.created_at);
-
-    await saveTarget(env, {
-      eventId,
-      matchName,
-      minute,
-      hunterScore
-    });
-
-    await saveDailyTarget(env, {
-      eventId,
-      signalId,
-      matchId,
-      matchName,
-      minute,
-      hunterScore,
-      entryTime
-    });
-
-    const oddsRow = await getStoredEvent(env, eventId);
-    const betRow = await getBetStatus(env, eventId);
-
-    targets.push({
-      eventId,
-      matchName,
-      cloudbetMatch: safe(cloudbet?.name ?? cloudbet?.match),
-      minute,
-      hunterScore,
-      classification: classification || "CONFIDENT_MATCH",
-      secureMatch: true,
-      overOdds: numberOrNull(oddsRow?.over_odds),
-      underOdds: numberOrNull(oddsRow?.under_odds),
-      oddsUpdatedAt: oddsRow?.updated_at ?? null,
-      betPlaced: safe(betRow?.status).toUpperCase() === "PLACED",
-      betStatus: betRow?.status ?? null,
-      betPlacedAt: betRow?.placed_at ?? null,
-      betStake: numberOrNull(betRow?.stake),
-      betOdds: numberOrNull(betRow?.odds)
-    });
-  }
-
-  targets.sort((a, b) => {
-    const ao = numberOrNull(a?.overOdds);
-    const bo = numberOrNull(b?.overOdds);
-
-    if (ao !== null && bo !== null) return bo - ao;
-    if (ao !== null) return -1;
-    if (bo !== null) return 1;
-
-    return (numberOrNull(b?.hunterScore) ?? 0) -
-           (numberOrNull(a?.hunterScore) ?? 0);
-  });
-
-  return {
-    trackerSignals: signals.length,
-    matcherHunterResults: hunterResults.length,
-    targets
-  };
-}
-
-
-async function saveTarget(env: Env, target: Obj) {
-  const now = new Date().toISOString();
-
-  await env.DB.prepare(`
-    INSERT INTO live_odds (
-      event_id, match_name, minute, score, hunter_score,
-      market, selection, over_odds, under_odds,
-      source, created_at, updated_at
-    )
-    VALUES (
-      ?1, ?2, ?3, NULL, ?4,
-      '1H Total Goals', 'Over 0.5', NULL, NULL,
-      'TOP_SIGNAL', ?5, ?5
-    )
-    ON CONFLICT(event_id) DO UPDATE SET
-      match_name = COALESCE(excluded.match_name, live_odds.match_name),
-      minute = COALESCE(excluded.minute, live_odds.minute),
-      hunter_score = COALESCE(excluded.hunter_score, live_odds.hunter_score)
-  `).bind(
-    target.eventId,
-    target.matchName,
-    target.minute,
-    target.hunterScore,
-    now
-  ).run();
-}
-
-
-async function getStoredEvent(env: Env, eventId: string): Promise<any> {
-  return await env.DB.prepare(`
-    SELECT * FROM live_odds
-    WHERE event_id = ?1
-    LIMIT 1
-  `).bind(eventId).first();
-}
-
-
-async function getBetStatus(env: Env, eventId: string): Promise<any> {
-  return await env.DB.prepare(`
-    SELECT * FROM bet_status
-    WHERE event_id = ?1
-    LIMIT 1
-  `).bind(eventId).first();
-}
-
-
-// ============================================================
-// MATCHER
-// ============================================================
-
-async function callMatcher(env: Env, signals: Obj[]) {
-  if (!signals.length) {
-    return {
-      success: true,
-      hunter_results: [],
-      stats: {
-        hunter_signals: 0,
-        hunter_secure_matches: 0
-      }
-    };
-  }
-
-  // Important matcher compatibility:
-  // do not pass signal: "HUNTER_ENTRY" as a nested signal object.
-  const cleanSignals = signals.map(s => {
-    const copy: Obj = { ...s };
-
-    if (typeof copy.signal === "string") {
-      delete copy.signal;
-    }
-
-    copy.type = "HUNTER_ENTRY";
-    copy.action = copy.action ?? "ENTRY";
-    copy.status = copy.status ?? "TRACKING";
-
-    return copy;
-  });
-
-  const query = encodeURIComponent(JSON.stringify(cleanSignals));
-
-  return await fetchServiceJSON(
-    env.MATCHER,
-    "/match?signals=" + query
   );
 }
 
 
 // ============================================================
-// TRACKER SIGNAL EXTRACTION
+// NORMALIZATION
 // ============================================================
 
-function extractHunterSignals(data: any): Obj[] {
-  let raw: any[] = [];
+function normalizeText(
+  value: any
+): string {
 
-  if (Array.isArray(data)) {
-    raw = data;
-  } else if (Array.isArray(data?.signals)) {
-    raw = data.signals;
-  } else if (Array.isArray(data?.entries)) {
-    raw = data.entries;
-  } else if (Array.isArray(data?.hunter_entries)) {
-    raw = data.hunter_entries;
-  } else if (Array.isArray(data?.data)) {
-    raw = data.data;
-  }
-
-  const out: Obj[] = [];
-  const seen = new Set<string>();
-
-  for (const item of raw) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    const marker = [
-      item?.type,
-      typeof item?.signal === "string" ? item.signal : "",
-      item?.action
-    ]
-      .map(safe)
-      .join(" ")
-      .toUpperCase();
-
-    const status =
-      safe(item?.status)
-        .toUpperCase();
-
-    const isHunter =
-      marker.includes("HUNTER_ENTRY") ||
-      marker.includes("HUNTER") ||
-      (
-        safe(item?.action).toUpperCase() === "ENTRY" &&
-        status === "TRACKING"
-      );
-
-    if (!isHunter) {
-      continue;
-    }
-
-    const normalized =
-      normalizeHunterSignal(item);
-
-    if (!normalized) {
-      continue;
-    }
-
-    const key =
-      safe(normalized.id) ||
-      (
-        safe(normalized.match_id) +
-        "|" +
-        safe(normalized.entry_time) +
-        "|" +
-        safe(normalized.match_name)
-      );
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-    out.push(normalized);
-  }
-
-  return out;
+  return String(
+    value ?? ""
+  )
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .toLowerCase()
+    .replace(
+      /&/g,
+      " and "
+    )
+    .replace(
+      /['’`]/g,
+      ""
+    )
+    .replace(
+      /[^a-z0-9]+/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
 }
 
 
-function normalizeHunterSignal(x: Obj): Obj | null {
-  const matchName =
-    safe(
-      x?.match_name ??
-      x?.match
+// ============================================================
+// ALIASES
+// ============================================================
+
+const TEAM_ALIASES:
+  Record<string, string> = {
+
+  "man city":
+    "manchester city",
+
+  "man utd":
+    "manchester united",
+
+  "man united":
+    "manchester united",
+
+  "man u":
+    "manchester united",
+
+  "manchester utd":
+    "manchester united",
+
+  "psg":
+    "paris saint germain",
+
+  "paris sg":
+    "paris saint germain",
+
+  "inter":
+    "inter milan",
+
+  "inter milano":
+    "inter milan",
+
+  "internazionale":
+    "inter milan",
+
+  "fc internazionale":
+    "inter milan",
+
+  "atletico":
+    "atletico madrid",
+
+  "atletico de madrid":
+    "atletico madrid",
+
+  "sporting cp":
+    "sporting lisbon",
+
+  "sporting lisboa":
+    "sporting lisbon",
+
+  "red star":
+    "crvena zvezda",
+
+  "red star belgrade":
+    "crvena zvezda",
+
+  "psv eindhoven":
+    "psv",
+
+  "bayern munchen":
+    "bayern munich",
+
+  "utd":
+    "united",
+
+  "ath":
+    "athletic",
+
+  "dep":
+    "deportivo",
+
+  "depor":
+    "deportivo",
+
+  // observed aliases
+  "oster":
+    "osters",
+
+  "osters":
+    "osters",
+
+  "osters if":
+    "osters",
+
+  "floridsdorfer ac":
+    "fac wien",
+
+  "floridsdorfer":
+    "fac wien",
+
+  "fac wien":
+    "fac wien",
+
+  "bregenz":
+    "schwarz weiss bregenz",
+
+  "sw bregenz":
+    "schwarz weiss bregenz",
+
+  "schwarz weiss bregenz":
+    "schwarz weiss bregenz"
+};
+
+
+const GENERIC_WORDS =
+  new Set([
+    "fc",
+    "cf",
+    "sc",
+    "ac",
+    "afc",
+    "ca",
+    "cd",
+    "sd",
+    "ss",
+    "as",
+    "us",
+    "ud",
+    "aa",
+    "ad",
+    "rc",
+    "fk",
+    "sk",
+    "ks",
+    "sv",
+    "vfb",
+    "vfl",
+    "club",
+    "calcio",
+    "spa",
+    "srl",
+    "football",
+    "soccer"
+  ]);
+
+
+const WEAK_TEAM_TOKENS =
+  new Set([
+    "city",
+    "united",
+    "athletic",
+    "sporting",
+    "racing",
+    "real",
+    "deportivo",
+    "olympic",
+    "olympique"
+  ]);
+
+
+// ============================================================
+// TEAM NORMALIZATION
+// ============================================================
+
+function applyAlias(
+  value: string
+): string {
+
+  return (
+    TEAM_ALIASES[value] ??
+    value
+  );
+}
+
+
+function normalizeTeam(
+  value: any
+): string {
+
+  let s =
+    normalizeText(
+      value
     );
 
-  let home =
-    safe(
-      typeof x?.home === "object"
-        ? x?.home?.name
-        : x?.home
+  if (!s) {
+    return "";
+  }
+
+  s =
+    applyAlias(
+      s
     );
 
-  let away =
-    safe(
-      typeof x?.away === "object"
-        ? x?.away?.name
-        : x?.away
+  const tokens =
+    s
+      .split(" ")
+      .filter(Boolean)
+      .map(
+        token =>
+          TEAM_ALIASES[token] ??
+          token
+      )
+      .filter(
+        token =>
+          !GENERIC_WORDS.has(
+            token
+          )
+      );
+
+  s =
+    tokens.join(" ");
+
+  s =
+    applyAlias(
+      s
+    );
+
+  return s;
+}
+
+
+function teamTokens(
+  value: any
+): string[] {
+
+  return normalizeTeam(
+    value
+  )
+    .split(" ")
+    .filter(Boolean);
+}
+
+
+// ============================================================
+// CATEGORY PROTECTION
+// ============================================================
+
+function teamCategory(
+  value: any
+): string {
+
+  const s =
+    normalizeText(
+      value
     );
 
   if (
-    (!home || !away) &&
-    matchName
+    /\bu\s*\d{2}\b/.test(
+      s
+    )
   ) {
-    const parts =
-      matchName.split(
-        /\s+-\s+|\s+v\s+|\s+vs\.?\s+/i
+    return (
+      s.match(
+        /\bu\s*(\d{2})\b/
+      )?.[1] ??
+      ""
+    )
+      ? "U" +
+        (
+          s.match(
+            /\bu\s*(\d{2})\b/
+          )?.[1] ??
+          ""
+        )
+      : "";
+  }
+
+  if (
+    /\bwomen\b|\bw\b/.test(
+      s
+    )
+  ) {
+    return "WOMEN";
+  }
+
+  if (
+    /\breserve\b|\breserves\b|\bii\b|\b2\b/.test(
+      s
+    )
+  ) {
+    return "RESERVE";
+  }
+
+  return "SENIOR";
+}
+
+
+function categoryCompatible(
+  a: any,
+  b: any
+): boolean {
+
+  const ca =
+    teamCategory(
+      a
+    );
+
+  const cb =
+    teamCategory(
+      b
+    );
+
+  if (
+    ca === "SENIOR" ||
+    cb === "SENIOR"
+  ) {
+    return true;
+  }
+
+  return ca === cb;
+}
+
+
+// ============================================================
+// LEVENSHTEIN
+// ============================================================
+
+function levenshtein(
+  a: string,
+  b: string
+): number {
+
+  if (a === b) {
+    return 0;
+  }
+
+  if (!a.length) {
+    return b.length;
+  }
+
+  if (!b.length) {
+    return a.length;
+  }
+
+  const prev =
+    new Array(
+      b.length + 1
+    );
+
+  const curr =
+    new Array(
+      b.length + 1
+    );
+
+  for (
+    let j = 0;
+    j <= b.length;
+    j++
+  ) {
+    prev[j] = j;
+  }
+
+  for (
+    let i = 1;
+    i <= a.length;
+    i++
+  ) {
+
+    curr[0] = i;
+
+    for (
+      let j = 1;
+      j <= b.length;
+      j++
+    ) {
+
+      const cost =
+        a[i - 1] ===
+        b[j - 1]
+          ? 0
+          : 1;
+
+      curr[j] =
+        Math.min(
+          prev[j] + 1,
+          curr[j - 1] + 1,
+          prev[j - 1] + cost
+        );
+    }
+
+    for (
+      let j = 0;
+      j <= b.length;
+      j++
+    ) {
+      prev[j] =
+        curr[j];
+    }
+  }
+
+  return prev[b.length];
+}
+
+
+function tokenSimilarity(
+  a: string,
+  b: string
+): number {
+
+  if (
+    !a ||
+    !b
+  ) {
+    return 0;
+  }
+
+  if (
+    a === b
+  ) {
+    return 1;
+  }
+
+  if (
+    a.length >= 4 &&
+    b.length >= 4 &&
+    (
+      a.includes(b) ||
+      b.includes(a)
+    )
+  ) {
+
+    return (
+      Math.min(
+        a.length,
+        b.length
+      ) /
+      Math.max(
+        a.length,
+        b.length
+      )
+    );
+  }
+
+  const distance =
+    levenshtein(
+      a,
+      b
+    );
+
+  return Math.max(
+    0,
+    1 -
+      distance /
+      Math.max(
+        a.length,
+        b.length
+      )
+  );
+}
+
+
+// ============================================================
+// TEAM SCORE
+// ============================================================
+
+function teamScore(
+  a: any,
+  b: any
+): number {
+
+  const A =
+    normalizeTeam(
+      a
+    );
+
+  const B =
+    normalizeTeam(
+      b
+    );
+
+  if (
+    !A ||
+    !B
+  ) {
+    return 0;
+  }
+
+  if (
+    A === B
+  ) {
+    return 1;
+  }
+
+  if (
+    !categoryCompatible(
+      a,
+      b
+    )
+  ) {
+    return 0;
+  }
+
+  const aTokens =
+    A.split(" ")
+      .filter(Boolean);
+
+  const bTokens =
+    B.split(" ")
+      .filter(Boolean);
+
+  if (
+    !aTokens.length ||
+    !bTokens.length
+  ) {
+    return 0;
+  }
+
+  const shorter =
+    aTokens.length <=
+    bTokens.length
+      ? aTokens
+      : bTokens;
+
+  const longer =
+    aTokens.length <=
+    bTokens.length
+      ? bTokens
+      : aTokens;
+
+  const shorterAllExact =
+    shorter.every(
+      token =>
+        longer.includes(
+          token
+        )
+    );
+
+  if (
+    shorterAllExact &&
+    shorter.length >= 2
+  ) {
+
+    const extraTokens =
+      longer.filter(
+        token =>
+          !shorter.includes(
+            token
+          )
       );
 
-    if (parts.length >= 2) {
-      home =
-        home ||
-        safe(parts[0]);
+    const meaningfulExtra =
+      extraTokens.filter(
+        token =>
+          !/^u\d{2}$/.test(
+            token
+          ) &&
+          token !==
+            "reserve" &&
+          token !==
+            "women" &&
+          !/^team[234]$/.test(
+            token
+          )
+      );
 
-      away =
-        away ||
-        safe(
-          parts
-            .slice(1)
-            .join(" - ")
+    if (
+      !meaningfulExtra.length
+    ) {
+      return 0.97;
+    }
+  }
+
+  let fuzzy = 0;
+  let exact = 0;
+
+  for (
+    const aToken
+    of aTokens
+  ) {
+
+    let best = 0;
+
+    for (
+      const bToken
+      of bTokens
+    ) {
+
+      if (
+        aToken ===
+        bToken
+      ) {
+        best = 1;
+        break;
+      }
+
+      const sim =
+        tokenSimilarity(
+          aToken,
+          bToken
+        );
+
+      if (
+        sim > best
+      ) {
+        best = sim;
+      }
+    }
+
+    if (
+      best >= 0.90
+    ) {
+      fuzzy += best;
+    }
+    else if (
+      best >= 0.75
+    ) {
+      fuzzy +=
+        best * 0.65;
+    }
+  }
+
+  for (
+    const token
+    of aTokens
+  ) {
+
+    if (
+      bTokens.includes(
+        token
+      )
+    ) {
+      exact++;
+    }
+  }
+
+  const minTokens =
+    Math.min(
+      aTokens.length,
+      bTokens.length
+    );
+
+  const precision =
+    fuzzy /
+    Math.max(
+      1,
+      aTokens.length
+    );
+
+  const recall =
+    fuzzy /
+    Math.max(
+      1,
+      bTokens.length
+    );
+
+  const overlap =
+    exact /
+    Math.max(
+      1,
+      minTokens
+    );
+
+  let score =
+    precision * 0.40 +
+    recall * 0.25 +
+    overlap * 0.35;
+
+  if (
+    aTokens.length === 1 &&
+    bTokens.length === 1
+  ) {
+
+    const sim =
+      tokenSimilarity(
+        aTokens[0],
+        bTokens[0]
+      );
+
+    if (
+      sim >= 0.90
+    ) {
+      score =
+        Math.max(
+          score,
+          sim
         );
     }
   }
 
   if (
-    !matchName &&
-    (!home || !away)
+    minTokens === 1 &&
+    bTokens.length >= 3 &&
+    overlap === 0
   ) {
-    return null;
+    score *= 0.50;
+  }
+
+  if (
+    minTokens === 1 &&
+    WEAK_TEAM_TOKENS.has(
+      aTokens[0]
+    )
+  ) {
+    score *= 0.35;
+  }
+
+  const exactMeaningful =
+    aTokens.filter(
+      token =>
+        bTokens.includes(
+          token
+        ) &&
+        !WEAK_TEAM_TOKENS.has(
+          token
+        )
+    ).length;
+
+  if (
+    exactMeaningful === 0 &&
+    overlap > 0
+  ) {
+
+    score =
+      Math.min(
+        score,
+        0.58
+      );
+  }
+
+  return Math.min(
+    1,
+    score
+  );
+}
+
+
+// ============================================================
+// HOME / AWAY
+// ============================================================
+
+function splitMatchName(
+  value: any
+): {
+  home: string | null;
+  away: string | null;
+} {
+
+  const text =
+    String(
+      value ?? ""
+    ).trim();
+
+  if (!text) {
+    return {
+      home: null,
+      away: null
+    };
+  }
+
+  const separators = [
+    " - ",
+    " v ",
+    " vs ",
+    " VS ",
+    " @ "
+  ];
+
+  for (
+    const separator
+    of separators
+  ) {
+
+    const index =
+      text.indexOf(
+        separator
+      );
+
+    if (
+      index >= 0
+    ) {
+
+      return {
+        home:
+          text
+            .slice(
+              0,
+              index
+            )
+            .trim(),
+
+        away:
+          text
+            .slice(
+              index +
+              separator.length
+            )
+            .trim()
+      };
+    }
   }
 
   return {
+    home: null,
+    away: null
+  };
+}
+
+
+function extractHome(
+  match: AnyObj
+): string | null {
+
+  if (
+    typeof match?.home ===
+    "string"
+  ) {
+    return match.home;
+  }
+
+  if (
+    typeof match?.homeTeam ===
+    "string"
+  ) {
+    return match.homeTeam;
+  }
+
+  if (
+    typeof match?.home_name ===
+    "string"
+  ) {
+    return match.home_name;
+  }
+
+  if (
+    typeof match?.home?.name ===
+    "string"
+  ) {
+    return match.home.name;
+  }
+
+  return splitMatchName(
+    match?.match ??
+    match?.name ??
+    ""
+  ).home;
+}
+
+
+function extractAway(
+  match: AnyObj
+): string | null {
+
+  if (
+    typeof match?.away ===
+    "string"
+  ) {
+    return match.away;
+  }
+
+  if (
+    typeof match?.awayTeam ===
+    "string"
+  ) {
+    return match.awayTeam;
+  }
+
+  if (
+    typeof match?.away_name ===
+    "string"
+  ) {
+    return match.away_name;
+  }
+
+  if (
+    typeof match?.away?.name ===
+    "string"
+  ) {
+    return match.away.name;
+  }
+
+  return splitMatchName(
+    match?.match ??
+    match?.name ??
+    ""
+  ).away;
+}
+
+
+// ============================================================
+// COMPETITION / COUNTRY
+// ============================================================
+
+function competitionText(
+  match: AnyObj
+): string {
+
+  const competition =
+    match?.competition;
+
+  if (
+    typeof competition ===
+    "string"
+  ) {
+    return normalizeText(
+      competition
+    );
+  }
+
+  if (
+    typeof competition?.name ===
+    "string"
+  ) {
+    return normalizeText(
+      competition.name
+    );
+  }
+
+  if (
+    typeof competition?.key ===
+    "string"
+  ) {
+    return normalizeText(
+      competition.key
+    );
+  }
+
+  const league =
+    match?.league;
+
+  if (
+    typeof league ===
+    "string"
+  ) {
+    return normalizeText(
+      league
+    );
+  }
+
+  if (
+    typeof league?.name ===
+    "string"
+  ) {
+    return normalizeText(
+      league.name
+    );
+  }
+
+  return "";
+}
+
+
+function countryText(
+  match: AnyObj
+): string {
+
+  const fields = [
+    match?.country,
+    match?.country_name,
+    match?.competition?.country,
+    match?.league?.country
+  ];
+
+  for (
+    const value
+    of fields
+  ) {
+
+    if (
+      typeof value ===
+        "string" &&
+      value.trim()
+    ) {
+
+      return normalizeText(
+        value
+      );
+    }
+  }
+
+  return "";
+}
+
+
+function competitionSimilarity(
+  a: AnyObj,
+  b: AnyObj
+): number {
+
+  const A =
+    competitionText(
+      a
+    );
+
+  const B =
+    competitionText(
+      b
+    );
+
+  if (
+    !A ||
+    !B
+  ) {
+    return 0;
+  }
+
+  if (
+    A === B
+  ) {
+    return 1;
+  }
+
+  const aWords =
+    new Set(
+      A.split(" ")
+        .filter(Boolean)
+    );
+
+  const bWords =
+    new Set(
+      B.split(" ")
+        .filter(Boolean)
+    );
+
+  let overlap = 0;
+
+  for (
+    const word
+    of aWords
+  ) {
+    if (
+      bWords.has(
+        word
+      )
+    ) {
+      overlap++;
+    }
+  }
+
+  return (
+    overlap /
+    Math.max(
+      1,
+      Math.min(
+        aWords.size,
+        bWords.size
+      )
+    )
+  );
+}
+
+
+function countrySimilarity(
+  a: AnyObj,
+  b: AnyObj
+): number {
+
+  const A =
+    countryText(
+      a
+    );
+
+  const B =
+    countryText(
+      b
+    );
+
+  if (
+    !A ||
+    !B
+  ) {
+    return 0;
+  }
+
+  return A === B
+    ? 1
+    : 0;
+}
+
+
+// ============================================================
+// SCORE
+// ============================================================
+
+function detailedMatchScore(
+  v27: AnyObj,
+  cb: AnyObj
+): AnyObj {
+
+  const vHome =
+    extractHome(
+      v27
+    );
+
+  const vAway =
+    extractAway(
+      v27
+    );
+
+  const cHome =
+    extractHome(
+      cb
+    );
+
+  const cAway =
+    extractAway(
+      cb
+    );
+
+  if (
+    !vHome ||
+    !vAway ||
+    !cHome ||
+    !cAway
+  ) {
+
+    return {
+      total: 0,
+      baseScore: 0,
+      homeScore: 0,
+      awayScore: 0,
+      reverseHomeScore: 0,
+      reverseAwayScore: 0,
+      direction: "NONE",
+      competitionScore: 0,
+      countryScore: 0
+    };
+  }
+
+  const homeScore =
+    teamScore(
+      vHome,
+      cHome
+    );
+
+  const awayScore =
+    teamScore(
+      vAway,
+      cAway
+    );
+
+  const reverseHomeScore =
+    teamScore(
+      vHome,
+      cAway
+    );
+
+  const reverseAwayScore =
+    teamScore(
+      vAway,
+      cHome
+    );
+
+  const normal =
+    (
+      homeScore +
+      awayScore
+    ) / 2;
+
+  const reversed =
+    (
+      reverseHomeScore +
+      reverseAwayScore
+    ) / 2;
+
+  let direction =
+    "NORMAL";
+
+  let baseScore =
+    normal;
+
+  if (
+    reversed > normal &&
+    reverseHomeScore >=
+      REVERSED_CONFIDENT_SCORE &&
+    reverseAwayScore >=
+      REVERSED_CONFIDENT_SCORE
+  ) {
+
+    direction =
+      "REVERSED";
+
+    baseScore =
+      reversed;
+  }
+
+  const competitionScore =
+    competitionSimilarity(
+      v27,
+      cb
+    );
+
+  const countryScore =
+    countrySimilarity(
+      v27,
+      cb
+    );
+
+  let total =
+    baseScore;
+
+  if (
+    competitionScore >=
+      0.80
+  ) {
+    total +=
+      COMPETITION_BONUS;
+  }
+
+  if (
+    countryScore === 1
+  ) {
+    total +=
+      COUNTRY_BONUS;
+  }
+
+  return {
+    total:
+      Math.min(
+        1,
+        total
+      ),
+
+    baseScore,
+    homeScore,
+    awayScore,
+    reverseHomeScore,
+    reverseAwayScore,
+    direction,
+    competitionScore,
+    countryScore
+  };
+}
+
+
+// ============================================================
+// CLASSIFY
+// ============================================================
+
+function classifyMatch(
+  detail: AnyObj,
+  threshold: number
+): AnyObj {
+
+  const home =
+    detail.homeScore;
+
+  const away =
+    detail.awayScore;
+
+  const total =
+    detail.total;
+
+  if (
+    detail.direction ===
+      "REVERSED"
+  ) {
+
+    if (
+      detail.reverseHomeScore >=
+        REVERSED_CONFIDENT_SCORE &&
+      detail.reverseAwayScore >=
+        REVERSED_CONFIDENT_SCORE
+    ) {
+
+      return {
+        classification:
+          "CONFIDENT_MATCH",
+
+        reason:
+          "STRONG_REVERSED_TWO_SIDED_MATCH"
+      };
+    }
+
+    return {
+      classification:
+        "REVERSED_CANDIDATE",
+
+      reason:
+        "HOME_AWAY_DIRECTION_REVERSED"
+    };
+  }
+
+  if (
+    home >=
+      STRONG_TEAM_SCORE &&
+    away >=
+      STRONG_TEAM_SCORE &&
+    total >=
+      Math.max(
+        threshold,
+        CONFIDENT_TOTAL_SCORE
+      )
+  ) {
+
+    return {
+      classification:
+        "CONFIDENT_MATCH",
+
+      reason:
+        "STRONG_TWO_SIDED_MATCH"
+    };
+  }
+
+  if (
+    home >=
+      POSSIBLE_TEAM_SCORE &&
+    away >=
+      POSSIBLE_TEAM_SCORE &&
+    total >=
+      POSSIBLE_TOTAL_SCORE
+  ) {
+
+    return {
+      classification:
+        "POSSIBLE_MATCH",
+
+      reason:
+        "BOTH_TEAMS_HAVE_REASONABLE_SIMILARITY"
+    };
+  }
+
+  if (
+    (
+      home >= 0.80 &&
+      away <
+        WEAK_SIDE_LIMIT
+    ) ||
+    (
+      away >= 0.80 &&
+      home <
+        WEAK_SIDE_LIMIT
+    )
+  ) {
+
+    return {
+      classification:
+        "FALSE_POSITIVE_RISK",
+
+      reason:
+        "ONLY_ONE_TEAM_MATCHES"
+    };
+  }
+
+  if (
+    total >=
+      Math.max(
+        0,
+        threshold - 0.10
+      )
+  ) {
+
+    return {
+      classification:
+        "CLOSE_BELOW_THRESHOLD",
+
+      reason:
+        "BOTH_SIDES_NOT_STRONG_ENOUGH"
+    };
+  }
+
+  return {
+    classification:
+      "TRUE_UNMATCHED",
+
+    reason:
+      "WEAK_TWO_SIDED_SIMILARITY"
+  };
+}
+
+
+// ============================================================
+// PREPARED
+// ============================================================
+
+interface PreparedMatch {
+  raw: AnyObj;
+  id: string;
+  home: string;
+  away: string;
+  normalizedHome: string;
+  normalizedAway: string;
+  homeTokens: string[];
+  awayTokens: string[];
+}
+
+
+function prepareMatch(
+  match: AnyObj
+): PreparedMatch {
+
+  const home =
+    extractHome(
+      match
+    ) ?? "";
+
+  const away =
+    extractAway(
+      match
+    ) ?? "";
+
+  return {
+    raw:
+      match,
+
     id:
-      x?.id ??
-      null,
-
-    type:
-      "HUNTER_ENTRY",
-
-    action:
-      safe(x?.action) ||
-      "ENTRY",
-
-    status:
-      safe(x?.status) ||
-      "TRACKING",
-
-    match_id:
-      safe(x?.match_id),
-
-    match_name:
-      matchName ||
-      (home + " - " + away),
-
-    match:
-      matchName ||
-      (home + " - " + away),
-
-    league:
-      safe(x?.league),
-
-    entry_time:
-      safe(
-        x?.entry_time ??
-        x?.created_at
-      ),
-
-    entry_minute:
-      numberOrNull(
-        x?.entry_minute ??
-        x?.minute
-      ),
-
-    hunter_score:
-      numberOrNull(
-        x?.hunter_score ??
-        x?.goal_signal?.score
-      ),
-
-    goal_pressure:
-      numberOrNull(
-        x?.goal_pressure
-      ),
-
-    danger_index:
-      numberOrNull(
-        x?.danger_index
-      ),
-
-    attack_score:
-      numberOrNull(
-        x?.attack_score
+      String(
+        match?.id ??
+        match?.event_id ??
+        match?.key ??
+        ""
       ),
 
     home,
     away,
 
-    score:
-      x?.score ?? {
-        home:
-          numberOrNull(
-            x?.entry_home_score
-          ) ?? 0,
+    normalizedHome:
+      normalizeTeam(
+        home
+      ),
 
-        away:
-          numberOrNull(
-            x?.entry_away_score
-          ) ?? 0
-      }
+    normalizedAway:
+      normalizeTeam(
+        away
+      ),
+
+    homeTokens:
+      teamTokens(
+        home
+      ),
+
+    awayTokens:
+      teamTokens(
+        away
+      )
   };
 }
 
 
 // ============================================================
-// DAILY LOG
+// CLOUD BET EXTRACTION
 // ============================================================
 
-async function saveDailyTarget(env: Env, target: Obj) {
-  const now = new Date().toISOString();
-  const dayKey = sofiaDate(target.entryTime || now);
+function extractCloudbetMatches(
+  data: any
+): AnyObj[] {
 
-  const bet = await getBetStatus(env, target.eventId);
-
-  await env.DB.prepare(`
-    INSERT INTO daily_matches (
-      event_id, signal_id, match_id, match_name,
-      entry_minute, hunter_score, found_odds,
-      bet_status, bet_odds, bet_stake,
-      tracker_status, tracker_result, result_status,
-      day_key, entry_time, placed_at,
-      first_seen_at, updated_at, finished_at
+  if (
+    Array.isArray(
+      data?.events
     )
-    VALUES (
-      ?1, ?2, ?3, ?4,
-      ?5, ?6, NULL,
-      ?7, ?8, ?9,
-      'TRACKING', 'PENDING', 'PENDING',
-      ?10, ?11, ?12,
-      ?13, ?13, NULL
+  ) {
+    return data.events;
+  }
+
+  if (
+    Array.isArray(
+      data?.matches
     )
-    ON CONFLICT(event_id) DO UPDATE SET
-      signal_id = COALESCE(excluded.signal_id, daily_matches.signal_id),
-      match_id = COALESCE(excluded.match_id, daily_matches.match_id),
-      match_name = COALESCE(excluded.match_name, daily_matches.match_name),
-      entry_minute = COALESCE(excluded.entry_minute, daily_matches.entry_minute),
-      hunter_score = COALESCE(excluded.hunter_score, daily_matches.hunter_score),
-      updated_at = excluded.updated_at
-  `).bind(
-    target.eventId,
-    target.signalId || null,
-    target.matchId || null,
-    target.matchName,
-    target.minute,
-    target.hunterScore,
-    safe(bet?.status).toUpperCase() === "PLACED" ? "PLACED" : "NOT_PLACED",
-    numberOrNull(bet?.odds),
-    numberOrNull(bet?.stake),
-    dayKey,
-    target.entryTime || null,
-    bet?.placed_at ?? null,
-    now
-  ).run();
-}
-
-
-async function updateDailyPlaced(
-  env: Env,
-  eventId: string,
-  odds: number | null,
-  stake: number | null,
-  placedAt: string
-) {
-  const now = new Date().toISOString();
-
-  await env.DB.prepare(`
-    UPDATE daily_matches
-    SET
-      bet_status = 'PLACED',
-      bet_odds = COALESCE(?2, bet_odds, found_odds),
-      bet_stake = COALESCE(?3, bet_stake),
-      placed_at = ?4,
-      updated_at = ?5
-    WHERE event_id = ?1
-  `).bind(
-    eventId,
-    odds,
-    stake,
-    placedAt,
-    now
-  ).run();
-}
-
-
-async function syncDailyFromTracker(env: Env) {
-  const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
-  await syncDailyFromTrackerData(env, tracker);
-}
-
-
-async function syncDailyFromTrackerData(env: Env, tracker: any) {
-  const records = extractTrackerRecords(tracker);
-
-  if (!records.length) return;
-
-  const today = sofiaDate();
-  const rows = await env.DB.prepare(`
-    SELECT event_id, signal_id, match_id, match_name
-    FROM daily_matches
-    WHERE day_key = ?1
-  `).bind(today).all();
-
-  const daily = Array.isArray(rows?.results) ? rows.results : [];
-
-  for (const row of daily) {
-    const record = findTrackerRecordForDaily(row, records);
-    if (!record) continue;
-
-    const normalized = normalizeTrackerResult(record);
-    if (!normalized) continue;
-
-    const now = new Date().toISOString();
-
-    await env.DB.prepare(`
-      UPDATE daily_matches
-      SET
-        tracker_status = ?2,
-        tracker_result = ?3,
-        result_status = ?4,
-        updated_at = ?5,
-        finished_at = CASE
-          WHEN ?4 IN ('WIN','LOSS')
-          THEN COALESCE(finished_at, ?5)
-          ELSE finished_at
-        END
-      WHERE event_id = ?1
-    `).bind(
-      row.event_id,
-      normalized.trackerStatus,
-      normalized.trackerResult,
-      normalized.resultStatus,
-      now
-    ).run();
-  }
-}
-
-
-function extractTrackerRecords(data: any): Obj[] {
-  const candidates: any[][] = [];
-
-  if (Array.isArray(data)) {
-    candidates.push(data);
-  }
-
-  if (Array.isArray(data?.signals)) {
-    candidates.push(data.signals);
-  }
-
-  if (Array.isArray(data?.entries)) {
-    candidates.push(data.entries);
-  }
-
-  if (Array.isArray(data?.hunter_entries)) {
-    candidates.push(data.hunter_entries);
-  }
-
-  if (Array.isArray(data?.data)) {
-    candidates.push(data.data);
-  }
-
-  const out: Obj[] = [];
-  const seen = new Set<string>();
-
-  for (const arr of candidates) {
-    for (const value of arr) {
-      if (!value || typeof value !== "object") {
-        continue;
-      }
-
-      const key =
-        safe(value?.id) ||
-        (
-          safe(value?.match_id) +
-          "|" +
-          safe(value?.match_name ?? value?.match) +
-          "|" +
-          safe(value?.status) +
-          "|" +
-          safe(value?.result)
-        );
-
-      if (seen.has(key)) {
-        continue;
-      }
-
-      seen.add(key);
-      out.push(value);
-    }
-  }
-
-  return out;
-}
-
-
-function findTrackerRecordForDaily(row: any, records: Obj[]): Obj | null {
-  const signalId = safe(row?.signal_id);
-  const matchId = safe(row?.match_id);
-  const matchName = normalizeName(row?.match_name);
-
-  let best: Obj | null = null;
-
-  for (const r of records) {
-    if (signalId && safe(r?.id) === signalId) {
-      return r;
-    }
-
-    if (matchId && safe(r?.match_id) === matchId) {
-      best = r;
-      continue;
-    }
-
-    const rName = normalizeName(r?.match_name ?? r?.match);
-
-    if (!best && matchName && rName && matchName === rName) {
-      best = r;
-    }
-  }
-
-  return best;
-}
-
-
-function normalizeTrackerResult(record: Obj) {
-  const status = safe(record?.status).toUpperCase();
-  const result = safe(record?.result).toUpperCase();
-  const action = safe(record?.action).toUpperCase();
-  const type = safe(record?.type).toUpperCase();
-
-  const text = [status, result, action, type]
-    .join(" ")
-    .replace(/_/g, " ");
-
-  if (
-    text.includes("NO GOAL") ||
-    text.includes("NO-GOAL")
   ) {
-    return {
-      trackerStatus: status || "FINISHED",
-      trackerResult: result || "NO GOAL",
-      resultStatus: "LOSS"
-    };
+    return data.matches;
   }
 
   if (
-    text.includes("GOAL HIT") ||
-    /\bGOAL\b/.test(text)
+    Array.isArray(
+      data?.live_matches
+    )
   ) {
-    return {
-      trackerStatus: status || "FINISHED",
-      trackerResult: result || "GOAL HIT",
-      resultStatus: "WIN"
-    };
+    return data.live_matches;
+  }
+
+  return [];
+}
+
+
+function isCloudbetLive(
+  match: AnyObj
+): boolean {
+
+  const status =
+    String(
+      match?.status ??
+      ""
+    )
+      .trim()
+      .toUpperCase();
+
+  if (
+    status ===
+      "TRADING_LIVE" ||
+    status ===
+      "LIVE" ||
+    status.includes(
+      "LIVE"
+    )
+  ) {
+    return true;
   }
 
   if (
-    status === "TRACKING" ||
-    text.includes("ENTRY") ||
-    text.includes("PENDING")
+    match?.live === true
   ) {
-    return {
-      trackerStatus: status || "TRACKING",
-      trackerResult: result || "PENDING",
-      resultStatus: "PENDING"
-    };
+    return true;
   }
 
-  return null;
-}
-
-
-async function getDailyMatches(env: Env): Promise<Obj[]> {
-  const result = await env.DB.prepare(`
-    SELECT *
-    FROM daily_matches
-    WHERE day_key = ?1
-    ORDER BY
-      COALESCE(entry_time, first_seen_at) DESC,
-      first_seen_at DESC
-  `).bind(sofiaDate()).all();
-
-  return Array.isArray(result?.results)
-    ? result.results as Obj[]
-    : [];
-}
-
-
-function buildDailySummary(matches: Obj[]) {
-  const today = matches.length;
-  const placedRows = matches.filter(
-    x => safe(x?.bet_status).toUpperCase() === "PLACED"
-  );
-
-  const wins = placedRows.filter(
-    x => safe(x?.result_status).toUpperCase() === "WIN"
-  ).length;
-
-  const losses = placedRows.filter(
-    x => safe(x?.result_status).toUpperCase() === "LOSS"
-  ).length;
-
-  const settled = wins + losses;
-
-  return {
-    today,
-    placed: placedRows.length,
-    wins,
-    losses,
-    notPlaced: today - placedRows.length,
-    pending: placedRows.filter(
-      x => safe(x?.result_status).toUpperCase() === "PENDING"
-    ).length,
-    successRate: settled > 0
-      ? (wins / settled) * 100
-      : null
-  };
+  return false;
 }
 
 
@@ -1256,730 +1631,1324 @@ async function fetchServiceJSON(
   service: Fetcher,
   path: string
 ): Promise<any> {
-  const response = await service.fetch(
-    new Request(
-      "https://internal" + path,
-      {
-        method: "GET",
-        headers: {
-          "accept": "application/json",
-          "cache-control": "no-store"
+
+  const response =
+    await service.fetch(
+      new Request(
+        `https://service${path}`,
+        {
+          method:
+            "GET",
+
+          headers: {
+            "accept":
+              "application/json"
+          }
         }
-      }
+      )
+    );
+
+  const text =
+    await response.text();
+
+  if (
+    !response.ok
+  ) {
+
+    throw new Error(
+      `HTTP ${response.status}: ${text.slice(
+        0,
+        400
+      )}`
+    );
+  }
+
+  try {
+    return JSON.parse(
+      text
+    );
+  }
+  catch {
+    throw new Error(
+      `Invalid JSON from ${path}`
+    );
+  }
+}
+
+
+// ============================================================
+// SIGNAL NORMALIZATION
+// IMPORTANT FIX:
+// tracker may contain signal: "HUNTER_ENTRY" string.
+// We only use item.signal when it is actually an object.
+// ============================================================
+
+function normalizeHunterSignal(
+  item: AnyObj
+): AnyObj | null {
+
+  const signal =
+    item?.signal &&
+    typeof item.signal ===
+      "object" &&
+    !Array.isArray(
+      item.signal
     )
-  );
+      ? item.signal
+      : item;
 
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      "HTTP " + response.status + ": " + text.slice(0, 500)
-    );
-  }
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(
-      "INVALID_JSON: " + text.slice(0, 500)
-    );
-  }
-}
-
-
-// ============================================================
-// HELPERS
-// ============================================================
-
-function sofiaDate(value?: string): string {
-  const date = value ? new Date(value) : new Date();
-
-  try {
-    const parts = new Intl.DateTimeFormat("en-CA", {
-      timeZone: TIME_ZONE,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit"
-    }).formatToParts(date);
-
-    const map: Obj = {};
-
-    for (const p of parts) {
-      if (p.type !== "literal") {
-        map[p.type] = p.value;
-      }
-    }
-
-    return `${map.year}-${map.month}-${map.day}`;
-  } catch {
-    return date.toISOString().slice(0, 10);
-  }
-}
-
-
-function normalizeName(value: any): string {
-  return safe(value)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-
-function safe(value: any): string {
-  if (value === null || value === undefined) return "";
-  return String(value).trim();
-}
-
-
-function numberOrNull(value: any): number | null {
-  if (value === null || value === undefined || value === "") {
+  if (
+    !signal ||
+    typeof signal !==
+      "object"
+  ) {
     return null;
   }
 
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
+  const split =
+    splitMatchName(
+      signal?.match ??
+      signal?.match_name ??
+      signal?.name ??
+      ""
+    );
 
+  const home =
+    String(
+      signal?.home ??
+      signal?.homeTeam ??
+      signal?.home_name ??
+      split.home ??
+      ""
+    ).trim();
 
-function corsHeaders() {
+  const away =
+    String(
+      signal?.away ??
+      signal?.awayTeam ??
+      signal?.away_name ??
+      split.away ??
+      ""
+    ).trim();
+
+  if (
+    !home ||
+    !away
+  ) {
+    return null;
+  }
+
   return {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type"
+    ...signal,
+
+    type:
+      signal?.type ??
+      signal?.signal ??
+      "HUNTER_ENTRY",
+
+    match:
+      signal?.match ??
+      signal?.match_name ??
+      `${home} - ${away}`,
+
+    match_id:
+      signal?.match_id ??
+      signal?.id ??
+      null,
+
+    home,
+    away,
+
+    entry_minute:
+      signal?.entry_minute ??
+      null,
+
+    hunter_score:
+      signal?.hunter_score ??
+      null
   };
 }
 
 
-function json(data: any, status = 200): Response {
-  return new Response(
-    JSON.stringify(data, null, 2),
-    {
-      status,
-      headers: {
-        "content-type": "application/json; charset=UTF-8",
-        "cache-control": "no-store",
-        ...corsHeaders()
+function parseSignalsParam(
+  request: Request
+): {
+  rawPresent: boolean;
+  signals: AnyObj[];
+} {
+
+  const url =
+    new URL(
+      request.url
+    );
+
+  const value =
+    url.searchParams.get(
+      "signals"
+    );
+
+  if (
+    value === null
+  ) {
+    return {
+      rawPresent:
+        false,
+      signals:
+        []
+    };
+  }
+
+  try {
+
+    const parsed =
+      JSON.parse(
+        value
+      );
+
+    if (
+      !Array.isArray(
+        parsed
+      )
+    ) {
+
+      return {
+        rawPresent:
+          true,
+        signals:
+          []
+      };
+    }
+
+    return {
+      rawPresent:
+        true,
+
+      signals:
+        parsed
+          .map(
+            normalizeHunterSignal
+          )
+          .filter(
+            Boolean
+          ) as AnyObj[]
+    };
+  }
+  catch {
+
+    return {
+      rawPresent:
+        true,
+      signals:
+        []
+    };
+  }
+}
+
+
+// ============================================================
+// FAST CANDIDATE INDEX
+// ============================================================
+
+function buildTokenIndex(
+  cloudbet: PreparedMatch[]
+): Map<string, number[]> {
+
+  const index =
+    new Map<
+      string,
+      number[]
+    >();
+
+  for (
+    let i = 0;
+    i <
+      cloudbet.length;
+    i++
+  ) {
+
+    const tokens =
+      new Set([
+        ...cloudbet[i]
+          .homeTokens,
+        ...cloudbet[i]
+          .awayTokens
+      ]);
+
+    for (
+      const token
+      of tokens
+    ) {
+
+      if (
+        !token ||
+        token.length < 3
+      ) {
+        continue;
+      }
+
+      const list =
+        index.get(
+          token
+        );
+
+      if (list) {
+        list.push(i);
+      }
+      else {
+        index.set(
+          token,
+          [i]
+        );
       }
     }
-  );
+  }
+
+  return index;
+}
+
+
+function candidateIndexesForSignal(
+  signal: PreparedMatch,
+  tokenIndex:
+    Map<string, number[]>,
+  cloudbetCount: number
+): number[] {
+
+  const set =
+    new Set<number>();
+
+  const tokens =
+    new Set([
+      ...signal.homeTokens,
+      ...signal.awayTokens
+    ]);
+
+  for (
+    const token
+    of tokens
+  ) {
+
+    if (
+      !token ||
+      token.length < 3
+    ) {
+      continue;
+    }
+
+    const rows =
+      tokenIndex.get(
+        token
+      );
+
+    if (!rows) {
+      continue;
+    }
+
+    for (
+      const index
+      of rows
+    ) {
+      set.add(index);
+    }
+  }
+
+  // Safety fallback:
+  // if aliases/spelling produce no shared token,
+  // compare against all live events.
+  if (
+    set.size === 0
+  ) {
+
+    for (
+      let i = 0;
+      i <
+        cloudbetCount;
+      i++
+    ) {
+      set.add(i);
+    }
+  }
+
+  return [
+    ...set
+  ];
 }
 
 
 // ============================================================
-// DASHBOARD
+// HUNTER MATCH
 // ============================================================
 
-function renderHtml(): string {
-  return `<!DOCTYPE html>
-<html lang="bg">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Top Signal Control</title>
+function scoringRecord(
+  detail: AnyObj
+): AnyObj {
 
-<style>
-*{box-sizing:border-box}
-body{
-  margin:0;
-  background:#0b0e13;
-  color:#fff;
-  font-family:Arial,Helvetica,sans-serif
-}
-.app{
-  max-width:760px;
-  margin:0 auto;
-  padding:10px
-}
-.title{
-  font-size:20px;
-  font-weight:900
-}
-.subtitle{
-  margin-top:3px;
-  color:#8d96a5;
-  font-size:9px
-}
-.summary{
-  margin-top:10px;
-  display:grid;
-  grid-template-columns:repeat(4,1fr);
-  gap:5px
-}
-.sum{
-  background:#151a22;
-  border:1px solid #252c38;
-  border-radius:9px;
-  padding:7px 3px;
-  text-align:center
-}
-.sum .v{
-  font-size:17px;
-  font-weight:900
-}
-.sum .l{
-  margin-top:2px;
-  font-size:7px;
-  color:#8d96a5
-}
-.stats{
-  margin-top:7px;
-  color:#7d8797;
-  font-size:9px;
-  line-height:1.4
-}
-.err{color:#fca5a5}
-.card{
-  margin-top:8px;
-  padding:9px;
-  background:#151a22;
-  border:1px solid #252c38;
-  border-radius:11px
-}
-.card.placed{
-  border-color:#16a34a;
-  background:#101d16
-}
-.placedBanner{
-  margin-bottom:6px;
-  padding:4px 6px;
-  border-radius:6px;
-  background:#14532d;
-  color:#bbf7d0;
-  font-size:9px;
-  font-weight:900;
-  text-align:center
-}
-.match{
-  font-size:14px;
-  font-weight:900;
-  line-height:1.25
-}
-.event{
-  margin-top:2px;
-  color:#646f80;
-  font-size:7px
-}
-.meta{
-  margin-top:4px;
-  display:flex;
-  gap:8px;
-  color:#adb5c2;
-  font-size:9px
-}
-.marketLine{
-  margin-top:7px;
-  display:flex;
-  align-items:center;
-  justify-content:space-between
-}
-.marketName{
-  color:#a7b0bd;
-  font-size:10px;
-  font-weight:800
-}
-.odds{
-  font-size:20px;
-  font-weight:900;
-  text-align:right
-}
-.state{
-  font-size:8px;
-  text-align:right
-}
-.ready{color:#86efac}
-.waiting{color:#fbbf24}
-.actions{
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:6px;
-  margin-top:7px
-}
-.btn{
-  border:0;
-  border-radius:8px;
-  padding:8px 6px;
-  font-size:9px;
-  font-weight:900;
-  cursor:pointer
-}
-.check{background:#2563eb;color:#fff}
-.bet{background:#16a34a;color:#fff}
-.bet[disabled]{
-  background:#26303c;
-  color:#788393
-}
-.empty{
-  margin-top:9px;
-  padding:16px 10px;
-  background:#151a22;
-  border:1px solid #252c38;
-  border-radius:11px;
-  text-align:center;
-  color:#9aa4b3;
-  font-size:10px;
-  line-height:1.5
-}
-.daily{
-  margin-top:14px;
-  background:#151a22;
-  border:1px solid #252c38;
-  border-radius:11px;
-  overflow:hidden
-}
-.dailyHead{
-  width:100%;
-  padding:11px;
-  border:0;
-  background:#151a22;
-  color:#fff;
-  display:flex;
-  justify-content:space-between;
-  font-size:11px;
-  font-weight:900
-}
-.dailyBody{
-  display:none;
-  padding:0 9px 9px;
-  border-top:1px solid #252c38
-}
-.daily.open .dailyBody{display:block}
-.dailySummary{
-  margin-top:8px;
-  display:grid;
-  grid-template-columns:repeat(2,1fr);
-  gap:4px
-}
-.ds{
-  background:#0f1319;
-  border-radius:7px;
-  padding:6px 7px;
-  font-size:9px;
-  display:flex;
-  justify-content:space-between
-}
-.dailyRow{
-  padding:8px 2px;
-  border-top:1px solid #242a34
-}
-.dailyMatch{
-  font-size:10px;
-  font-weight:900
-}
-.dailyStatus{
-  margin-top:3px;
-  display:flex;
-  flex-wrap:wrap;
-  gap:5px;
-  font-size:8px;
-  color:#929baa
-}
-.pill{
-  padding:2px 5px;
-  border-radius:5px;
-  background:#202632
-}
-.win{color:#4ade80;font-weight:900}
-.loss{color:#f87171;font-weight:900}
-.pending{color:#fbbf24;font-weight:900}
-.footer{
-  margin-top:14px;
-  text-align:center;
-  color:#596273;
-  font-size:7px
-}
-</style>
-</head>
+  return {
+    total:
+      Number(
+        detail.total
+          .toFixed(3)
+      ),
 
-<body>
-<div class="app">
+    base_score:
+      Number(
+        detail.baseScore
+          .toFixed(3)
+      ),
 
-<div class="title">⚡ TOP SIGNAL MANUAL</div>
-<div class="subtitle">
-V2.0.2 CPU SAFE · TRACKER → MATCHER
-</div>
+    home_score:
+      Number(
+        detail.homeScore
+          .toFixed(3)
+      ),
 
-<div class="summary">
-  <div class="sum"><div id="sumTargets" class="v">0</div><div class="l">TARGETS</div></div>
-  <div class="sum"><div id="sumReady" class="v">0</div><div class="l">ODDS READY</div></div>
-  <div class="sum"><div id="sumPlaced" class="v">0</div><div class="l">PLACED</div></div>
-  <div class="sum"><div id="sumBest" class="v">—</div><div class="l">BEST O0.5</div></div>
-</div>
+    away_score:
+      Number(
+        detail.awayScore
+          .toFixed(3)
+      ),
 
-<div id="stats" class="stats">Loading...</div>
-<div id="list"></div>
+    reverse_home_score:
+      Number(
+        detail.reverseHomeScore
+          .toFixed(3)
+      ),
 
-<div id="daily" class="daily">
-  <button id="dailyHead" class="dailyHead" type="button">
-    <span>📊 ДНЕШНИ МАЧОВЕ · <span id="dailyCount">0</span></span>
-    <span id="dailyArrow">▸</span>
-  </button>
+    reverse_away_score:
+      Number(
+        detail.reverseAwayScore
+          .toFixed(3)
+      ),
 
-  <div class="dailyBody">
-    <div id="dailySummary" class="dailySummary"></div>
-    <div id="dailyList"></div>
-  </div>
-</div>
+    direction:
+      detail.direction,
 
-<div class="footer">
-DAILY MATCH LOG · EUROPE/SOFIA · SUCCESS = WIN / (WIN + LOSS)
-</div>
+    competition_score:
+      Number(
+        detail.competitionScore
+          .toFixed(3)
+      ),
 
-</div>
-
-<script>
-const CLOUDBET_ORIGIN = 'https://www.cloud0007.com';
-
-const TARGET_REFRESH_MS = 10000;
-const DAILY_REFRESH_MS = 30000;
-
-let targetRefreshRunning = false;
-let dailyRefreshRunning = false;
-
-let latestTargets = [];
-let latestDaily = [];
-let dailyOpen = false;
+    country_score:
+      Number(
+        detail.countryScore
+          .toFixed(3)
+      )
+  };
+}
 
 
-function esc(v){
-  return String(v ?? '').replace(/[&<>"']/g,c=>({
-    '&':'&amp;',
-    '<':'&lt;',
-    '>':'&gt;',
-    '"':'&quot;',
-    "'":'&#39;'
-  }[c]));
-}
+function matchDisplayName(
+  match: AnyObj
+): string {
 
-function num(v){
-  const x=Number(v);
-  return Number.isFinite(x)?x:null;
-}
+  const home =
+    extractHome(
+      match
+    );
 
-function eventUrl(target,action){
-  const id=String(target?.eventId??'').trim();
-
-  const u=new URL(
-    CLOUDBET_ORIGIN+
-    '/en/sports/soccer/live/'+
-    encodeURIComponent(id)
-  );
-
-  u.searchParams.set('markets-tab','goals');
-  u.searchParams.set('ts-action',action);
-  u.searchParams.set('ts-event',id);
-
-  u.hash=
-    'ts-action='+encodeURIComponent(action)+
-    '&ts-event='+encodeURIComponent(id);
-
-  return u.href;
-}
-
-function go(target,action){
-  if(!target?.eventId)return;
-  if(action==='bet'&&target?.betPlaced)return;
-  location.href=eventUrl(target,action);
-}
-
-function card(t){
-  const odds=num(t?.overOdds);
-  const ready=odds!==null;
-  const placed=t?.betPlaced===true;
+  const away =
+    extractAway(
+      match
+    );
 
   return (
-    '<div class="card '+(placed?'placed':'')+'">'+
-    (placed?'<div class="placedBanner">✅ ЗАЛОЖЕНО</div>':'')+
-    '<div class="match">⚽ '+esc(t?.matchName||'Hunter target')+'</div>'+
-    '<div class="event">Event '+esc(t?.eventId||'')+'</div>'+
-    '<div class="meta">'+
-      '<span>⏱ '+esc(t?.minute??'—')+"'</span>"+
-      '<span>🎯 Hunter '+esc(t?.hunterScore??'—')+'</span>'+
-    '</div>'+
-    '<div class="marketLine">'+
-      '<div class="marketName">1H O0.5</div>'+
-      '<div>'+
-        '<div class="odds">'+(ready?'@'+odds.toFixed(2):'@—')+'</div>'+
-        '<div class="state '+(ready?'ready':'waiting')+'">'+
-          (placed?'PLACED ✅':ready?'READY ✅':'WAIT')+
-        '</div>'+
-      '</div>'+
-    '</div>'+
-    '<div class="actions">'+
-      '<button class="btn check" data-action="check" data-id="'+esc(t?.eventId)+'">CHECK</button>'+
-      '<button class="btn bet" data-action="bet" data-id="'+esc(t?.eventId)+'" '+
-        ((placed||!ready)?'disabled':'')+'>'+
-        (placed?'✅ ЗАЛОЖЕНО':'BET NOW')+
-      '</button>'+
-    '</div>'+
-    '</div>'
+    match?.match ??
+    match?.name ??
+    `${home ?? ""} - ${away ?? ""}`
   );
 }
 
-function dailyRow(m){
-  const placed=String(m?.bet_status??'').toUpperCase()==='PLACED';
-  const result=String(m?.result_status??'PENDING').toUpperCase();
 
-  const odds=num(
-    placed
-      ? (m?.bet_odds??m?.found_odds)
-      : m?.found_odds
-  );
+function findHunterTargetMatch(
+  signal: AnyObj,
+  cloudbet:
+    PreparedMatch[],
+  tokenIndex:
+    Map<string, number[]>,
+  threshold: number
+): AnyObj {
 
-  let resultHtml='—';
+  const target =
+    prepareMatch({
+      id:
+        signal?.match_id ??
+        "",
 
-  if(placed){
-    if(result==='WIN'){
-      resultHtml='<span class="win">✅ ПЕЧЕЛИ</span>';
-    }else if(result==='LOSS'){
-      resultHtml='<span class="loss">❌ НЕ ПЕЧЕЛИ</span>';
-    }else{
-      resultHtml='<span class="pending">⏳ PENDING</span>';
+      home:
+        signal?.home ??
+        "",
+
+      away:
+        signal?.away ??
+        "",
+
+      match:
+        signal?.match ??
+        `${signal?.home ?? ""} - ${signal?.away ?? ""}`,
+
+      competition:
+        signal?.competition ??
+        signal?.league ??
+        null,
+
+      country:
+        signal?.country ??
+        null
+    });
+
+  if (
+    !target.home ||
+    !target.away
+  ) {
+
+    return {
+      found:
+        false,
+
+      best:
+        null,
+
+      detail:
+        null,
+
+      classification:
+        "TRUE_UNMATCHED",
+
+      reason:
+        "HUNTER_SIGNAL_MISSING_HOME_OR_AWAY",
+
+      candidateEvaluations:
+        0,
+
+      candidates:
+        0
+    };
+  }
+
+  const candidates =
+    candidateIndexesForSignal(
+      target,
+      tokenIndex,
+      cloudbet.length
+    );
+
+  let best:
+    PreparedMatch | null =
+    null;
+
+  let bestDetail:
+    AnyObj | null =
+    null;
+
+  let bestScore =
+    -1;
+
+  let candidateEvaluations =
+    0;
+
+  for (
+    const index
+    of candidates
+  ) {
+
+    const cb =
+      cloudbet[index];
+
+    if (!cb) {
+      continue;
+    }
+
+    candidateEvaluations++;
+
+    const detail =
+      detailedMatchScore(
+        target.raw,
+        cb.raw
+      );
+
+    if (
+      detail.total >
+      bestScore
+    ) {
+
+      best =
+        cb;
+
+      bestDetail =
+        detail;
+
+      bestScore =
+        detail.total;
     }
   }
 
-  return (
-    '<div class="dailyRow">'+
-      '<div class="dailyMatch">'+esc(m?.match_name||'Unknown match')+'</div>'+
-      '<div class="dailyStatus">'+
-        '<span>'+(odds!==null?'@'+odds.toFixed(2):'@—')+'</span>'+
-        '<span class="pill">'+(placed?'ЗАЛОЖЕН':'НЕЗАЛОЖЕН')+'</span>'+
-        '<span>'+resultHtml+'</span>'+
-      '</div>'+
-    '</div>'
-  );
-}
+  if (
+    !best ||
+    !bestDetail
+  ) {
 
-function renderDailySummary(s){
-  const rate=
-    s?.successRate===null||s?.successRate===undefined
-      ? '—'
-      : Number(s.successRate).toFixed(1)+'%';
+    return {
+      found:
+        false,
 
-  return (
-    '<div class="ds"><span>ДНЕС</span><strong>'+esc(s?.today??0)+'</strong></div>'+
-    '<div class="ds"><span>ЗАЛОЖЕНИ</span><strong>'+esc(s?.placed??0)+'</strong></div>'+
-    '<div class="ds"><span>ПЕЧЕЛИ</span><strong class="win">'+esc(s?.wins??0)+'</strong></div>'+
-    '<div class="ds"><span>НЕ ПЕЧЕЛИ</span><strong class="loss">'+esc(s?.losses??0)+'</strong></div>'+
-    '<div class="ds"><span>НЕЗАЛОЖЕНИ</span><strong>'+esc(s?.notPlaced??0)+'</strong></div>'+
-    '<div class="ds"><span>УСПЕХ</span><strong>'+esc(rate)+'</strong></div>'
-  );
-}
+      best:
+        null,
 
+      detail:
+        null,
 
-// ==========================================================
-// ACTIVE TARGET REFRESH
-// ==========================================================
+      classification:
+        "TRUE_UNMATCHED",
 
-async function refreshTargets(){
-  const r=await fetch(
-    '/api/targets?ts='+Date.now(),
-    {cache:'no-store'}
-  );
+      reason:
+        "NO_VALID_CLOUDBET_CANDIDATE",
 
-  const d=await r.json();
+      candidateEvaluations,
 
-  if(!r.ok||!d?.success){
-    throw new Error(
-      d?.error||('HTTP '+r.status)
+      candidates:
+        candidates.length
+    };
+  }
+
+  const classification =
+    classifyMatch(
+      bestDetail,
+      threshold
     );
-  }
 
-  latestTargets=Array.isArray(d.targets)?d.targets:[];
+  return {
+    found:
+      classification
+        .classification ===
+      "CONFIDENT_MATCH",
 
-  const ready=latestTargets.filter(
-    x=>num(x?.overOdds)!==null
-  );
+    best,
 
-  const placed=latestTargets.filter(
-    x=>x?.betPlaced===true
-  );
+    detail:
+      bestDetail,
 
-  const best=
-    ready
-      .map(x=>num(x?.overOdds))
-      .filter(x=>x!==null)
-      .sort((a,b)=>b-a)[0]??null;
+    classification:
+      classification
+        .classification,
 
-  document.getElementById('sumTargets').textContent=
-    String(latestTargets.length);
+    reason:
+      classification.reason,
 
-  document.getElementById('sumReady').textContent=
-    String(ready.length);
+    candidateEvaluations,
 
-  document.getElementById('sumPlaced').textContent=
-    String(placed.length);
-
-  document.getElementById('sumBest').textContent=
-    best===null?'—':best.toFixed(2);
-
-  document.getElementById('stats').textContent=
-    'Tracker '+(d.tracker_signals??0)+
-    ' · Matcher '+(d.matcher_hunter_results??0)+
-    ' · Secure '+latestTargets.length+
-    ' · targets 10s · daily 30s';
-
-  document.getElementById('list').innerHTML=
-    latestTargets.length
-      ? latestTargets.map(card).join('')
-      : '<div class="empty">Няма активен secure Hunter target.<br>Чакаме нов сигнал.</div>';
+    candidates:
+      candidates.length
+  };
 }
 
 
-// ==========================================================
-// DAILY REFRESH
-// ==========================================================
+// ============================================================
+// FAST HUNTER MODE
+// ============================================================
 
-async function refreshDaily(){
-  const r=await fetch(
-    '/api/daily?ts='+Date.now(),
-    {cache:'no-store'}
-  );
+async function runFastHunter(
+  env: Env,
+  request: Request,
+  signals: AnyObj[],
+  threshold: number
+): Promise<Response> {
 
-  const d=await r.json();
+  const started =
+    Date.now();
 
-  if(!r.ok||!d?.success){
-    throw new Error(
-      d?.error||('DAILY HTTP '+r.status)
+  const cloudbetStarted =
+    Date.now();
+
+  const cloudbetData =
+    await fetchServiceJSON(
+      env.CLOUDBET,
+      "/live"
     );
-  }
 
-  latestDaily=Array.isArray(d.matches)?d.matches:[];
+  const cloudbetFetchMs =
+    Date.now() -
+    cloudbetStarted;
 
-  document.getElementById('dailyCount').textContent=
-    String(latestDaily.length);
-
-  document.getElementById('dailySummary').innerHTML=
-    renderDailySummary(d.summary||{});
-
-  document.getElementById('dailyList').innerHTML=
-    latestDaily.length
-      ? latestDaily.map(dailyRow).join('')
-      : '<div class="empty">Още няма мачове за днес.</div>';
-}
-
-
-// ==========================================================
-// SAFE REFRESH — V2.0.1 ANTI-OVERLAP
-// ==========================================================
-
-async function safeRefreshTargets(){
-  if(targetRefreshRunning){
-    console.log(
-      'TARGET refresh skipped — previous request still running'
+  const rawCloudbet =
+    extractCloudbetMatches(
+      cloudbetData
     );
-    return;
-  }
 
-  targetRefreshRunning=true;
-
-  try{
-    await refreshTargets();
-  }catch(e){
-    console.warn('TARGET REFRESH ERROR',e);
-
-    const stats=document.getElementById('stats');
-
-    if(stats){
-      stats.innerHTML=
-        '<span class="err">'+
-        'TEMP CONNECTION ERROR · keeping last targets · '+
-        esc(e?.message||e)+
-        '</span>';
-    }
-  }finally{
-    targetRefreshRunning=false;
-  }
-}
-
-async function safeRefreshDaily(){
-  if(dailyRefreshRunning){
-    console.log(
-      'DAILY refresh skipped — previous request still running'
+  const cloudbetLive =
+    rawCloudbet.filter(
+      isCloudbetLive
     );
-    return;
+
+  const prepareStarted =
+    Date.now();
+
+  const preparedCloudbet =
+    cloudbetLive.map(
+      prepareMatch
+    );
+
+  const tokenIndex =
+    buildTokenIndex(
+      preparedCloudbet
+    );
+
+  const prepareMs =
+    Date.now() -
+    prepareStarted;
+
+  const hunterResults:
+    AnyObj[] = [];
+
+  let totalCandidateEvaluations =
+    0;
+
+  const matchStarted =
+    Date.now();
+
+  for (
+    const signal
+    of signals
+  ) {
+
+    const result =
+      findHunterTargetMatch(
+        signal,
+        preparedCloudbet,
+        tokenIndex,
+        threshold
+      );
+
+    totalCandidateEvaluations +=
+      result.candidateEvaluations;
+
+    const detail =
+      result.detail;
+
+    const cb =
+      result.best;
+
+    hunterResults.push({
+
+      status:
+        result.found
+          ? "MATCH"
+          : "NO_MATCH",
+
+      signal: {
+        type:
+          signal?.type ??
+          "HUNTER_ENTRY",
+
+        match:
+          signal?.match ??
+          null,
+
+        match_id:
+          signal?.match_id ??
+          null,
+
+        home:
+          signal?.home ??
+          null,
+
+        away:
+          signal?.away ??
+          null,
+
+        entry_minute:
+          signal?.entry_minute ??
+          null,
+
+        hunter_score:
+          signal?.hunter_score ??
+          null
+      },
+
+      cloudbet:
+        cb
+          ? {
+              id:
+                cb.raw?.id ??
+                cb.raw?.event_id ??
+                null,
+
+              event_id:
+                cb.raw?.event_id ??
+                cb.raw?.id ??
+                null,
+
+              key:
+                cb.raw?.key ??
+                null,
+
+              match:
+                matchDisplayName(
+                  cb.raw
+                ),
+
+              home:
+                extractHome(
+                  cb.raw
+                ),
+
+              away:
+                extractAway(
+                  cb.raw
+                ),
+
+              normalized_home:
+                cb.normalizedHome,
+
+              normalized_away:
+                cb.normalizedAway,
+
+              status:
+                cb.raw?.status ??
+                null,
+
+              competition:
+                cb.raw?.competition ??
+                null
+            }
+          : null,
+
+      matcher_scoring:
+        detail
+          ? scoringRecord(
+              detail
+            )
+          : {
+              total: 0,
+              base_score: 0,
+              home_score: 0,
+              away_score: 0,
+              reverse_home_score: 0,
+              reverse_away_score: 0,
+              direction:
+                "NONE",
+              competition_score: 0,
+              country_score: 0
+            },
+
+      classification:
+        result.classification,
+
+      reason:
+        result.reason,
+
+      security: {
+        secure_match:
+          result.found === true,
+
+        match_method:
+          result.found
+            ? "FAST_HUNTER_TWO_SIDED"
+            : null,
+
+        score_only_match:
+          false,
+
+        exact_id_alone:
+          false,
+
+        required_classification:
+          "CONFIDENT_MATCH",
+
+        candidate_discovery:
+          "TOKEN_INDEX_WITH_FULL_FALLBACK"
+      },
+
+      diagnostics: {
+        candidate_evaluations:
+          result.candidateEvaluations,
+
+        candidates:
+          result.candidates,
+
+        target_normalized_home:
+          normalizeTeam(
+            signal?.home
+          ),
+
+        target_normalized_away:
+          normalizeTeam(
+            signal?.away
+          )
+      }
+    });
   }
 
-  dailyRefreshRunning=true;
+  const matchingMs =
+    Date.now() -
+    matchStarted;
 
-  try{
-    await refreshDaily();
-  }catch(e){
-    console.warn('DAILY REFRESH ERROR',e);
-  }finally{
-    dailyRefreshRunning=false;
-  }
-}
+  return json({
+    success:
+      true,
 
+    worker:
+      "cloudbet-match-matcher",
 
-// DAILY TOGGLE
-document
-  .getElementById('dailyHead')
-  .addEventListener('click',()=>{
-    dailyOpen=!dailyOpen;
+    version:
+      VERSION,
 
-    const el=document.getElementById('daily');
-    const arrow=document.getElementById('dailyArrow');
+    mode:
+      "READ ONLY",
 
-    if(dailyOpen){
-      el.classList.add('open');
-      arrow.textContent='▾';
-    }else{
-      el.classList.remove('open');
-      arrow.textContent='▸';
-    }
+    execution_mode:
+      "FAST_HUNTER",
+
+    source: {
+      v27:
+        "SKIPPED_IN_FAST_HUNTER",
+
+      cloudbet:
+        "CLOUDBET SERVICE BINDING /live"
+    },
+
+    settings: {
+      match_threshold:
+        threshold,
+
+      strong_team_score:
+        STRONG_TEAM_SCORE,
+
+      possible_team_score:
+        POSSIBLE_TEAM_SCORE,
+
+      possible_total_score:
+        POSSIBLE_TOTAL_SCORE,
+
+      confident_total_score:
+        CONFIDENT_TOTAL_SCORE,
+
+      reversed_confident_score:
+        REVERSED_CONFIDENT_SCORE,
+
+      matcher:
+        "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION",
+
+      hunter_security:
+        "ONLY CONFIDENT_MATCH IS ACCEPTED",
+
+      fast_hunter:
+        true
+    },
+
+    stats: {
+      hunter_signals:
+        signals.length,
+
+      cloudbet_raw_matches:
+        rawCloudbet.length,
+
+      cloudbet_live_matches:
+        cloudbetLive.length,
+
+      hunter_secure_matches:
+        hunterResults.filter(
+          x =>
+            x?.security
+              ?.secure_match ===
+            true
+        ).length,
+
+      hunter_no_matches:
+        hunterResults.filter(
+          x =>
+            x?.security
+              ?.secure_match !==
+            true
+        ).length,
+
+      hunter_candidate_evaluations:
+        totalCandidateEvaluations,
+
+      cloudbet_fetch_ms:
+        cloudbetFetchMs,
+
+      prepare_ms:
+        prepareMs,
+
+      matching_ms:
+        matchingMs,
+
+      processing_ms:
+        Date.now() -
+        started
+    },
+
+    hunter_results:
+      hunterResults,
+
+    timestamp:
+      new Date()
+        .toISOString()
   });
-
-
-// BUTTONS
-document.addEventListener('click',e=>{
-  const b=e.target.closest('[data-action]');
-  if(!b)return;
-
-  const id=b.getAttribute('data-id');
-  const action=b.getAttribute('data-action');
-
-  const target=latestTargets.find(
-    x=>String(x?.eventId)===String(id)
-  );
-
-  if(!target)return;
-
-  if(action==='check'){
-    go(target,'check');
-    return;
-  }
-
-  if(
-    action==='bet'&&
-    !b.disabled&&
-    !target?.betPlaced
-  ){
-    go(target,'bet');
-  }
-});
-
-
-// ==========================================================
-// START — NO MASTER Promise.all(), NO 3s OVERLAP
-// ==========================================================
-
-safeRefreshTargets();
-safeRefreshDaily();
-
-setInterval(
-  safeRefreshTargets,
-  TARGET_REFRESH_MS
-);
-
-setInterval(
-  safeRefreshDaily,
-  DAILY_REFRESH_MS
-);
-
-</script>
-</body>
-</html>`;
 }
+
+
+// ============================================================
+// LIGHT DIAGNOSTIC MODE
+// No full cross-product matching.
+// ============================================================
+
+async function runLightDiagnostic(
+  env: Env
+): Promise<Response> {
+
+  const started =
+    Date.now();
+
+  const [
+    v27Data,
+    cloudbetData
+  ] =
+    await Promise.all([
+      fetchServiceJSON(
+        env.V27,
+        "/"
+      ),
+
+      fetchServiceJSON(
+        env.CLOUDBET,
+        "/live"
+      )
+    ]);
+
+  const v27Matches =
+    Array.isArray(
+      v27Data?.matches
+    )
+      ? v27Data.matches
+      : Array.isArray(
+          v27Data?.live_matches
+        )
+      ? v27Data.live_matches
+      : Array.isArray(
+          v27Data?.events
+        )
+      ? v27Data.events
+      : [];
+
+  const cb =
+    extractCloudbetMatches(
+      cloudbetData
+    );
+
+  const live =
+    cb.filter(
+      isCloudbetLive
+    );
+
+  return json({
+    success:
+      true,
+
+    worker:
+      "cloudbet-match-matcher",
+
+    version:
+      VERSION,
+
+    mode:
+      "READ ONLY",
+
+    execution_mode:
+      "LIGHT_DIAGNOSTIC",
+
+    note:
+      "Full all-vs-all diagnostic matching is intentionally disabled in V7.2.0 to avoid CPU limit.",
+
+    stats: {
+      v27_matches:
+        v27Matches.length,
+
+      cloudbet_raw_matches:
+        cb.length,
+
+      cloudbet_live_matches:
+        live.length,
+
+      processing_ms:
+        Date.now() -
+        started
+    },
+
+    hunter_results:
+      [],
+
+    timestamp:
+      new Date()
+        .toISOString()
+  });
+}
+
+
+// ============================================================
+// THRESHOLD
+// ============================================================
+
+function getThreshold(
+  request: Request
+): number {
+
+  const url =
+    new URL(
+      request.url
+    );
+
+  let threshold =
+    Number(
+      url.searchParams.get(
+        "threshold"
+      ) ??
+      String(
+        DEFAULT_THRESHOLD
+      )
+    );
+
+  if (
+    !Number.isFinite(
+      threshold
+    )
+  ) {
+    threshold =
+      DEFAULT_THRESHOLD;
+  }
+
+  return Math.max(
+    0.30,
+    Math.min(
+      1,
+      threshold
+    )
+  );
+}
+
+
+// ============================================================
+// MAIN
+// ============================================================
+
+export default {
+
+  async fetch(
+    request: Request,
+    env: Env
+  ): Promise<Response> {
+
+    const started =
+      Date.now();
+
+    const url =
+      new URL(
+        request.url
+      );
+
+    const pathname =
+      url.pathname;
+
+    if (
+      pathname ===
+      "/"
+    ) {
+
+      return json({
+        success:
+          true,
+
+        worker:
+          "cloudbet-match-matcher",
+
+        version:
+          VERSION,
+
+        mode:
+          "READ ONLY",
+
+        fast_hunter:
+          true,
+
+        routes: [
+          "/match?signals=[...]",
+          "/diagnostic"
+        ]
+      });
+    }
+
+
+    if (
+      pathname ===
+      "/match"
+    ) {
+
+      try {
+
+        const threshold =
+          getThreshold(
+            request
+          );
+
+        const parsed =
+          parseSignalsParam(
+            request
+          );
+
+        // ----------------------------------------------------
+        // Top Signal path:
+        // signals query is present => ALWAYS FAST_HUNTER
+        // ----------------------------------------------------
+
+        if (
+          parsed.rawPresent
+        ) {
+
+          if (
+            parsed.signals.length ===
+            0
+          ) {
+
+            return json({
+              success:
+                true,
+
+              worker:
+                "cloudbet-match-matcher",
+
+              version:
+                VERSION,
+
+              mode:
+                "READ ONLY",
+
+              execution_mode:
+                "FAST_HUNTER",
+
+              stats: {
+                hunter_signals: 0,
+                hunter_secure_matches: 0,
+                hunter_no_matches: 0,
+                hunter_candidate_evaluations: 0,
+                processing_ms:
+                  Date.now() -
+                  started
+              },
+
+              hunter_results:
+                [],
+
+              warning:
+                "signals parameter was present but contained no valid Hunter signals"
+            });
+          }
+
+          return await runFastHunter(
+            env,
+            request,
+            parsed.signals,
+            threshold
+          );
+        }
+
+        // No signals => light diagnostic only.
+        return await runLightDiagnostic(
+          env
+        );
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-match-matcher",
+
+            version:
+              VERSION,
+
+            action:
+              "MATCH",
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(
+                    error
+                  ),
+
+            processing_ms:
+              Date.now() -
+              started
+          },
+          500
+        );
+      }
+    }
+
+
+    if (
+      pathname ===
+      "/diagnostic"
+    ) {
+
+      try {
+
+        return await runLightDiagnostic(
+          env
+        );
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-match-matcher",
+
+            version:
+              VERSION,
+
+            action:
+              "DIAGNOSTIC",
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(
+                    error
+                  )
+          },
+          500
+        );
+      }
+    }
+
+
+    return json(
+      {
+        success:
+          false,
+
+        worker:
+          "cloudbet-match-matcher",
+
+        version:
+          VERSION,
+
+        error:
+          "NOT_FOUND"
+      },
+      404
+    );
+  }
+};
