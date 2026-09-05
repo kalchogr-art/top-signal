@@ -1,8 +1,16 @@
 // ============================================================
-// TOP SIGNAL V1.8.1 — MANUAL TARGET CONTROL
+// TOP SIGNAL V1.9.0 — BET STATUS
 //
 // TRACKER -> MATCHER -> DASHBOARD
 // -> CHECK ODDS / BET NOW
+//
+// NEW V1.9.0:
+// - POST /api/bet-status
+// - D1 table bet_status
+// - exact event_id marked PLACED
+// - dashboard shows ✅ ЗАЛОЖЕНО
+// - BET NOW disabled after confirmed placement
+// - survives refresh/reopen
 //
 // CHECK ODDS:
 // - exact Cloudbet event
@@ -16,15 +24,14 @@
 // - fills 1 USDT
 // - NEVER clicks final Place bet
 //
-// FIX V1.8.1:
-// - action/event passed through QUERY + HASH
-// - more robust against Cloudbet redirects
+// Keeps V1.8.1:
+// - QUERY + HASH handoff
 //
 // Keeps V1.7.1 matcher fix:
 // - signal: "HUNTER_ENTRY" is NOT forwarded
 // ============================================================
 
-const VERSION = "V1.8.1 MANUAL TARGET";
+const VERSION = "V1.9.0 BET STATUS";
 const APP_NAME = "top-signal";
 
 type Obj = Record<string, any>;
@@ -66,6 +73,15 @@ export default {
 
 
     // ========================================================
+    // ENSURE BET STATUS TABLE
+    // ========================================================
+
+    await ensureBetStatusTable(
+      env
+    );
+
+
+    // ========================================================
     // STATUS
     // ========================================================
 
@@ -91,6 +107,9 @@ export default {
 
         storage:
           "D1",
+
+        bet_tracking:
+          "CONFIRMED_MANUAL_BETS",
 
         bindings: {
 
@@ -271,7 +290,12 @@ export default {
               result.matcherHunterResults,
 
             secure_targets:
-              result.targets.length
+              result.targets.length,
+
+            placed:
+              result.targets.filter(
+                x => x.betPlaced
+              ).length
           },
 
           timestamp:
@@ -340,6 +364,11 @@ export default {
 
           matcher_hunter_results:
             result.matcherHunterResults,
+
+          placed:
+            result.targets.filter(
+              x => x.betPlaced
+            ).length,
 
           targets:
             result.targets
@@ -597,6 +626,339 @@ export default {
 
 
     // ========================================================
+    // SAVE BET STATUS
+    // ========================================================
+
+    if (
+      url.pathname ===
+        "/api/bet-status" &&
+      request.method ===
+        "POST"
+    ) {
+
+      try {
+
+        const body =
+          await request.json<Obj>();
+
+
+        const eventId =
+          safe(
+            body?.eventId
+          );
+
+
+        const status =
+          safe(
+            body?.status
+          )
+            .toUpperCase();
+
+
+        if (
+          !eventId ||
+          status !== "PLACED"
+        ) {
+
+          return json(
+            {
+              success: false,
+
+              error:
+                "INVALID_BET_STATUS_PAYLOAD"
+            },
+            400
+          );
+        }
+
+
+        const market =
+          safe(
+            body?.market
+          ) ||
+          "1st Half Total Goals";
+
+
+        const selection =
+          safe(
+            body?.selection
+          ) ||
+          "O 0.5";
+
+
+        const stake =
+          numberOrNull(
+            body?.stake
+          );
+
+
+        const odds =
+          numberOrNull(
+            body?.odds
+          );
+
+
+        const source =
+          safe(
+            body?.source
+          ) ||
+          "CLOUDBET_FRONTEND";
+
+
+        const placedAt =
+          safe(
+            body?.placedAt
+          ) ||
+          new Date()
+            .toISOString();
+
+
+        const now =
+          new Date()
+            .toISOString();
+
+
+        const storedTarget =
+          await getStoredEvent(
+            env,
+            eventId
+          );
+
+
+        await env.DB
+          .prepare(`
+            INSERT INTO bet_status (
+              event_id,
+              match_name,
+              status,
+              market,
+              selection,
+              stake,
+              odds,
+              source,
+              placed_at,
+              created_at,
+              updated_at
+            )
+
+            VALUES (
+              ?1,
+              ?2,
+              'PLACED',
+              ?3,
+              ?4,
+              ?5,
+              ?6,
+              ?7,
+              ?8,
+              ?9,
+              ?9
+            )
+
+            ON CONFLICT(event_id)
+
+            DO UPDATE SET
+
+              match_name =
+                COALESCE(
+                  excluded.match_name,
+                  bet_status.match_name
+                ),
+
+              status =
+                'PLACED',
+
+              market =
+                excluded.market,
+
+              selection =
+                excluded.selection,
+
+              stake =
+                excluded.stake,
+
+              odds =
+                COALESCE(
+                  excluded.odds,
+                  bet_status.odds
+                ),
+
+              source =
+                excluded.source,
+
+              placed_at =
+                excluded.placed_at,
+
+              updated_at =
+                excluded.updated_at
+          `)
+
+          .bind(
+            eventId,
+
+            storedTarget
+              ?.match_name ??
+            null,
+
+            market,
+
+            selection,
+
+            stake,
+
+            odds,
+
+            source,
+
+            placedAt,
+
+            now
+          )
+
+          .run();
+
+
+        const saved =
+          await getBetStatus(
+            env,
+            eventId
+          );
+
+
+        return json({
+          success: true,
+
+          action:
+            "BET_PLACED_SAVED",
+
+          eventId,
+
+          betPlaced:
+            true,
+
+          data:
+            saved
+        });
+
+      } catch (
+        error: any
+      ) {
+
+        console.error(
+          "BET STATUS ERROR",
+          error
+        );
+
+
+        return json(
+          {
+            success: false,
+
+            error:
+              error?.message ??
+              String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // GET BET STATUS
+    // ========================================================
+
+    if (
+      url.pathname ===
+        "/api/bet-status" &&
+      request.method ===
+        "GET"
+    ) {
+
+      try {
+
+        const eventId =
+          safe(
+            url.searchParams
+              .get("eventId")
+          );
+
+
+        if (
+          eventId
+        ) {
+
+          const row =
+            await getBetStatus(
+              env,
+              eventId
+            );
+
+
+          return json({
+            success: true,
+
+            found:
+              !!row,
+
+            betPlaced:
+              safe(
+                row?.status
+              )
+                .toUpperCase() ===
+              "PLACED",
+
+            data:
+              row ??
+              null
+          });
+        }
+
+
+        const result =
+          await env.DB
+            .prepare(`
+              SELECT *
+              FROM bet_status
+              WHERE status = 'PLACED'
+              ORDER BY placed_at DESC
+              LIMIT 100
+            `)
+            .all();
+
+
+        return json({
+          success: true,
+
+          count:
+            result.results
+              ?.length ??
+            0,
+
+          data:
+            result.results ??
+            []
+        });
+
+      } catch (
+        error: any
+      ) {
+
+        return json(
+          {
+            success: false,
+
+            error:
+              error?.message ??
+              String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
     // DASHBOARD
     // ========================================================
 
@@ -615,6 +977,45 @@ export default {
     );
   }
 };
+
+
+// ============================================================
+// BET STATUS TABLE
+// ============================================================
+
+async function ensureBetStatusTable(
+  env: Env
+): Promise<void> {
+
+  await env.DB
+    .prepare(`
+      CREATE TABLE IF NOT EXISTS bet_status (
+
+        event_id TEXT PRIMARY KEY,
+
+        match_name TEXT,
+
+        status TEXT NOT NULL,
+
+        market TEXT,
+
+        selection TEXT,
+
+        stake REAL,
+
+        odds REAL,
+
+        source TEXT,
+
+        placed_at TEXT,
+
+        created_at TEXT NOT NULL,
+
+        updated_at TEXT NOT NULL
+      )
+    `)
+    .run();
+}
 
 
 // ============================================================
@@ -754,10 +1155,25 @@ async function buildTargets(
       );
 
 
+    const betStatus =
+      await getBetStatus(
+        env,
+        target.eventId
+      );
+
+
     const storedOdds =
       numberOrNull(
         stored?.over_odds
       );
+
+
+    const betPlaced =
+      safe(
+        betStatus?.status
+      )
+        .toUpperCase() ===
+      "PLACED";
 
 
     targets.push({
@@ -783,7 +1199,29 @@ async function buildTargets(
         null,
 
       ready:
-        storedOdds !== null
+        storedOdds !== null,
+
+      betPlaced,
+
+      betStatus:
+        betStatus
+          ?.status ??
+        null,
+
+      betPlacedAt:
+        betStatus
+          ?.placed_at ??
+        null,
+
+      betStake:
+        numberOrNull(
+          betStatus?.stake
+        ),
+
+      betOdds:
+        numberOrNull(
+          betStatus?.odds
+        )
     });
   }
 
@@ -998,10 +1436,6 @@ function isHunterEntry(
 
 // ============================================================
 // NORMALIZE SIGNAL
-//
-// IMPORTANT:
-// No:
-// signal: "HUNTER_ENTRY"
 // ============================================================
 
 function normalizeSignal(
@@ -1403,6 +1837,27 @@ async function getStoredEvent(
     .prepare(`
       SELECT *
       FROM live_odds
+      WHERE event_id = ?1
+      LIMIT 1
+    `)
+
+    .bind(
+      eventId
+    )
+
+    .first();
+}
+
+
+async function getBetStatus(
+  env: Env,
+  eventId: string
+): Promise<Obj | null> {
+
+  return await env.DB
+    .prepare(`
+      SELECT *
+      FROM bet_status
       WHERE event_id = ?1
       LIMIT 1
     `)
@@ -1906,7 +2361,7 @@ body {
 
   grid-template-columns:
     repeat(
-      3,
+      4,
       1fr
     );
 
@@ -1927,7 +2382,7 @@ body {
     13px;
 
   padding:
-    12px;
+    12px 6px;
 
   text-align:
     center;
@@ -1986,6 +2441,43 @@ body {
 
   border-radius:
     16px;
+}
+
+.card.placed {
+
+  border:
+    2px solid
+    #16a34a;
+
+  background:
+    #101d16;
+}
+
+.placedBanner {
+
+  margin-bottom:
+    12px;
+
+  padding:
+    10px;
+
+  border-radius:
+    10px;
+
+  background:
+    #14532d;
+
+  color:
+    #bbf7d0;
+
+  font-size:
+    14px;
+
+  font-weight:
+    900;
+
+  text-align:
+    center;
 }
 
 .match {
@@ -2111,6 +2603,15 @@ body {
     #fbbf24;
 }
 
+.placedState {
+
+  color:
+    #4ade80;
+
+  font-weight:
+    900;
+}
+
 .actions {
 
   display:
@@ -2175,6 +2676,15 @@ body {
 
   cursor:
     not-allowed;
+}
+
+.placedBtn {
+
+  background:
+    #14532d !important;
+
+  color:
+    #86efac !important;
 }
 
 .copy {
@@ -2288,6 +2798,13 @@ body {
   }
 
   .summary {
+
+    grid-template-columns:
+      repeat(
+        2,
+        1fr
+      );
+
     gap:
       6px;
   }
@@ -2319,7 +2836,7 @@ body {
 
   <div class="subtitle">
 
-    V1.8.1 MANUAL TARGET
+    V1.9.0 BET STATUS
 
     · TRACKER → MATCHER → SELECT MATCH
 
@@ -2358,6 +2875,22 @@ body {
 
       <div class="l">
         ODDS READY
+      </div>
+
+    </div>
+
+
+    <div class="sum">
+
+      <div
+        id="sumPlaced"
+        class="v"
+      >
+        0
+      </div>
+
+      <div class="l">
+        PLACED
       </div>
 
     </div>
@@ -2469,6 +3002,37 @@ function num(v) {
 
 
 // ==========================================================
+// TIME
+// ==========================================================
+
+function formatTime(v) {
+
+  if (!v) {
+    return '';
+  }
+
+  try {
+
+    return new Date(v)
+      .toLocaleTimeString(
+        'bg-BG',
+        {
+          hour:
+            '2-digit',
+
+          minute:
+            '2-digit'
+        }
+      );
+
+  } catch {
+
+    return '';
+  }
+}
+
+
+// ==========================================================
 // CLOUDBET EVENT URL
 // ==========================================================
 
@@ -2498,14 +3062,12 @@ function eventUrl(
     );
 
 
-  // Goals tab
   u.searchParams.set(
     'markets-tab',
     'goals'
   );
 
 
-  // Query hand-off
   u.searchParams.set(
     'ts-action',
     action
@@ -2518,8 +3080,6 @@ function eventUrl(
   );
 
 
-  // Hash hand-off.
-  // More resistant to frontend redirects.
   u.hash =
     'ts-action=' +
     encodeURIComponent(
@@ -2547,6 +3107,15 @@ function go(
   if (
     !target?.eventId
   ) {
+    return;
+  }
+
+
+  if (
+    action === 'bet' &&
+    target?.betPlaced
+  ) {
+
     return;
   }
 
@@ -2624,6 +3193,10 @@ function card(t) {
     odds !== null;
 
 
+  const placed =
+    t?.betPlaced === true;
+
+
   const match =
     esc(
 
@@ -2685,9 +3258,60 @@ function card(t) {
     );
 
 
+  const placedTime =
+    formatTime(
+      t?.betPlacedAt
+    );
+
+
+  const placedOdds =
+    num(
+      t?.betOdds
+    );
+
+
+  const placedStake =
+    num(
+      t?.betStake
+    );
+
+
   return (
 
-    '<div class="card">' +
+    '<div class="card ' +
+
+      (
+        placed
+          ? 'placed'
+          : ''
+      ) +
+
+    '">' +
+
+
+      (
+        placed
+
+          ? (
+
+            '<div class="placedBanner">' +
+
+              '✅ ЗАЛОЖЕНО' +
+
+              (
+                placedTime
+                  ? ' · ' +
+                    esc(
+                      placedTime
+                    )
+                  : ''
+              ) +
+
+            '</div>'
+          )
+
+          : ''
+      ) +
 
 
       '<div class="match">' +
@@ -2728,6 +3352,49 @@ function card(t) {
         '</div>' +
 
 
+        (
+          placed &&
+          placedStake !== null
+
+            ? (
+
+              '<div class="badge">' +
+
+                '💰 ' +
+                esc(
+                  placedStake
+                ) +
+                ' USDT' +
+
+              '</div>'
+            )
+
+            : ''
+        ) +
+
+
+        (
+          placed &&
+          placedOdds !== null
+
+            ? (
+
+              '<div class="badge">' +
+
+                '✅ @ ' +
+                esc(
+                  placedOdds.toFixed(
+                    2
+                  )
+                ) +
+
+              '</div>'
+            )
+
+            : ''
+        ) +
+
+
       '</div>' +
 
 
@@ -2760,19 +3427,27 @@ function card(t) {
         '<div class="state ' +
 
           (
-            ready
-              ? 'ready'
-              : 'waiting'
+            placed
+
+              ? 'placedState'
+
+              : ready
+                ? 'ready'
+                : 'waiting'
           ) +
 
         '">' +
 
           (
-            ready
+            placed
 
-              ? 'ODDS READY ✅'
+              ? '✅ BET PLACED'
 
-              : 'WAITING FOR CHECK'
+              : ready
+
+                ? 'ODDS READY ✅'
+
+                : 'WAITING FOR CHECK'
           ) +
 
         '</div>' +
@@ -2801,7 +3476,15 @@ function card(t) {
 
         '<button ' +
 
-          'class="btn bet" ' +
+          'class="btn bet ' +
+
+          (
+            placed
+              ? 'placedBtn'
+              : ''
+          ) +
+
+          '" ' +
 
           'data-action="bet" ' +
 
@@ -2810,14 +3493,20 @@ function card(t) {
           '" ' +
 
           (
-            ready
-              ? ''
-              : 'disabled'
+            placed ||
+            !ready
+
+              ? 'disabled'
+              : ''
           ) +
 
         '>' +
 
-          'BET NOW' +
+          (
+            placed
+              ? '✅ ЗАЛОЖЕНО'
+              : 'BET NOW'
+          ) +
 
         '</button>' +
 
@@ -2842,13 +3531,27 @@ function card(t) {
 
       '<div class="small">' +
 
-        'CHECK ODDS → отваря само този мач, ' +
+        (
+          placed
 
-        'чете реалния 1H O0.5 коефициент и се връща тук.<br>' +
+            ? (
 
-        'BET NOW → подготвя O0.5 + stake 1 USDT, ' +
+              'Този Event ID вече е маркиран като успешно заложен.<br>' +
 
-        'без да натиска Place bet.' +
+              'BET NOW е блокиран за защита от повторен залог.'
+            )
+
+            : (
+
+              'CHECK ODDS → отваря само този мач, ' +
+
+              'чете реалния 1H O0.5 коефициент и се връща тук.<br>' +
+
+              'BET NOW → подготвя O0.5 + stake 1 USDT, ' +
+
+              'без да натиска Place bet.'
+            )
+        ) +
 
       '</div>' +
 
@@ -2929,6 +3632,15 @@ async function refresh() {
         );
 
 
+    const placed =
+      latestTargets
+        .filter(
+          x =>
+            x?.betPlaced ===
+            true
+        );
+
+
     const best =
 
       ready
@@ -2979,6 +3691,16 @@ async function refresh() {
 
     document
       .getElementById(
+        'sumPlaced'
+      )
+      .textContent =
+        String(
+          placed.length
+        );
+
+
+    document
+      .getElementById(
         'sumBest'
       )
       .textContent =
@@ -3016,6 +3738,10 @@ async function refresh() {
         ' · Secure ' +
 
         latestTargets.length +
+
+        ' · Placed ' +
+
+        placed.length +
 
         ' · refresh 3s';
 
@@ -3157,7 +3883,8 @@ document
       if (
         action ===
           'bet' &&
-        !b.disabled
+        !b.disabled &&
+        !target?.betPlaced
       ) {
 
         go(
@@ -3187,4 +3914,4 @@ setInterval(
 </body>
 
 </html>`;
-}
+                     }
