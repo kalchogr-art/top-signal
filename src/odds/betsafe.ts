@@ -1,21 +1,24 @@
 // ============================================================
-// TOP SIGNAL — BETSAFE DIAGNOSTIC V2
+// TOP SIGNAL — BETSAFE DIAGNOSTIC V3
 // READ ONLY
 //
-// PURPOSE:
-// - test Betsafe access from Cloudflare
-// - inspect HTML for sportsbook/live data
-// - discover likely JSON / API / XHR endpoints
-// - inspect context around useful keywords
+// V3:
+// - fetch main Betsafe live HTML
+// - discover sportsbook main JS bundle
+// - fetch that JS bundle
+// - inspect it for API / live / event / market / odds endpoints
 //
-// NO:
-// - betting
-// - login
-// - D1 writes
+// NO BETTING
+// NO LOGIN
+// NO D1 WRITES
 // ============================================================
 
+const BETSAFE_ORIGIN =
+  "https://www.betsafe.com";
+
 const BETSAFE_LIVE_URL =
-  "https://www.betsafe.com/en/sportsbook/live";
+  BETSAFE_ORIGIN +
+  "/en/sportsbook/live";
 
 
 // ============================================================
@@ -26,29 +29,117 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
   const started = Date.now();
 
   try {
-    const response =
+
+    // ========================================================
+    // 1. FETCH LIVE PAGE
+    // ========================================================
+
+    const pageResponse =
       await fetch(
         BETSAFE_LIVE_URL,
         {
           method: "GET",
 
+          headers:
+            browserHeaders(),
+
+          redirect:
+            "follow"
+        }
+      );
+
+    const html =
+      await pageResponse.text();
+
+
+    // ========================================================
+    // 2. FIND SPORTBOOK MAIN JS
+    // ========================================================
+
+    const scripts =
+      extractScriptSources(
+        html
+      );
+
+    const sportsbookScript =
+      scripts.find(
+        x =>
+          x.includes(
+            "/widgets/sportsbook/"
+          ) &&
+          x.includes(
+            "/main-"
+          ) &&
+          x.endsWith(
+            ".js"
+          )
+      ) || null;
+
+
+    if (!sportsbookScript) {
+
+      return {
+        success:
+          false,
+
+        source:
+          "BETSAFE",
+
+        diagnostic_version:
+          "V3",
+
+        stage:
+          "SPORTSBOOK_SCRIPT_NOT_FOUND",
+
+        page: {
+          status:
+            pageResponse.status,
+
+          content_length:
+            html.length,
+
+          scripts
+        },
+
+        timing_ms:
+          Date.now() -
+          started
+      };
+    }
+
+
+    // ========================================================
+    // 3. BUILD ABSOLUTE SCRIPT URL
+    // ========================================================
+
+    const scriptUrl =
+      sportsbookScript.startsWith(
+        "http"
+      )
+        ? sportsbookScript
+        : BETSAFE_ORIGIN +
+          sportsbookScript;
+
+
+    // ========================================================
+    // 4. FETCH SPORTBOOK SCRIPT
+    // ========================================================
+
+    const jsResponse =
+      await fetch(
+        scriptUrl,
+        {
+          method:
+            "GET",
+
           headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-              "AppleWebKit/537.36 (KHTML, like Gecko) " +
-              "Chrome/140.0.0.0 Safari/537.36",
+            ...browserHeaders(),
 
             "Accept":
-              "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "*/*",
 
-            "Accept-Language":
-              "en-US,en;q=0.9",
-
-            "Cache-Control":
-              "no-cache",
-
-            "Pragma":
-              "no-cache"
+            "Referer":
+              BETSAFE_LIVE_URL
           },
 
           redirect:
@@ -56,257 +147,222 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
         }
       );
 
-    const text =
-      await response.text();
+    const js =
+      await jsResponse.text();
+
 
     const lower =
-      text.toLowerCase();
+      js.toLowerCase();
 
 
     // ========================================================
-    // BASIC CHECKS
-    // ========================================================
-
-    const football =
-      hasAny(
-        lower,
-        [
-          "football",
-          "soccer"
-        ]
-      );
-
-    const firstHalf =
-      hasAny(
-        lower,
-        [
-          "1st half",
-          "first half",
-          "1h"
-        ]
-      );
-
-    const totalGoals =
-      hasAny(
-        lower,
-        [
-          "total goals",
-          "total_goals",
-          "totalgoals",
-          "totals"
-        ]
-      );
-
-    const over05 =
-      hasAny(
-        lower,
-        [
-          "over 0.5",
-          "over&nbsp;0.5",
-          "over 0,5",
-          "over0.5"
-        ]
-      );
-
-
-    // ========================================================
-    // BLOCK CHECK
-    //
-    // Strong and weak indicators are separated.
-    // "forbidden" alone is NOT enough to call the page blocked.
-    // ========================================================
-
-    const strongBlockPatterns = [
-      "access denied",
-      "not available in your country",
-      "not available in your region",
-      "service unavailable in your region",
-      "this website is not available",
-      "your country is restricted",
-      "geo blocked",
-      "geoblocked"
-    ];
-
-    const weakBlockPatterns = [
-      "forbidden",
-      "restricted"
-    ];
-
-    const strongBlocked =
-      strongBlockPatterns.filter(
-        x =>
-          lower.includes(x)
-      );
-
-    const weakBlocked =
-      weakBlockPatterns.filter(
-        x =>
-          lower.includes(x)
-      );
-
-
-    // ========================================================
-    // SCRIPT SOURCES
-    // ========================================================
-
-    const scripts =
-      extractScriptSources(
-        text
-      );
-
-
-    // ========================================================
-    // URL DISCOVERY
+    // 5. EXTRACT URLS
     // ========================================================
 
     const absoluteUrls =
       extractAbsoluteUrls(
-        text
+        js
       );
-
-    const interestingUrls =
-      absoluteUrls
-        .filter(
-          u =>
-            isInterestingUrl(u)
-        )
-        .slice(
-          0,
-          100
-        );
-
-
-    // ========================================================
-    // RELATIVE ENDPOINT DISCOVERY
-    // ========================================================
 
     const relativeEndpoints =
       extractRelativeEndpoints(
-        text
-      )
+        js
+      );
+
+
+    const interestingAbsolute =
+      absoluteUrls
         .filter(
-          x =>
-            isInterestingUrl(x)
+          isInteresting
         )
         .slice(
           0,
-          100
+          150
+        );
+
+
+    const interestingRelative =
+      relativeEndpoints
+        .filter(
+          isInteresting
+        )
+        .slice(
+          0,
+          200
         );
 
 
     // ========================================================
-    // KEYWORD CONTEXT
+    // 6. CONTEXT SEARCH
     // ========================================================
 
     const contexts = {
-      first_half:
-        findContexts(
-          text,
-          [
-            "1st Half",
-            "First Half",
-            "first half"
-          ]
-        ),
-
-      total_goals:
-        findContexts(
-          text,
-          [
-            "Total Goals",
-            "total goals",
-            "totalGoals",
-            "total_goals"
-          ]
-        ),
-
-      over_05:
-        findContexts(
-          text,
-          [
-            "Over 0.5",
-            "over 0.5",
-            "Over&nbsp;0.5"
-          ]
-        ),
-
-      football:
-        findContexts(
-          text,
-          [
-            "Football",
-            "football",
-            "Soccer",
-            "soccer"
-          ]
-        ),
-
-      forbidden:
-        findContexts(
-          text,
-          [
-            "forbidden",
-            "Forbidden"
-          ]
-        ),
 
       api:
         findContexts(
-          text,
+          js,
           [
             "/api/",
             "api.",
-            "sportsbook",
+            "baseUrl",
+            "baseURL",
+            "endpoint"
+          ],
+          25
+        ),
+
+      live:
+        findContexts(
+          js,
+          [
+            "live",
+            "inplay",
+            "in-play",
+            "inPlay"
+          ],
+          25
+        ),
+
+      odds:
+        findContexts(
+          js,
+          [
+            "odds",
+            "price",
+            "prices"
+          ],
+          25
+        ),
+
+      event:
+        findContexts(
+          js,
+          [
             "eventId",
-            "event-id"
+            "event_id",
+            "events",
+            "event/"
+          ],
+          25
+        ),
+
+      market:
+        findContexts(
+          js,
+          [
+            "marketId",
+            "market_id",
+            "markets",
+            "market/"
+          ],
+          25
+        ),
+
+      total:
+        findContexts(
+          js,
+          [
+            "total goals",
+            "totalGoals",
+            "overUnder",
+            "over/under",
+            "handicap"
           ],
           20
+        ),
+
+      socket:
+        findContexts(
+          js,
+          [
+            "wss://",
+            "websocket",
+            "socket"
+          ],
+          20
+        ),
+
+      fetch:
+        findContexts(
+          js,
+          [
+            "fetch(",
+            "axios",
+            "XMLHttpRequest",
+            "http.get",
+            ".get("
+          ],
+          25
         )
     };
 
 
     // ========================================================
-    // EMBEDDED JSON / APP STATE HINTS
+    // 7. FEATURE HINTS
     // ========================================================
 
-    const appStateHints = {
-      next_data:
-        lower.includes("__next_data__"),
+    const hints = {
 
-      svelte:
-        lower.includes("__svelte"),
+      has_api:
+        lower.includes(
+          "/api/"
+        ) ||
+        lower.includes(
+          "api."
+        ),
 
-      redux:
-        lower.includes("redux"),
+      has_live:
+        lower.includes(
+          "live"
+        ),
 
-      hydration:
-        lower.includes("hydrate") ||
-        lower.includes("hydration"),
+      has_inplay:
+        lower.includes(
+          "inplay"
+        ) ||
+        lower.includes(
+          "in-play"
+        ),
 
-      graphql:
-        lower.includes("graphql"),
+      has_odds:
+        lower.includes(
+          "odds"
+        ),
 
-      websocket:
-        lower.includes("websocket") ||
-        lower.includes("wss://"),
+      has_markets:
+        lower.includes(
+          "market"
+        ),
 
-      event_id:
-        lower.includes("eventid") ||
-        lower.includes("event_id"),
+      has_event_id:
+        lower.includes(
+          "eventid"
+        ) ||
+        lower.includes(
+          "event_id"
+        ),
 
-      sportsbook:
-        lower.includes("sportsbook"),
+      has_websocket:
+        lower.includes(
+          "wss://"
+        ) ||
+        lower.includes(
+          "websocket"
+        ),
 
-      odds:
-        lower.includes("odds")
+      has_graphql:
+        lower.includes(
+          "graphql"
+        )
     };
 
 
     // ========================================================
-    // RESPONSE
+    // RESULT
     // ========================================================
 
     return {
+
       success:
         true,
 
@@ -314,89 +370,64 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
         "BETSAFE",
 
       diagnostic_version:
-        "V2",
+        "V3",
 
       mode:
         "READ_ONLY_DIAGNOSTIC",
 
-      target:
-        BETSAFE_LIVE_URL,
+      page: {
 
-      http: {
+        url:
+          BETSAFE_LIVE_URL,
+
         status:
-          response.status,
+          pageResponse.status,
 
         ok:
-          response.ok,
+          pageResponse.ok,
 
-        status_text:
-          response.statusText,
+        content_length:
+          html.length
+      },
 
-        final_url:
-          response.url,
+      sportsbook_script: {
+
+        path:
+          sportsbookScript,
+
+        url:
+          scriptUrl,
+
+        status:
+          jsResponse.status,
+
+        ok:
+          jsResponse.ok,
 
         content_type:
-          response.headers.get(
+          jsResponse.headers.get(
             "content-type"
           ),
 
         content_length:
-          text.length
+          js.length
       },
 
-      block_check: {
-        blocked:
-          strongBlocked.length > 0,
-
-        strong_matches:
-          strongBlocked,
-
-        weak_matches:
-          weakBlocked,
-
-        note:
-          strongBlocked.length
-            ? "POSSIBLE_REAL_BLOCK"
-            : "NO_STRONG_BLOCK_DETECTED"
-      },
-
-      checks: {
-        football,
-        first_half:
-          firstHalf,
-
-        total_goals:
-          totalGoals,
-
-        first_half_total_goals:
-          firstHalf &&
-          totalGoals,
-
-        over_05:
-          over05
-      },
-
-      app_state_hints:
-        appStateHints,
+      hints,
 
       discovery: {
-        script_count:
-          scripts.length,
-
-        scripts:
-          scripts.slice(
-            0,
-            50
-          ),
 
         absolute_url_count:
           absoluteUrls.length,
 
-        interesting_urls:
-          interestingUrls,
+        interesting_absolute_urls:
+          interestingAbsolute,
 
-        relative_endpoints:
-          relativeEndpoints
+        relative_endpoint_count:
+          relativeEndpoints.length,
+
+        interesting_relative_endpoints:
+          interestingRelative
       },
 
       contexts,
@@ -409,6 +440,7 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
   } catch (error: any) {
 
     return {
+
       success:
         false,
 
@@ -416,13 +448,7 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
         "BETSAFE",
 
       diagnostic_version:
-        "V2",
-
-      mode:
-        "READ_ONLY_DIAGNOSTIC",
-
-      target:
-        BETSAFE_LIVE_URL,
+        "V3",
 
       error:
         error?.message ??
@@ -437,32 +463,37 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
 
 
 // ============================================================
-// CHECK STRING LIST
+// HEADERS
 // ============================================================
 
-function hasAny(
-  haystack: string,
-  needles: string[]
-): boolean {
+function browserHeaders() {
 
-  for (const needle of needles) {
+  return {
 
-    if (
-      haystack.includes(
-        needle.toLowerCase()
-      )
-    ) {
-      return true;
-    }
+    "User-Agent":
+      "Mozilla/5.0 " +
+      "(Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) " +
+      "Chrome/140.0.0.0 Safari/537.36",
 
-  }
+    "Accept":
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 
-  return false;
+    "Accept-Language":
+      "en-US,en;q=0.9",
+
+    "Cache-Control":
+      "no-cache",
+
+    "Pragma":
+      "no-cache"
+  };
 }
 
 
 // ============================================================
-// SCRIPT SRC EXTRACTION
+// SCRIPT EXTRACTION
 // ============================================================
 
 function extractScriptSources(
@@ -487,16 +518,20 @@ function extractScriptSources(
   ) {
 
     const value =
-      cleanUrl(
+      clean(
         match[1]
       );
 
     if (value) {
-      out.add(value);
+      out.add(
+        value
+      );
     }
   }
 
-  return Array.from(out);
+  return Array.from(
+    out
+  );
 }
 
 
@@ -505,7 +540,7 @@ function extractScriptSources(
 // ============================================================
 
 function extractAbsoluteUrls(
-  html: string
+  text: string
 ): string[] {
 
   const out =
@@ -521,23 +556,23 @@ function extractAbsoluteUrls(
   while (
     (
       match =
-        regex.exec(html)
+        regex.exec(text)
     )
   ) {
 
     let value =
-      cleanUrl(
+      clean(
         match[0]
       );
 
     value =
       value
         .replace(
-          /&amp;/g,
+          /\\u0026/g,
           "&"
         )
         .replace(
-          /\\u0026/g,
+          /&amp;/g,
           "&"
         );
 
@@ -545,27 +580,31 @@ function extractAbsoluteUrls(
       value.length >
       8
     ) {
-      out.add(value);
+      out.add(
+        value
+      );
     }
   }
 
-  return Array.from(out);
+  return Array.from(
+    out
+  );
 }
 
 
 // ============================================================
-// RELATIVE PATH / ENDPOINT EXTRACTION
+// RELATIVE ENDPOINT EXTRACTION
 // ============================================================
 
 function extractRelativeEndpoints(
-  html: string
+  text: string
 ): string[] {
 
   const out =
     new Set<string>();
 
   const regex =
-    /["'](\/[^"'<>\\\s]{3,300})["']/g;
+    /["'`](\/[^"'`<>\\\s]{3,300})["'`]/g;
 
   let match:
     RegExpExecArray |
@@ -574,29 +613,35 @@ function extractRelativeEndpoints(
   while (
     (
       match =
-        regex.exec(html)
+        regex.exec(text)
     )
   ) {
 
     const value =
-      cleanUrl(
+      clean(
         match[1]
       );
 
-    if (value) {
-      out.add(value);
+    if (
+      value
+    ) {
+      out.add(
+        value
+      );
     }
   }
 
-  return Array.from(out);
+  return Array.from(
+    out
+  );
 }
 
 
 // ============================================================
-// INTERESTING URL FILTER
+// INTERESTING FILTER
 // ============================================================
 
-function isInterestingUrl(
+function isInteresting(
   value: string
 ): boolean {
 
@@ -604,35 +649,56 @@ function isInterestingUrl(
     value
       .toLowerCase();
 
-  const words = [
+  const keys = [
+
     "api",
+
     "sport",
+
     "sportsbook",
+
     "live",
-    "event",
-    "odds",
-    "market",
-    "fixture",
-    "coupon",
-    "bet",
-    "feed",
-    "prematch",
+
     "inplay",
+
     "in-play",
-    "graphql",
+
+    "event",
+
+    "fixture",
+
+    "market",
+
+    "odds",
+
+    "price",
+
+    "coupon",
+
+    "feed",
+
+    "bet",
+
     "socket",
-    "stream"
+
+    "stream",
+
+    "graphql",
+
+    "prematch"
   ];
 
-  return words.some(
-    x =>
-      s.includes(x)
+  return keys.some(
+    key =>
+      s.includes(
+        key
+      )
   );
 }
 
 
 // ============================================================
-// CONTEXT FINDER
+// CONTEXT
 // ============================================================
 
 function findContexts(
@@ -645,19 +711,24 @@ function findContexts(
     string[] = [];
 
   const lower =
-    text.toLowerCase();
+    text
+      .toLowerCase();
 
-  for (const needleRaw of needles) {
+  for (
+    const rawNeedle
+    of needles
+  ) {
 
     const needle =
-      needleRaw.toLowerCase();
+      rawNeedle
+        .toLowerCase();
 
     let start =
       0;
 
     while (
       out.length <
-        maxResults
+      maxResults
     ) {
 
       const index =
@@ -667,7 +738,8 @@ function findContexts(
         );
 
       if (
-        index === -1
+        index ===
+        -1
       ) {
         break;
       }
@@ -683,7 +755,7 @@ function findContexts(
           text.length,
           index +
           needle.length +
-          400
+          450
         );
 
       const context =
@@ -700,9 +772,13 @@ function findContexts(
 
       if (
         context &&
-        !out.includes(context)
+        !out.includes(
+          context
+        )
       ) {
-        out.push(context);
+        out.push(
+          context
+        );
       }
 
       start =
@@ -723,10 +799,10 @@ function findContexts(
 
 
 // ============================================================
-// CLEAN URL
+// CLEAN
 // ============================================================
 
-function cleanUrl(
+function clean(
   value: any
 ): string {
 
@@ -737,7 +813,9 @@ function cleanUrl(
     return "";
   }
 
-  return String(value)
+  return String(
+    value
+  )
     .trim()
     .replace(
       /&quot;/g,
