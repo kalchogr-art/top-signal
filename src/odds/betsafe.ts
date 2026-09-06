@@ -1,15 +1,19 @@
 // ============================================================
-// TOP SIGNAL — BETSAFE DIAGNOSTIC V12
+// TOP SIGNAL — BETSAFE DIAGNOSTIC V13
 // READ ONLY
 //
-// V12 GOAL:
-// 1. Fetch the working Betsafe SSR live feed.
-// 2. Extract a SMALL list of live football events.
-// 3. Extract event IDs, teams, phase and visible markets/odds.
-// 4. For 1H events, probe event-specific SSR paths to see whether
-//    Betsafe returns expanded markets such as:
-//      1st Half - Total Goals
-//      Over 0.5
+// FIX FROM V12:
+// - V12 was accidentally treating market/selection IDs as event IDs.
+// - V13 derives the REAL base event ID from market-id + market-template-ids.
+// - Teams are taken from the Match Result market.
+// - Phase is taken from the nearest preceding event status.
+// - Only real 1H events are probed.
+//
+// GOAL:
+// Test event-specific SSR pages for:
+//   1st Half / First Half
+//   Total Goals
+//   Over 0.5 / Under 0.5
 //
 // NO BETTING
 // NO LOGIN
@@ -17,14 +21,18 @@
 // ============================================================
 
 const ORIGIN = "https://www.betsafe.com";
-const LIVE_PATH = "/en/sportsbook/live";
-const LIVE_URL = ORIGIN + LIVE_PATH;
+
+const LIVE_PATH =
+  "/en/sportsbook/live";
+
+const LIVE_URL =
+  ORIGIN + LIVE_PATH;
 
 const SSR_ENDPOINT =
   ORIGIN + "/sb/fe-api/ssr/v1/generate";
 
-const MAX_EVENTS = 8;
-const MAX_1H_PROBES = 4;
+const MAX_EVENTS = 12;
+const MAX_1H_PROBES = 6;
 
 
 // ============================================================
@@ -35,32 +43,48 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
   const started = Date.now();
 
   try {
+
     // --------------------------------------------------------
-    // 1. Load normal live page and context IDs
+    // 1. Normal live page -> context IDs
     // --------------------------------------------------------
 
-    const pageResponse = await fetch(LIVE_URL, {
-      method: "GET",
-      headers: pageHeaders(),
-      redirect: "follow"
-    });
+    const pageResponse =
+      await fetch(
+        LIVE_URL,
+        {
+          method: "GET",
+          headers: pageHeaders(),
+          redirect: "follow"
+        }
+      );
 
-    const pageHtml = await pageResponse.text();
-    const decodedPage = decode(pageHtml);
+    const pageHtml =
+      decode(
+        await pageResponse.text()
+      );
 
     const staticContextId =
-      extractJsonValue(decodedPage, "staticContextId");
+      extractJsonValue(
+        pageHtml,
+        "staticContextId"
+      );
 
     const userContextId =
-      extractJsonValue(decodedPage, "userContextId");
+      extractJsonValue(
+        pageHtml,
+        "userContextId"
+      );
 
-    if (!staticContextId || !userContextId) {
+    if (
+      !staticContextId ||
+      !userContextId
+    ) {
       return {
         success: false,
         source: "BETSAFE",
-        diagnostic_version: "V12",
+        diagnostic_version: "V13",
         stage: "CONTEXT",
-        error: "Missing Betsafe context IDs",
+        error: "Missing context IDs",
         context: {
           staticContextId,
           userContextId
@@ -84,122 +108,208 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
       return {
         success: false,
         source: "BETSAFE",
-        diagnostic_version: "V12",
+        diagnostic_version: "V13",
         stage: "LIVE_SSR",
-        live_ssr: liveSsr
+        live_ssr: {
+          status: liveSsr.status,
+          ok: liveSsr.ok,
+          content_type: liveSsr.content_type,
+          content_length: liveSsr.body.length
+        }
       };
     }
 
 
     // --------------------------------------------------------
-    // 3. Extract compact live event list
+    // 3. REAL base event IDs
     // --------------------------------------------------------
 
     const events =
-      extractEvents(
+      extractRealEvents(
         liveSsr.body
       )
-      .slice(0, MAX_EVENTS);
-
-
-    // --------------------------------------------------------
-    // 4. Probe event-specific paths for 1H events
-    // --------------------------------------------------------
+      .slice(
+        0,
+        MAX_EVENTS
+      );
 
     const firstHalfEvents =
       events
         .filter(
           event =>
-            event.phase
-              ?.toLowerCase()
-              .includes("1st half")
+            isFirstHalf(
+              event.phase
+            )
         )
-        .slice(0, MAX_1H_PROBES);
+        .slice(
+          0,
+          MAX_1H_PROBES
+        );
+
+
+    // --------------------------------------------------------
+    // 4. Event-specific probes
+    // --------------------------------------------------------
 
     const probes: Record<string, any>[] = [];
 
-    for (const event of firstHalfEvents) {
-      const eventId = event.event_id;
+    for (
+      const event
+      of firstHalfEvents
+    ) {
 
-      if (!eventId) continue;
+      const eventId =
+        event.event_id;
 
-      const candidates = [
-        // Path shape closest to the current live page.
+      const candidatePaths = [
         `${LIVE_PATH}?eventId=${eventId}`,
-
-        // Common event route variants worth testing.
+        `${LIVE_PATH}/live?eventId=${eventId}`,
         `/en/sportsbook/event/${eventId}`,
         `/en/sportsbook/live/event/${eventId}`
       ];
 
-      const candidateResults: Record<string, any>[] = [];
+      const candidateResults:
+        Record<string, any>[] = [];
 
-      for (const candidatePath of candidates) {
+      for (
+        const path
+        of candidatePaths
+      ) {
+
         const result =
           await fetchSsr(
-            candidatePath,
+            path,
             staticContextId,
             userContextId
           );
 
         candidateResults.push({
-          path: candidatePath,
-          status: result.status,
-          ok: result.ok,
-          content_type: result.content_type,
-          content_length: result.body.length,
-          signals: analyseTargetMarket(result.body),
-          sample: targetMarketSample(result.body)
+          path,
+
+          status:
+            result.status,
+
+          ok:
+            result.ok,
+
+          content_type:
+            result.content_type,
+
+          content_length:
+            result.body.length,
+
+          signals:
+            analyseTargetMarket(
+              result.body
+            ),
+
+          exact_matches:
+            extractExactTargetMarkets(
+              result.body
+            ),
+
+          sample:
+            targetMarketSample(
+              result.body
+            )
         });
       }
 
       probes.push({
-        event_id: eventId,
-        home: event.home,
-        away: event.away,
-        phase: event.phase,
-        candidates: candidateResults
+        event_id:
+          eventId,
+
+        home:
+          event.home,
+
+        away:
+          event.away,
+
+        phase:
+          event.phase,
+
+        visible_markets:
+          event.visible_markets,
+
+        candidates:
+          candidateResults
       });
     }
 
 
     return {
       success: true,
-      source: "BETSAFE",
-      diagnostic_version: "V12",
-      mode: "READ_ONLY_DIAGNOSTIC",
+
+      source:
+        "BETSAFE",
+
+      diagnostic_version:
+        "V13",
+
+      mode:
+        "READ_ONLY_DIAGNOSTIC",
 
       page: {
-        status: pageResponse.status,
-        ok: pageResponse.ok
-      },
+        status:
+          pageResponse.status,
 
-      context: {
-        staticContextId,
-        userContextId
+        ok:
+          pageResponse.ok
       },
 
       live_ssr: {
-        status: liveSsr.status,
-        ok: liveSsr.ok,
-        content_length: liveSsr.body.length
+        status:
+          liveSsr.status,
+
+        ok:
+          liveSsr.ok,
+
+        content_length:
+          liveSsr.body.length
+      },
+
+      summary: {
+        real_events_found:
+          events.length,
+
+        first_half_events:
+          firstHalfEvents.length,
+
+        probes_run:
+          probes.length
       },
 
       events,
 
-      event_probes: probes,
+      event_probes:
+        probes,
 
-      timing_ms: Date.now() - started
+      timing_ms:
+        Date.now() -
+        started
     };
 
   } catch (error: any) {
+
     return {
       success: false,
-      source: "BETSAFE",
-      diagnostic_version: "V12",
-      mode: "READ_ONLY_DIAGNOSTIC",
-      error: error?.message ?? String(error),
-      timing_ms: Date.now() - started
+
+      source:
+        "BETSAFE",
+
+      diagnostic_version:
+        "V13",
+
+      mode:
+        "READ_ONLY_DIAGNOSTIC",
+
+      error:
+        error?.message ??
+        String(error),
+
+      timing_ms:
+        Date.now() -
+        started
     };
   }
 }
@@ -220,224 +330,391 @@ async function fetchSsr(
   body: string;
 }> {
 
-  // URLSearchParams is deliberate here:
-  // nested ?eventId= is encoded safely inside the path parameter.
-  const params = new URLSearchParams({
-    path
-  });
+  const params =
+    new URLSearchParams({
+      path
+    });
 
   const url =
     `${SSR_ENDPOINT}?${params.toString()}`;
 
   const response =
-    await fetch(url, {
-      method: "GET",
-      headers: {
-        ...assetHeaders(),
+    await fetch(
+      url,
+      {
+        method: "GET",
 
-        "x-sb-static-context-id":
-          staticContextId,
+        headers: {
+          ...assetHeaders(),
 
-        "x-sb-user-context-id":
-          userContextId,
+          "x-sb-static-context-id":
+            staticContextId,
 
-        "x-sb-content-type":
-          "full",
+          "x-sb-user-context-id":
+            userContextId,
 
-        "Referer":
-          LIVE_URL
-      },
-      redirect: "follow"
-    });
+          "x-sb-content-type":
+            "full",
 
-  const text =
+          "Referer":
+            LIVE_URL
+        },
+
+        redirect:
+          "follow"
+      }
+    );
+
+  const body =
     decode(
       await response.text()
     );
 
   return {
-    status: response.status,
-    ok: response.ok,
+    status:
+      response.status,
+
+    ok:
+      response.ok,
+
     content_type:
       response.headers.get(
         "content-type"
       ),
-    body: text
+
+    body
   };
 }
 
 
 // ============================================================
-// EVENT EXTRACTION
+// REAL EVENT EXTRACTION
 // ============================================================
 
-function extractEvents(
+function extractRealEvents(
   html: string
 ): Record<string, any>[] {
 
-  const results: Record<string, any>[] = [];
-
-  // Split around event-info blocks while preserving enough nearby HTML.
-  const eventIdRegex =
-    /(?:selection-id|market-id)="[^"]*?(f-[A-Za-z0-9_-]+)[^"]*"/g;
-
-  const seen =
+  const eventIds =
     new Set<string>();
 
-  let match:
+  const marketRegex =
+    /<obg-event-row-market-container\b([^>]*)>/gi;
+
+  let marketMatch:
     RegExpExecArray | null;
 
   while (
-    (match =
-      eventIdRegex.exec(html))
+    (
+      marketMatch =
+        marketRegex.exec(html)
+    )
   ) {
 
-    const eventId =
-      match[1];
+    const attrs =
+      marketMatch[1];
+
+    const marketId =
+      attr(
+        attrs,
+        "market-id"
+      );
+
+    const templateIds =
+      attr(
+        attrs,
+        "market-template-ids"
+      );
 
     if (
-      seen.has(eventId)
+      !marketId ||
+      !templateIds
     ) {
       continue;
     }
 
-    seen.add(eventId);
-
-    const index =
-      match.index;
-
-    const from =
-      Math.max(
-        0,
-        index - 9000
+    const eventId =
+      deriveBaseEventId(
+        marketId,
+        templateIds
       );
 
-    const to =
-      Math.min(
-        html.length,
-        index + 14000
+    if (eventId) {
+      eventIds.add(
+        eventId
       );
-
-    const block =
-      html.slice(
-        from,
-        to
-      );
-
-    const phase =
-      firstMatch(
-        block,
-        /<span class="phase">\s*([^<]+?)\s*<\/span>/i
-      );
-
-    const participants =
-      extractParticipantNames(
-        block
-      );
-
-    const visibleMarkets =
-      extractVisibleMarkets(
-        block
-      );
-
-    results.push({
-      event_id:
-        eventId,
-
-      phase:
-        phase,
-
-      home:
-        participants[0] ??
-        null,
-
-      away:
-        participants[1] ??
-        null,
-
-      visible_markets:
-        visibleMarkets
-    });
-
-    if (
-      results.length >=
-      MAX_EVENTS * 3
-    ) {
-      break;
     }
   }
 
-  return dedupeEvents(
-    results
+
+  const events:
+    Record<string, any>[] = [];
+
+  for (
+    const eventId
+    of eventIds
+  ) {
+
+    const event =
+      buildEvent(
+        html,
+        eventId
+      );
+
+    if (event) {
+      events.push(
+        event
+      );
+    }
+  }
+
+
+  // Sort 1H first, then halftime, then others.
+  events.sort(
+    (a, b) =>
+      phaseRank(a.phase) -
+      phaseRank(b.phase)
   );
+
+  return events;
 }
 
 
 // ============================================================
-// PARTICIPANTS
+// DERIVE BASE EVENT ID
 // ============================================================
 
-function extractParticipantNames(
-  block: string
-): string[] {
+function deriveBaseEventId(
+  marketId: string,
+  templateIds: string
+): string | null {
 
-  const names: string[] = [];
+  // Example:
+  // market-id:
+  //   m-f-C7UQaaiDJUyO6m6AUjNKQA-MTG2W-1.5
+  //
+  // market-template-ids:
+  //   MTG2W25,MTG2W,ESFMTOTAL,ESFMATOTAL
+  //
+  // => event:
+  //   f-C7UQaaiDJUyO6m6AUjNKQA
 
-  const patterns = [
-    /test-id="event-info\.participant-name"[^>]*>\s*([^<]+?)\s*</gi,
-    /class="[^"]*participant-name[^"]*"[^>]*>\s*([^<]+?)\s*</gi,
-    /class="[^"]*participants-name[^"]*"[^>]*>\s*([^<]+?)\s*</gi
-  ];
+  let value =
+    marketId;
 
-  for (const regex of patterns) {
-    let match: RegExpExecArray | null;
+  if (
+    value.startsWith("m-")
+  ) {
+    value =
+      value.slice(2);
+  }
 
-    while (
-      (match =
-        regex.exec(block))
+  const templates =
+    templateIds
+      .split(",")
+      .map(
+        item =>
+          item.trim()
+      )
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          b.length -
+          a.length
+      );
+
+  for (
+    const template
+    of templates
+  ) {
+
+    const marker =
+      `-${template}`;
+
+    const index =
+      value.indexOf(
+        marker
+      );
+
+    if (
+      index > 0
     ) {
 
-      const value =
-        htmlText(
-          match[1]
+      const candidate =
+        value.slice(
+          0,
+          index
         );
 
       if (
-        value &&
-        !names.includes(value)
+        candidate.startsWith(
+          "f-"
+        )
       ) {
-        names.push(value);
-      }
-
-      if (names.length >= 2) {
-        return names;
+        return candidate;
       }
     }
   }
 
-  return names;
+  // Fallback for known sportsbook template-like suffixes.
+  const fallback =
+    value.match(
+      /^(f-[A-Za-z0-9_-]+?)-(?:MW3W|MTG2W25|MTG2W|BTTS|M3WHCP|DC)(?:-|$)/
+    );
+
+  return fallback?.[1] ??
+    null;
 }
 
 
 // ============================================================
-// VISIBLE MARKETS
+// BUILD ONE EVENT
 // ============================================================
 
-function extractVisibleMarkets(
-  block: string
+function buildEvent(
+  html: string,
+  eventId: string
+): Record<string, any> | null {
+
+  const needle =
+    `m-${eventId}-`;
+
+  const index =
+    html.indexOf(
+      needle
+    );
+
+  if (
+    index === -1
+  ) {
+    return null;
+  }
+
+
+  // The market occurs after scorecard/status.
+  // A 16k backward window is enough for the event header.
+  const headerFrom =
+    Math.max(
+      0,
+      index - 16000
+    );
+
+  const headerBlock =
+    html.slice(
+      headerFrom,
+      index
+    );
+
+  const phase =
+    lastMatch(
+      headerBlock,
+      /<span class="phase">\s*([^<]+?)\s*<\/span>/gi
+    );
+
+
+  // Find all markets that belong to this exact base event ID.
+  const visibleMarkets =
+    extractEventMarkets(
+      html,
+      eventId
+    );
+
+
+  // Strongest team source:
+  // Match Result selection IDs explicitly tell home/draw/away.
+  let home:
+    string | null = null;
+
+  let away:
+    string | null = null;
+
+  const matchResult =
+    visibleMarkets.find(
+      market =>
+        market.label ===
+          "Match Result" ||
+        market.market_id
+          ?.includes(
+            "-MW3W"
+          )
+    );
+
+  if (matchResult) {
+
+    for (
+      const selection
+      of matchResult.selections ??
+      []
+    ) {
+
+      const id =
+        String(
+          selection.selection_id ??
+          ""
+        );
+
+      if (
+        id.endsWith(
+          "-home"
+        )
+      ) {
+        home =
+          selection.label ??
+          null;
+      }
+
+      if (
+        id.endsWith(
+          "-away"
+        )
+      ) {
+        away =
+          selection.label ??
+          null;
+      }
+    }
+  }
+
+
+  return {
+    event_id:
+      eventId,
+
+    phase,
+
+    home,
+
+    away,
+
+    visible_markets:
+      visibleMarkets
+  };
+}
+
+
+// ============================================================
+// EXTRACT MARKETS FOR EXACT EVENT
+// ============================================================
+
+function extractEventMarkets(
+  html: string,
+  eventId: string
 ): Record<string, any>[] {
 
-  const markets: Record<string, any>[] = [];
+  const out:
+    Record<string, any>[] = [];
 
-  const marketRegex =
+  const regex =
     /<obg-event-row-market-container\b([^>]*)>([\s\S]*?)<\/obg-event-row-market-container>/gi;
 
   let match:
     RegExpExecArray | null;
 
   while (
-    (match =
-      marketRegex.exec(block))
+    (
+      match =
+        regex.exec(html)
+    )
   ) {
 
     const attrs =
@@ -447,10 +724,19 @@ function extractVisibleMarkets(
       match[2];
 
     const marketId =
-      firstMatch(
+      attr(
         attrs,
-        /market-id="([^"]+)"/i
+        "market-id"
       );
+
+    if (
+      !marketId ||
+      !marketId.startsWith(
+        `m-${eventId}-`
+      )
+    ) {
+      continue;
+    }
 
     const label =
       firstMatch(
@@ -463,46 +749,48 @@ function extractVisibleMarkets(
         body
       );
 
+    out.push({
+      market_id:
+        marketId,
+
+      label,
+
+      selections
+    });
+
     if (
-      label ||
-      marketId ||
-      selections.length
+      out.length >= 8
     ) {
-      markets.push({
-        market_id:
-          marketId,
-
-        label:
-          label,
-
-        selections
-      });
-    }
-
-    if (markets.length >= 6) {
       break;
     }
   }
 
-  return markets;
+  return out;
 }
 
+
+// ============================================================
+// SELECTIONS
+// ============================================================
 
 function extractSelections(
   body: string
 ): Record<string, any>[] {
 
-  const out: Record<string, any>[] = [];
+  const out:
+    Record<string, any>[] = [];
 
-  const selectionRegex =
+  const regex =
     /<obg-selection-container\b([^>]*)>([\s\S]*?)<\/obg-selection-container>/gi;
 
   let match:
     RegExpExecArray | null;
 
   while (
-    (match =
-      selectionRegex.exec(body))
+    (
+      match =
+        regex.exec(body)
+    )
   ) {
 
     const attrs =
@@ -512,9 +800,9 @@ function extractSelections(
       match[2];
 
     const selectionId =
-      firstMatch(
+      attr(
         attrs,
-        /selection-id="([^"]+)"/i
+        "selection-id"
       );
 
     const label =
@@ -523,30 +811,25 @@ function extractSelections(
         /class="obg-selection-label"[^>]*>\s*([^<]+?)\s*</i
       );
 
-    const odds =
+    const oddsText =
       firstMatch(
         inner,
         /test-id="odds"[^>]*>\s*([0-9]+(?:\.[0-9]+)?)\s*</i
       );
 
-    if (
-      selectionId ||
-      label ||
-      odds
-    ) {
-      out.push({
-        selection_id:
-          selectionId,
+    out.push({
+      selection_id:
+        selectionId,
 
-        label:
-          label,
+      label,
 
-        odds:
-          odds
-            ? Number(odds)
-            : null
-      });
-    }
+      odds:
+        oddsText
+          ? Number(
+              oddsText
+            )
+          : null
+    });
   }
 
   return out;
@@ -554,7 +837,7 @@ function extractSelections(
 
 
 // ============================================================
-// TARGET MARKET ANALYSIS
+// TARGET ANALYSIS
 // ============================================================
 
 function analyseTargetMarket(
@@ -606,19 +889,106 @@ function analyseTargetMarket(
       ) ||
       lower.includes(
         "first half total goals"
-      ),
-
-    first_half_market_templates:
-      findTemplateIds(
-        html,
-        [
-          "1H",
-          "FHT",
-          "HT",
-          "TOTAL"
-        ]
       )
   };
+}
+
+
+// ============================================================
+// EXTRACT EXACT TARGET-LIKE MARKETS
+// ============================================================
+
+function extractExactTargetMarkets(
+  html: string
+): Record<string, any>[] {
+
+  const out:
+    Record<string, any>[] = [];
+
+  const regex =
+    /<obg-event-row-market-container\b([^>]*)>([\s\S]*?)<\/obg-event-row-market-container>/gi;
+
+  let match:
+    RegExpExecArray | null;
+
+  while (
+    (
+      match =
+        regex.exec(html)
+    )
+  ) {
+
+    const attrs =
+      match[1];
+
+    const body =
+      match[2];
+
+    const label =
+      firstMatch(
+        body,
+        /event-row\.market-header\.label"[^>]*>\s*([^<]+?)\s*</i
+      );
+
+    const selections =
+      extractSelections(
+        body
+      );
+
+    const combined =
+      (
+        `${label ?? ""} ` +
+        selections
+          .map(
+            s =>
+              s.label ??
+              ""
+          )
+          .join(" ")
+      )
+        .toLowerCase();
+
+    const interesting =
+      combined.includes(
+        "0.5"
+      ) ||
+      combined.includes(
+        "1st half"
+      ) ||
+      combined.includes(
+        "first half"
+      );
+
+    if (!interesting) {
+      continue;
+    }
+
+    out.push({
+      market_id:
+        attr(
+          attrs,
+          "market-id"
+        ),
+
+      market_template_ids:
+        attr(
+          attrs,
+          "market-template-ids"
+        ),
+
+      label,
+
+      selections
+    });
+
+    if (
+      out.length >= 12
+    ) {
+      break;
+    }
+  }
+
+  return out;
 }
 
 
@@ -641,213 +1011,104 @@ function targetMarketSample(
       "Total Goals"
     ],
     5,
-    500
+    450
   );
 }
 
 
 // ============================================================
-// TEMPLATE IDS
+// PHASE
 // ============================================================
 
-function findTemplateIds(
-  html: string,
-  tokens: string[]
-): string[] {
+function isFirstHalf(
+  phase: any
+): boolean {
 
-  const out =
-    new Set<string>();
+  const value =
+    String(
+      phase ??
+      ""
+    )
+      .toLowerCase();
 
-  const regex =
-    /market-template-ids="([^"]+)"/gi;
+  return value.includes(
+    "1st half"
+  ) ||
+  value.includes(
+    "first half"
+  );
+}
 
-  let match:
-    RegExpExecArray | null;
 
-  while (
-    (match =
-      regex.exec(html))
+function phaseRank(
+  phase: any
+): number {
+
+  const value =
+    String(
+      phase ??
+      ""
+    )
+      .toLowerCase();
+
+  if (
+    isFirstHalf(value)
   ) {
+    return 0;
+  }
 
-    const value =
-      match[1];
+  if (
+    value.includes(
+      "halftime"
+    )
+  ) {
+    return 1;
+  }
 
-    const upper =
-      value.toUpperCase();
+  if (
+    value.includes(
+      "2nd half"
+    ) ||
+    value.includes(
+      "second half"
+    )
+  ) {
+    return 2;
+  }
 
-    if (
-      tokens.some(
-        token =>
-          upper.includes(
-            token
-          )
+  return 3;
+}
+
+
+// ============================================================
+// ATTRIBUTE
+// ============================================================
+
+function attr(
+  attrs: string,
+  name: string
+): string | null {
+
+  const escaped =
+    escapeRegex(
+      name
+    );
+
+  const match =
+    attrs.match(
+      new RegExp(
+        `${escaped}="([^"]*)"`,
+        "i"
       )
-    ) {
-      out.add(value);
-    }
+    );
 
-    if (out.size >= 20) {
-      break;
-    }
-  }
-
-  return Array.from(out);
+  return match?.[1] ??
+    null;
 }
 
 
 // ============================================================
-// DEDUPE
-// ============================================================
-
-function dedupeEvents(
-  events: Record<string, any>[]
-): Record<string, any>[] {
-
-  const map =
-    new Map<string, Record<string, any>>();
-
-  for (const event of events) {
-    const existing =
-      map.get(
-        event.event_id
-      );
-
-    if (!existing) {
-      map.set(
-        event.event_id,
-        event
-      );
-      continue;
-    }
-
-    if (
-      !existing.phase &&
-      event.phase
-    ) {
-      existing.phase =
-        event.phase;
-    }
-
-    if (
-      !existing.home &&
-      event.home
-    ) {
-      existing.home =
-        event.home;
-    }
-
-    if (
-      !existing.away &&
-      event.away
-    ) {
-      existing.away =
-        event.away;
-    }
-
-    if (
-      (
-        existing.visible_markets?.length ??
-        0
-      ) <
-      (
-        event.visible_markets?.length ??
-        0
-      )
-    ) {
-      existing.visible_markets =
-        event.visible_markets;
-    }
-  }
-
-  return Array.from(
-    map.values()
-  );
-}
-
-
-// ============================================================
-// CONTEXT FINDER
-// ============================================================
-
-function findContexts(
-  text: string,
-  needles: string[],
-  maxResults = 5,
-  radius = 500
-): string[] {
-
-  const out: string[] = [];
-  const lower =
-    text.toLowerCase();
-
-  for (const rawNeedle of needles) {
-    const needle =
-      rawNeedle.toLowerCase();
-
-    let start = 0;
-
-    while (
-      out.length <
-      maxResults
-    ) {
-      const index =
-        lower.indexOf(
-          needle,
-          start
-        );
-
-      if (index === -1) {
-        break;
-      }
-
-      const from =
-        Math.max(
-          0,
-          index - radius
-        );
-
-      const to =
-        Math.min(
-          text.length,
-          index +
-            needle.length +
-            radius
-        );
-
-      const context =
-        normalizeContext(
-          text.slice(
-            from,
-            to
-          )
-        );
-
-      if (
-        context &&
-        !out.includes(context)
-      ) {
-        out.push(context);
-      }
-
-      start =
-        index +
-        needle.length;
-    }
-
-    if (
-      out.length >=
-      maxResults
-    ) {
-      break;
-    }
-  }
-
-  return out;
-}
-
-
-// ============================================================
-// GENERIC HELPERS
+// MATCH HELPERS
 // ============================================================
 
 function firstMatch(
@@ -872,6 +1133,201 @@ function firstMatch(
   );
 }
 
+
+function lastMatch(
+  text: string,
+  regex: RegExp
+): string | null {
+
+  regex.lastIndex =
+    0;
+
+  let match:
+    RegExpExecArray | null;
+
+  let value:
+    string | null = null;
+
+  while (
+    (
+      match =
+        regex.exec(text)
+    )
+  ) {
+
+    if (
+      match[1]
+    ) {
+      value =
+        htmlText(
+          match[1]
+        );
+    }
+
+    if (
+      match[0].length === 0
+    ) {
+      regex.lastIndex++;
+    }
+  }
+
+  return value;
+}
+
+
+// ============================================================
+// CONTEXT FINDER
+// ============================================================
+
+function findContexts(
+  text: string,
+  needles: string[],
+  maxResults = 5,
+  radius = 450
+): string[] {
+
+  const out:
+    string[] = [];
+
+  const lower =
+    text.toLowerCase();
+
+  for (
+    const rawNeedle
+    of needles
+  ) {
+
+    const needle =
+      rawNeedle.toLowerCase();
+
+    let start =
+      0;
+
+    while (
+      out.length <
+      maxResults
+    ) {
+
+      const index =
+        lower.indexOf(
+          needle,
+          start
+        );
+
+      if (
+        index === -1
+      ) {
+        break;
+      }
+
+      const from =
+        Math.max(
+          0,
+          index - radius
+        );
+
+      const to =
+        Math.min(
+          text.length,
+          index +
+          needle.length +
+          radius
+        );
+
+      const context =
+        normalizeContext(
+          text.slice(
+            from,
+            to
+          )
+        );
+
+      if (
+        context &&
+        !out.includes(
+          context
+        )
+      ) {
+        out.push(
+          context
+        );
+      }
+
+      start =
+        index +
+        needle.length;
+    }
+
+    if (
+      out.length >=
+      maxResults
+    ) {
+      break;
+    }
+  }
+
+  return out;
+}
+
+
+// ============================================================
+// CONTEXT VALUE
+// ============================================================
+
+function extractJsonValue(
+  text: string,
+  key: string
+): string | null {
+
+  const escaped =
+    escapeRegex(
+      key
+    );
+
+  const patterns = [
+    new RegExp(
+      `["']${escaped}["']\\s*:\\s*["']([^"']+)["']`,
+      "i"
+    ),
+
+    new RegExp(
+      `${escaped}\\s*:\\s*["']([^"']+)["']`,
+      "i"
+    ),
+
+    new RegExp(
+      `${escaped}\\s*=\\s*["']([^"']+)["']`,
+      "i"
+    )
+  ];
+
+  for (
+    const pattern
+    of patterns
+  ) {
+
+    const match =
+      text.match(
+        pattern
+      );
+
+    if (
+      match &&
+      match[1]
+    ) {
+      return decode(
+        match[1]
+      ).trim();
+    }
+  }
+
+  return null;
+}
+
+
+// ============================================================
+// TEXT
+// ============================================================
 
 function htmlText(
   value: string
@@ -905,51 +1361,6 @@ function htmlText(
       " "
     )
     .trim();
-}
-
-
-function extractJsonValue(
-  text: string,
-  key: string
-): string | null {
-
-  const escaped =
-    escapeRegex(
-      key
-    );
-
-  const patterns = [
-    new RegExp(
-      `["']${escaped}["']\\s*:\\s*["']([^"']+)["']`,
-      "i"
-    ),
-    new RegExp(
-      `${escaped}\\s*:\\s*["']([^"']+)["']`,
-      "i"
-    ),
-    new RegExp(
-      `${escaped}\\s*=\\s*["']([^"']+)["']`,
-      "i"
-    )
-  ];
-
-  for (const pattern of patterns) {
-    const match =
-      text.match(
-        pattern
-      );
-
-    if (
-      match &&
-      match[1]
-    ) {
-      return decode(
-        match[1]
-      ).trim();
-    }
-  }
-
-  return null;
 }
 
 
@@ -1031,16 +1442,45 @@ function decode(
     return "";
   }
 
-  return String(value)
-    .replace(/\\\\\//g, "/")
-    .replace(/\\\//g, "/")
-    .replace(/\\u002F/gi, "/")
-    .replace(/\\u003A/gi, ":")
-    .replace(/\\u0026/gi, "&")
-    .replace(/\\u003D/gi, "=")
-    .replace(/\\u003F/gi, "?")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, "\"");
+  return String(
+    value
+  )
+    .replace(
+      /\\\\\//g,
+      "/"
+    )
+    .replace(
+      /\\\//g,
+      "/"
+    )
+    .replace(
+      /\\u002F/gi,
+      "/"
+    )
+    .replace(
+      /\\u003A/gi,
+      ":"
+    )
+    .replace(
+      /\\u0026/gi,
+      "&"
+    )
+    .replace(
+      /\\u003D/gi,
+      "="
+    )
+    .replace(
+      /\\u003F/gi,
+      "?"
+    )
+    .replace(
+      /&amp;/g,
+      "&"
+    )
+    .replace(
+      /&quot;/g,
+      "\""
+    );
 }
 
 
