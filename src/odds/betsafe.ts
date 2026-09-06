@@ -1,19 +1,20 @@
 // ============================================================
-// TOP SIGNAL — BETSAFE DIAGNOSTIC V5
+// TOP SIGNAL — BETSAFE DIAGNOSTIC V6
 // READ ONLY
 //
-// V5:
+// V6:
 // - fetch Betsafe live HTML
-// - extract sportsbook JS files from HTML + embedded SSR config
-// - fetch sportsbook JS files
-// - search for:
+// - locate sportsbook main JS
+// - fetch main JS
+// - extract dynamic import() chunk files
+// - fetch relevant chunks
+// - search all chunks for:
 //     sbApiBaseUrl
-//     /api/sb
 //     fetchUserContext
 //     fetchStartupContext
-//     startupContext
-//     userContext
-//     sportsbook backend hints
+//     /api/sb
+//     startup/user/static context endpoints
+//     event/market/odds/live request paths
 //
 // NO BETTING
 // NO LOGIN
@@ -27,11 +28,11 @@ const BETSAFE_LIVE_URL =
   BETSAFE_ORIGIN +
   "/en/sportsbook/live";
 
-const MAX_SCRIPTS =
-  15;
+const MAX_CHUNKS =
+  40;
 
-const MAX_SCRIPT_BYTES =
-  2_000_000;
+const MAX_BYTES_PER_FILE =
+  2_500_000;
 
 
 // ============================================================
@@ -45,7 +46,7 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
   try {
 
     // ========================================================
-    // 1. FETCH PAGE
+    // 1. FETCH LIVE PAGE
     // ========================================================
 
     const pageResponse =
@@ -53,7 +54,7 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
         BETSAFE_LIVE_URL,
         {
           method: "GET",
-          headers: browserHeaders(),
+          headers: pageHeaders(),
           redirect: "follow"
         }
       );
@@ -80,66 +81,168 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
 
 
     // ========================================================
-    // 3. EXTRACT ALL SPORTBOOK JS PATHS
+    // 3. FIND MAIN SPORTBOOK SCRIPT
     // ========================================================
 
-    const normalScripts =
+    const scripts =
       extractScriptSources(
         html
       );
 
-    const embeddedScripts =
-      extractEmbeddedJsPaths(
-        html
+    const mainPath =
+      scripts.find(
+        x =>
+          x.includes(
+            "/widgets/sportsbook/"
+          ) &&
+          x.includes(
+            "/main-"
+          ) &&
+          x.includes(
+            ".js"
+          )
+      ) || null;
+
+
+    if (!mainPath) {
+      return {
+        success: false,
+        source: "BETSAFE",
+        diagnostic_version: "V6",
+        stage: "MAIN_SCRIPT_NOT_FOUND",
+        scripts,
+        timing_ms:
+          Date.now() - started
+      };
+    }
+
+
+    const mainUrl =
+      absoluteUrl(
+        mainPath
       );
 
-    const allScripts =
-      unique(
-        [
-          ...normalScripts,
-          ...embeddedScripts
-        ]
-      )
+
+    // ========================================================
+    // 4. FETCH MAIN SCRIPT
+    // ========================================================
+
+    const mainResponse =
+      await fetch(
+        mainUrl,
+        {
+          method: "GET",
+
+          headers: {
+            ...assetHeaders(),
+            "Referer":
+              BETSAFE_LIVE_URL
+          },
+
+          redirect:
+            "follow"
+        }
+      );
+
+    const mainTextRaw =
+      await mainResponse.text();
+
+    const mainText =
+      mainTextRaw.length >
+      MAX_BYTES_PER_FILE
+        ? mainTextRaw.slice(
+            0,
+            MAX_BYTES_PER_FILE
+          )
+        : mainTextRaw;
+
+
+    // ========================================================
+    // 5. BASE DIRECTORY
+    // ========================================================
+
+    const mainDirectory =
+      mainUrl.slice(
+        0,
+        mainUrl.lastIndexOf("/") + 1
+      );
+
+
+    // ========================================================
+    // 6. EXTRACT CHUNKS
+    // ========================================================
+
+    const dynamicImports =
+      extractDynamicImports(
+        mainText
+      );
+
+    const jsReferences =
+      extractJsReferences(
+        mainText
+      );
+
+    const chunkNames =
+      unique([
+        ...dynamicImports,
+        ...jsReferences
+      ])
         .filter(
-          isSportsbookScript
+          x =>
+            x.endsWith(".js")
+        )
+        .filter(
+          x =>
+            !x.includes(
+              "main-DBPLPNWT.js"
+            )
         )
         .slice(
           0,
-          MAX_SCRIPTS
+          MAX_CHUNKS
         );
 
 
     // ========================================================
-    // 4. FETCH SCRIPTS
+    // 7. MAIN FILE ANALYSIS
     // ========================================================
 
-    const scriptResults: Record<string, any>[] =
-      [];
+    const mainAnalysis =
+      analyseSource(
+        "MAIN",
+        mainUrl,
+        mainText
+      );
+
+
+    // ========================================================
+    // 8. FETCH + ANALYSE CHUNKS
+    // ========================================================
+
+    const chunkResults:
+      Record<string, any>[] = [];
 
     for (
-      const scriptPath
-      of allScripts
+      const chunk
+      of chunkNames
     ) {
 
-      const scriptUrl =
-        toAbsoluteUrl(
-          scriptPath
+      const chunkUrl =
+        resolveChunkUrl(
+          chunk,
+          mainDirectory
         );
 
       try {
 
         const response =
           await fetch(
-            scriptUrl,
+            chunkUrl,
             {
               method: "GET",
 
               headers: {
-                ...browserHeaders(),
-
-                "Accept":
-                  "*/*",
-
+                ...assetHeaders(),
                 "Referer":
                   BETSAFE_LIVE_URL
               },
@@ -149,159 +252,27 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
             }
           );
 
-        const text =
+        const raw =
           await response.text();
 
-        const truncated =
-          text.length >
-          MAX_SCRIPT_BYTES;
-
-        const source =
-          truncated
-            ? text.slice(
+        const text =
+          raw.length >
+          MAX_BYTES_PER_FILE
+            ? raw.slice(
                 0,
-                MAX_SCRIPT_BYTES
+                MAX_BYTES_PER_FILE
               )
-            : text;
+            : raw;
 
+        const analysis =
+          analyseSource(
+            chunk,
+            chunkUrl,
+            text
+          );
 
-        // ====================================================
-        // SEARCH INSIDE SCRIPT
-        // ====================================================
-
-        const contexts = {
-
-          sb_api_base_url:
-            findContexts(
-              source,
-              [
-                "sbApiBaseUrl"
-              ],
-              12,
-              900
-            ),
-
-          api_sb:
-            findContexts(
-              source,
-              [
-                "/api/sb",
-                "api/sb"
-              ],
-              15,
-              900
-            ),
-
-          fetch_user_context:
-            findContexts(
-              source,
-              [
-                "fetchUserContext"
-              ],
-              12,
-              900
-            ),
-
-          startup_context:
-            findContexts(
-              source,
-              [
-                "fetchStartupContext",
-                "startupContext",
-                "StartupContext"
-              ],
-              15,
-              900
-            ),
-
-          user_context:
-            findContexts(
-              source,
-              [
-                "userContextId",
-                "user-context-id"
-              ],
-              15,
-              900
-            ),
-
-          static_context:
-            findContexts(
-              source,
-              [
-                "staticContextId",
-                "static-context-id"
-              ],
-              15,
-              900
-            ),
-
-          sportsbook_api:
-            findContexts(
-              source,
-              [
-                "sportsbookApi",
-                "sportsbook-api",
-                "sportsbook/api",
-                "sportsbookApiUrl",
-                "baseApiUrl",
-                "apiBaseUrl"
-              ],
-              15,
-              900
-            )
-        };
-
-
-        // ====================================================
-        // URL/PATH CANDIDATES
-        // ====================================================
-
-        const absoluteUrls =
-          extractAbsoluteUrls(
-            source
-          )
-            .filter(
-              isApiCandidate
-            )
-            .slice(
-              0,
-              100
-            );
-
-        const relativePaths =
-          extractRelativePaths(
-            source
-          )
-            .filter(
-              isApiCandidate
-            )
-            .slice(
-              0,
-              150
-            );
-
-
-        // ====================================================
-        // STRING CANDIDATES
-        // ====================================================
-
-        const stringCandidates =
-          extractInterestingStrings(
-            source
-          )
-            .slice(
-              0,
-              150
-            );
-
-
-        scriptResults.push({
-          path:
-            scriptPath,
-
-          url:
-            scriptUrl,
+        chunkResults.push({
+          ...analysis,
 
           http: {
             status:
@@ -316,80 +287,25 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
               ),
 
             content_length:
-              text.length,
+              raw.length,
 
             inspected_length:
-              source.length,
+              text.length,
 
-            truncated
-          },
-
-          hints: {
-            has_sb_api_base_url:
-              source.includes(
-                "sbApiBaseUrl"
-              ),
-
-            has_api_sb:
-              source.includes(
-                "/api/sb"
-              ),
-
-            has_fetch_user_context:
-              source.includes(
-                "fetchUserContext"
-              ),
-
-            has_fetch_startup_context:
-              source.includes(
-                "fetchStartupContext"
-              ),
-
-            has_user_context:
-              source.includes(
-                "userContextId"
-              ),
-
-            has_static_context:
-              source.includes(
-                "staticContextId"
-              ),
-
-            has_odds:
-              source
-                .toLowerCase()
-                .includes(
-                  "odds"
-                ),
-
-            has_markets:
-              source
-                .toLowerCase()
-                .includes(
-                  "market"
-                )
-          },
-
-          absolute_urls:
-            absoluteUrls,
-
-          relative_paths:
-            relativePaths,
-
-          string_candidates:
-            stringCandidates,
-
-          contexts
+            truncated:
+              raw.length >
+              MAX_BYTES_PER_FILE
+          }
         });
 
       } catch (error: any) {
 
-        scriptResults.push({
-          path:
-            scriptPath,
+        chunkResults.push({
+          file:
+            chunk,
 
           url:
-            scriptUrl,
+            chunkUrl,
 
           error:
             error?.message ??
@@ -400,22 +316,32 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
 
 
     // ========================================================
-    // 5. FLATTEN MOST IMPORTANT RESULTS
+    // 9. IMPORTANT HITS
     // ========================================================
 
-    const hits =
-      scriptResults
+    const allResults =
+      [
+        mainAnalysis,
+        ...chunkResults
+      ];
+
+    const importantHits =
+      allResults
         .filter(
           x =>
             x?.hints?.has_sb_api_base_url ||
-            x?.hints?.has_api_sb ||
             x?.hints?.has_fetch_user_context ||
-            x?.hints?.has_fetch_startup_context
+            x?.hints?.has_fetch_startup_context ||
+            x?.hints?.has_api_sb ||
+            x?.hints?.has_context_endpoint ||
+            x?.hints?.has_live_endpoint ||
+            x?.hints?.has_market_endpoint ||
+            x?.hints?.has_event_endpoint
         )
         .map(
           x => ({
-            path:
-              x.path,
+            file:
+              x.file,
 
             url:
               x.url,
@@ -423,14 +349,8 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
             hints:
               x.hints,
 
-            relative_paths:
-              x.relative_paths,
-
-            absolute_urls:
-              x.absolute_urls,
-
-            string_candidates:
-              x.string_candidates,
+            endpoint_candidates:
+              x.endpoint_candidates,
 
             contexts:
               x.contexts
@@ -439,56 +359,7 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
 
 
     // ========================================================
-    // 6. PAGE CONTEXT
-    // ========================================================
-
-    const pageContexts = {
-
-      static_context:
-        findContexts(
-          html,
-          [
-            "staticContextId"
-          ],
-          5,
-          700
-        ),
-
-      user_context:
-        findContexts(
-          html,
-          [
-            "userContextId"
-          ],
-          5,
-          700
-        ),
-
-      sportsbook_brand:
-        findContexts(
-          html,
-          [
-            "sportsbookBrandId"
-          ],
-          5,
-          700
-        ),
-
-      sportsbook_mfe:
-        findContexts(
-          html,
-          [
-            "sportsbook-load-mfe",
-            "widgets/sportsbook"
-          ],
-          8,
-          700
-        )
-    };
-
-
-    // ========================================================
-    // RESULT
+    // 10. RESULT
     // ========================================================
 
     return {
@@ -499,15 +370,20 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
         "BETSAFE",
 
       diagnostic_version:
-        "V5",
+        "V6",
 
       mode:
         "READ_ONLY_DIAGNOSTIC",
 
-      page: {
-        url:
-          BETSAFE_LIVE_URL,
+      sportsbook_context: {
+        staticContextId:
+          staticContextId || null,
 
+        userContextId:
+          userContextId || null
+      },
+
+      page: {
         status:
           pageResponse.status,
 
@@ -518,30 +394,33 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
           html.length
       },
 
-      sportsbook_context: {
-        staticContextId:
-          staticContextId || null,
+      main_script: {
+        path:
+          mainPath,
 
-        userContextId:
-          userContextId || null
+        url:
+          mainUrl,
+
+        status:
+          mainResponse.status,
+
+        ok:
+          mainResponse.ok,
+
+        content_length:
+          mainTextRaw.length
       },
 
-      scripts: {
+      chunks: {
         discovered:
-          allScripts.length,
+          chunkNames.length,
 
-        paths:
-          allScripts
+        names:
+          chunkNames
       },
 
       important_hits:
-        hits,
-
-      page_contexts:
-        pageContexts,
-
-      script_results:
-        scriptResults,
+        importantHits,
 
       timing_ms:
         Date.now() -
@@ -558,7 +437,7 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
         "BETSAFE",
 
       diagnostic_version:
-        "V5",
+        "V6",
 
       mode:
         "READ_ONLY_DIAGNOSTIC",
@@ -576,93 +455,488 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
 
 
 // ============================================================
-// HEADERS
+// ANALYSE SOURCE
 // ============================================================
 
-function browserHeaders(): Record<string, string> {
+function analyseSource(
+  file: string,
+  url: string,
+  text: string
+): Record<string, any> {
+
+  const lower =
+    text.toLowerCase();
+
+
+  const endpointCandidates =
+    extractEndpointCandidates(
+      text
+    );
+
 
   return {
 
-    "User-Agent":
-      "Mozilla/5.0 " +
-      "(Windows NT 10.0; Win64; x64) " +
-      "AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) " +
-      "Chrome/140.0.0.0 Safari/537.36",
+    file,
+    url,
 
-    "Accept":
-      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    hints: {
 
-    "Accept-Language":
-      "en-US,en;q=0.9",
+      has_sb_api_base_url:
+        text.includes(
+          "sbApiBaseUrl"
+        ),
 
-    "Cache-Control":
-      "no-cache",
+      has_fetch_user_context:
+        text.includes(
+          "fetchUserContext"
+        ),
 
-    "Pragma":
-      "no-cache"
+      has_fetch_startup_context:
+        text.includes(
+          "fetchStartupContext"
+        ),
+
+      has_api_sb:
+        lower.includes(
+          "/api/sb"
+        ),
+
+      has_context_endpoint:
+        lower.includes(
+          "context"
+        ) &&
+        (
+          lower.includes(
+            "/api/"
+          ) ||
+          lower.includes(
+            "/sb/"
+          )
+        ),
+
+      has_live_endpoint:
+        hasEndpointWord(
+          endpointCandidates,
+          "live"
+        ),
+
+      has_event_endpoint:
+        hasEndpointWord(
+          endpointCandidates,
+          "event"
+        ),
+
+      has_market_endpoint:
+        hasEndpointWord(
+          endpointCandidates,
+          "market"
+        ),
+
+      has_odds:
+        lower.includes(
+          "odds"
+        ),
+
+      has_price:
+        lower.includes(
+          "price"
+        )
+    },
+
+
+    endpoint_candidates:
+      endpointCandidates
+        .slice(
+          0,
+          150
+        ),
+
+
+    contexts: {
+
+      sb_api_base_url:
+        findContexts(
+          text,
+          [
+            "sbApiBaseUrl"
+          ],
+          10,
+          1200
+        ),
+
+      fetch_user_context:
+        findContexts(
+          text,
+          [
+            "fetchUserContext"
+          ],
+          10,
+          1200
+        ),
+
+      fetch_startup_context:
+        findContexts(
+          text,
+          [
+            "fetchStartupContext"
+          ],
+          10,
+          1200
+        ),
+
+      api_sb:
+        findContexts(
+          text,
+          [
+            "/api/sb",
+            "api/sb"
+          ],
+          15,
+          1200
+        ),
+
+      context:
+        findContexts(
+          text,
+          [
+            "usercontext",
+            "startupcontext",
+            "staticcontext",
+            "currentcontext",
+            "context/"
+          ],
+          15,
+          1200
+        ),
+
+      event:
+        findContexts(
+          text,
+          [
+            "/event",
+            "events?",
+            "eventId",
+            "event-id"
+          ],
+          15,
+          1200
+        ),
+
+      market:
+        findContexts(
+          text,
+          [
+            "/market",
+            "markets?",
+            "marketId",
+            "market-id"
+          ],
+          15,
+          1200
+        ),
+
+      live:
+        findContexts(
+          text,
+          [
+            "/live",
+            "live?",
+            "liveevents",
+            "live-events"
+          ],
+          15,
+          1200
+        ),
+
+      odds:
+        findContexts(
+          text,
+          [
+            "/odds",
+            "odds?",
+            "prices",
+            "price"
+          ],
+          15,
+          1200
+        )
+    }
   };
 }
 
 
 // ============================================================
-// EXTRACT STRING VALUE
+// DYNAMIC IMPORT EXTRACTION
 // ============================================================
 
-function extractStringValue(
-  text: string,
-  key: string
-): string {
+function extractDynamicImports(
+  text: string
+): string[] {
 
-  const escapedKey =
-    escapeRegex(
-      key
-    );
+  const out =
+    new Set<string>();
 
-  const patterns = [
+  const regex =
+    /import\(\s*["'`]([^"'`]+\.js)["'`]\s*\)/g;
 
-    new RegExp(
-      `["']${escapedKey}["']\\s*:\\s*["']([^"']+)["']`,
-      "i"
-    ),
+  let match:
+    RegExpExecArray |
+    null;
 
-    new RegExp(
-      `${escapedKey}\\s*:\\s*["']([^"']+)["']`,
-      "i"
-    ),
-
-    new RegExp(
-      `${escapedKey}\\s*=\\s*["']([^"']+)["']`,
-      "i"
+  while (
+    (
+      match =
+        regex.exec(text)
     )
-  ];
-
-  for (
-    const pattern
-    of patterns
   ) {
 
-    const match =
-      text.match(
-        pattern
-      );
-
-    if (
-      match &&
-      match[1]
-    ) {
-      return decodeValue(
+    const value =
+      clean(
         match[1]
       );
+
+    if (value) {
+      out.add(value);
     }
   }
 
-  return "";
+  return Array.from(
+    out
+  );
 }
 
 
 // ============================================================
-// NORMAL SCRIPT SRC EXTRACTION
+// JS REFERENCE EXTRACTION
+// ============================================================
+
+function extractJsReferences(
+  text: string
+): string[] {
+
+  const out =
+    new Set<string>();
+
+  const regex =
+    /["'`]([^"'`]{1,250}\.js)["'`]/g;
+
+  let match:
+    RegExpExecArray |
+    null;
+
+  while (
+    (
+      match =
+        regex.exec(text)
+    )
+  ) {
+
+    const value =
+      clean(
+        match[1]
+      );
+
+    if (
+      value &&
+      (
+        value.includes("chunk-") ||
+        value.includes("shell.") ||
+        value.includes("svc-") ||
+        value.includes("app-") ||
+        value.includes("./")
+      )
+    ) {
+      out.add(
+        value
+      );
+    }
+  }
+
+  return Array.from(
+    out
+  );
+}
+
+
+// ============================================================
+// ENDPOINT CANDIDATES
+// ============================================================
+
+function extractEndpointCandidates(
+  text: string
+): string[] {
+
+  const out =
+    new Set<string>();
+
+
+  // quoted relative paths
+  const relativeRegex =
+    /["'`]((?:\/|\.\.?\/)[^"'`<>\s]{2,250})["'`]/g;
+
+  let match:
+    RegExpExecArray |
+    null;
+
+  while (
+    (
+      match =
+        relativeRegex.exec(text)
+    )
+  ) {
+
+    const value =
+      clean(
+        match[1]
+      );
+
+    if (
+      looksLikeEndpoint(
+        value
+      )
+    ) {
+      out.add(
+        value
+      );
+    }
+  }
+
+
+  // absolute URLs
+  const absoluteRegex =
+    /https?:\/\/[^\s"'<>\\]{5,300}/gi;
+
+  while (
+    (
+      match =
+        absoluteRegex.exec(text)
+    )
+  ) {
+
+    const value =
+      clean(
+        match[0]
+      );
+
+    if (
+      looksLikeEndpoint(
+        value
+      )
+    ) {
+      out.add(
+        value
+      );
+    }
+  }
+
+
+  // plain quoted strings such as "startupcontext"
+  const stringRegex =
+    /["'`]([^"'`]{3,160})["'`]/g;
+
+  while (
+    (
+      match =
+        stringRegex.exec(text)
+    )
+  ) {
+
+    const value =
+      clean(
+        match[1]
+      );
+
+    const lower =
+      value.toLowerCase();
+
+    if (
+      (
+        lower.includes("context") ||
+        lower.includes("event") ||
+        lower.includes("market") ||
+        lower.includes("odds") ||
+        lower.includes("live")
+      ) &&
+      (
+        value.includes("/") ||
+        value.includes("?")
+      )
+    ) {
+      out.add(value);
+    }
+
+    if (
+      out.size >
+      500
+    ) {
+      break;
+    }
+  }
+
+
+  return Array.from(
+    out
+  );
+}
+
+
+// ============================================================
+// ENDPOINT FILTER
+// ============================================================
+
+function looksLikeEndpoint(
+  value: string
+): boolean {
+
+  const s =
+    value
+      .toLowerCase();
+
+  const words = [
+    "/api/",
+    "/sb/",
+    "context",
+    "startup",
+    "usercontext",
+    "event",
+    "market",
+    "odds",
+    "price",
+    "live",
+    "fixture",
+    "coupon",
+    "selection",
+    "sport"
+  ];
+
+  return words.some(
+    x =>
+      s.includes(x)
+  );
+}
+
+
+function hasEndpointWord(
+  endpoints: string[],
+  word: string
+): boolean {
+
+  const target =
+    word.toLowerCase();
+
+  return endpoints.some(
+    x =>
+      x
+        .toLowerCase()
+        .includes(
+          target
+        )
+  );
+}
+
+
+// ============================================================
+// PAGE SCRIPT EXTRACTION
 // ============================================================
 
 function extractScriptSources(
@@ -687,14 +961,12 @@ function extractScriptSources(
   ) {
 
     const value =
-      decodeValue(
+      clean(
         match[1]
       );
 
     if (value) {
-      out.add(
-        value
-      );
+      out.add(value);
     }
   }
 
@@ -705,288 +977,58 @@ function extractScriptSources(
 
 
 // ============================================================
-// EMBEDDED / ESCAPED JS PATH EXTRACTION
+// STRING EXTRACTION
 // ============================================================
 
-function extractEmbeddedJsPaths(
-  html: string
-): string[] {
+function extractStringValue(
+  text: string,
+  key: string
+): string {
 
-  const decoded =
-    decodeValue(
-      html
+  const k =
+    escapeRegex(
+      key
     );
 
-  const out =
-    new Set<string>();
+  const patterns = [
 
-  const regex =
-    /\/dist\/prod\/xp\/widgets\/sportsbook\/[^"'<>\\\s]+?\.js/g;
+    new RegExp(
+      `["']${k}["']\\s*:\\s*["']([^"']+)["']`,
+      "i"
+    ),
 
-  let match:
-    RegExpExecArray |
-    null;
+    new RegExp(
+      `${k}\\s*:\\s*["']([^"']+)["']`,
+      "i"
+    ),
 
-  while (
-    (
-      match =
-        regex.exec(decoded)
+    new RegExp(
+      `${k}\\s*=\\s*["']([^"']+)["']`,
+      "i"
     )
-  ) {
-
-    const value =
-      cleanPath(
-        match[0]
-      );
-
-    if (value) {
-      out.add(
-        value
-      );
-    }
-  }
-
-  return Array.from(
-    out
-  );
-}
-
-
-// ============================================================
-// SPORTBOOK SCRIPT FILTER
-// ============================================================
-
-function isSportsbookScript(
-  value: string
-): boolean {
-
-  const s =
-    value
-      .toLowerCase();
-
-  if (
-    !s.includes(
-      ".js"
-    )
-  ) {
-    return false;
-  }
-
-  return (
-    s.includes(
-      "/widgets/sportsbook/"
-    ) ||
-    s.includes(
-      "sportsbook"
-    )
-  );
-}
-
-
-// ============================================================
-// ABSOLUTE URL EXTRACTION
-// ============================================================
-
-function extractAbsoluteUrls(
-  text: string
-): string[] {
-
-  const out =
-    new Set<string>();
-
-  const regex =
-    /https?:\/\/[^\s"'<>\\]+/gi;
-
-  let match:
-    RegExpExecArray |
-    null;
-
-  while (
-    (
-      match =
-        regex.exec(text)
-    )
-  ) {
-
-    const value =
-      decodeValue(
-        match[0]
-      );
-
-    if (
-      value.length >
-      8
-    ) {
-      out.add(
-        value
-      );
-    }
-  }
-
-  return Array.from(
-    out
-  );
-}
-
-
-// ============================================================
-// RELATIVE PATH EXTRACTION
-// ============================================================
-
-function extractRelativePaths(
-  text: string
-): string[] {
-
-  const out =
-    new Set<string>();
-
-  const regex =
-    /["'`](\/[^"'`<>\\\s]{2,300})["'`]/g;
-
-  let match:
-    RegExpExecArray |
-    null;
-
-  while (
-    (
-      match =
-        regex.exec(text)
-    )
-  ) {
-
-    const value =
-      cleanPath(
-        match[1]
-      );
-
-    if (value) {
-      out.add(
-        value
-      );
-    }
-  }
-
-  return Array.from(
-    out
-  );
-}
-
-
-// ============================================================
-// INTERESTING STRINGS
-// ============================================================
-
-function extractInterestingStrings(
-  text: string
-): string[] {
-
-  const out =
-    new Set<string>();
-
-  const regex =
-    /["'`]([^"'`]{3,220})["'`]/g;
-
-  let match:
-    RegExpExecArray |
-    null;
-
-  while (
-    (
-      match =
-        regex.exec(text)
-    )
-  ) {
-
-    const value =
-      decodeValue(
-        match[1]
-      );
-
-    if (
-      isApiCandidate(
-        value
-      )
-    ) {
-      out.add(
-        value
-      );
-    }
-
-    if (
-      out.size >=
-      300
-    ) {
-      break;
-    }
-  }
-
-  return Array.from(
-    out
-  );
-}
-
-
-// ============================================================
-// API CANDIDATE
-// ============================================================
-
-function isApiCandidate(
-  value: string
-): boolean {
-
-  const s =
-    value
-      .toLowerCase();
-
-  const keys = [
-
-    "/api/",
-
-    "api.",
-
-    "api/sb",
-
-    "/sb/",
-
-    "sportsbook",
-
-    "startupcontext",
-
-    "usercontext",
-
-    "staticcontext",
-
-    "event",
-
-    "events",
-
-    "market",
-
-    "markets",
-
-    "odds",
-
-    "price",
-
-    "fixture",
-
-    "live",
-
-    "coupon",
-
-    "selection",
-
-    "betting",
-
-    "feed"
   ];
 
-  return keys.some(
-    key =>
-      s.includes(
-        key
-      )
-  );
+  for (
+    const pattern
+    of patterns
+  ) {
+
+    const match =
+      text.match(
+        pattern
+      );
+
+    if (
+      match &&
+      match[1]
+    ) {
+      return clean(
+        match[1]
+      );
+    }
+  }
+
+  return "";
 }
 
 
@@ -998,15 +1040,14 @@ function findContexts(
   text: string,
   needles: string[],
   maxResults = 10,
-  radius = 500
+  radius = 700
 ): string[] {
 
   const out:
     string[] = [];
 
   const lower =
-    text
-      .toLowerCase();
+    text.toLowerCase();
 
   for (
     const rawNeedle
@@ -1014,8 +1055,7 @@ function findContexts(
   ) {
 
     const needle =
-      rawNeedle
-        .toLowerCase();
+      rawNeedle.toLowerCase();
 
     let start =
       0;
@@ -1032,8 +1072,7 @@ function findContexts(
         );
 
       if (
-        index ===
-        -1
+        index === -1
       ) {
         break;
       }
@@ -1041,8 +1080,7 @@ function findContexts(
       const from =
         Math.max(
           0,
-          index -
-          radius
+          index - radius
         );
 
       const to =
@@ -1071,10 +1109,7 @@ function findContexts(
           context
         )
       ) {
-
-        out.push(
-          context
-        );
+        out.push(context);
       }
 
       start =
@@ -1098,65 +1133,155 @@ function findContexts(
 // URL HELPERS
 // ============================================================
 
-function toAbsoluteUrl(
-  value: string
+function resolveChunkUrl(
+  value: string,
+  mainDirectory: string
 ): string {
 
-  const clean =
-    decodeValue(
+  const cleanValue =
+    clean(
       value
     );
 
   if (
-    clean.startsWith(
+    cleanValue.startsWith(
       "http://"
     ) ||
-    clean.startsWith(
+    cleanValue.startsWith(
       "https://"
     )
   ) {
-    return clean;
+    return cleanValue;
   }
 
   if (
-    clean.startsWith(
+    cleanValue.startsWith(
       "/"
     )
   ) {
     return (
       BETSAFE_ORIGIN +
-      clean
+      cleanValue
+    );
+  }
+
+  try {
+    return new URL(
+      cleanValue,
+      mainDirectory
+    ).href;
+  } catch {
+    return (
+      mainDirectory +
+      cleanValue.replace(
+        /^\.\//,
+        ""
+      )
+    );
+  }
+}
+
+
+function absoluteUrl(
+  value: string
+): string {
+
+  const v =
+    clean(
+      value
+    );
+
+  if (
+    v.startsWith(
+      "http://"
+    ) ||
+    v.startsWith(
+      "https://"
+    )
+  ) {
+    return v;
+  }
+
+  if (
+    v.startsWith(
+      "/"
+    )
+  ) {
+    return (
+      BETSAFE_ORIGIN +
+      v
     );
   }
 
   return (
     BETSAFE_ORIGIN +
     "/" +
-    clean
+    v
   );
 }
 
 
-function cleanPath(
-  value: any
-): string {
+// ============================================================
+// HEADERS
+// ============================================================
 
-  return decodeValue(
-    value
-  )
-    .replace(
-      /[),;]+$/g,
-      ""
-    )
-    .trim();
+function pageHeaders(): Record<string, string> {
+
+  return {
+
+    "User-Agent":
+      "Mozilla/5.0 " +
+      "(Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) " +
+      "Chrome/140.0.0.0 Safari/537.36",
+
+    "Accept":
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+
+    "Accept-Language":
+      "en-US,en;q=0.9",
+
+    "Cache-Control":
+      "no-cache",
+
+    "Pragma":
+      "no-cache"
+  };
+}
+
+
+function assetHeaders(): Record<string, string> {
+
+  return {
+
+    "User-Agent":
+      "Mozilla/5.0 " +
+      "(Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) " +
+      "Chrome/140.0.0.0 Safari/537.36",
+
+    "Accept":
+      "*/*",
+
+    "Accept-Language":
+      "en-US,en;q=0.9",
+
+    "Cache-Control":
+      "no-cache",
+
+    "Pragma":
+      "no-cache"
+  };
 }
 
 
 // ============================================================
-// DECODE
+// CLEAN
 // ============================================================
 
-function decodeValue(
+function clean(
   value: any
 ): string {
 
@@ -1167,9 +1292,7 @@ function decodeValue(
     return "";
   }
 
-  return String(
-    value
-  )
+  return String(value)
     .trim()
 
     .replace(
@@ -1205,11 +1328,6 @@ function decodeValue(
     .replace(
       /\\u003F/gi,
       "?"
-    )
-
-    .replace(
-      /\\u002D/gi,
-      "-"
     )
 
     .replace(
