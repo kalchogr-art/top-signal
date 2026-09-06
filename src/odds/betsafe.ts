@@ -1,36 +1,30 @@
 // ============================================================
-// TOP SIGNAL — BETSAFE DIAGNOSTIC V11
+// TOP SIGNAL — BETSAFE DIAGNOSTIC V12
 // READ ONLY
 //
-// IMPORTANT DISCOVERY FROM V10:
-// shell.js calls:
-//
-//   `${sbApiBaseUrl ?? ""}/sb/fe-api/ssr/v1/generate?path=...`
-//
-// If sbApiBaseUrl is null/empty, the request is SAME-ORIGIN.
-// Therefore V11 directly tests:
-//
-//   https://www.betsafe.com/sb/fe-api/ssr/v1/generate
-//
-// with the exact context headers discovered in shell.js.
+// V12 GOAL:
+// 1. Fetch the working Betsafe SSR live feed.
+// 2. Extract a SMALL list of live football events.
+// 3. Extract event IDs, teams, phase and visible markets/odds.
+// 4. For 1H events, probe event-specific SSR paths to see whether
+//    Betsafe returns expanded markets such as:
+//      1st Half - Total Goals
+//      Over 0.5
 //
 // NO BETTING
 // NO LOGIN
 // NO D1 WRITES
 // ============================================================
 
-const ORIGIN =
-  "https://www.betsafe.com";
-
-const LIVE_PATH =
-  "/en/sportsbook/live";
-
-const LIVE_URL =
-  ORIGIN + LIVE_PATH;
+const ORIGIN = "https://www.betsafe.com";
+const LIVE_PATH = "/en/sportsbook/live";
+const LIVE_URL = ORIGIN + LIVE_PATH;
 
 const SSR_ENDPOINT =
-  ORIGIN +
-  "/sb/fe-api/ssr/v1/generate";
+  ORIGIN + "/sb/fe-api/ssr/v1/generate";
+
+const MAX_EVENTS = 8;
+const MAX_1H_PROBES = 4;
 
 
 // ============================================================
@@ -38,328 +32,146 @@ const SSR_ENDPOINT =
 // ============================================================
 
 export async function debugBetsafe(): Promise<Record<string, any>> {
-  const started =
-    Date.now();
+  const started = Date.now();
 
   try {
+    // --------------------------------------------------------
+    // 1. Load normal live page and context IDs
+    // --------------------------------------------------------
 
-    // ========================================================
-    // 1. FETCH LIVE PAGE FOR CONTEXT IDS
-    // ========================================================
+    const pageResponse = await fetch(LIVE_URL, {
+      method: "GET",
+      headers: pageHeaders(),
+      redirect: "follow"
+    });
 
-    const pageResponse =
-      await fetch(
-        LIVE_URL,
-        {
-          method: "GET",
-          headers: pageHeaders(),
-          redirect: "follow"
-        }
-      );
-
-    const html =
-      await pageResponse.text();
-
-    const decodedHtml =
-      decode(html);
+    const pageHtml = await pageResponse.text();
+    const decodedPage = decode(pageHtml);
 
     const staticContextId =
-      extractJsonValue(
-        decodedHtml,
-        "staticContextId"
-      );
+      extractJsonValue(decodedPage, "staticContextId");
 
     const userContextId =
-      extractJsonValue(
-        decodedHtml,
-        "userContextId"
-      );
+      extractJsonValue(decodedPage, "userContextId");
 
-
-    if (
-      !staticContextId ||
-      !userContextId
-    ) {
-
+    if (!staticContextId || !userContextId) {
       return {
         success: false,
-
         source: "BETSAFE",
-
-        diagnostic_version:
-          "V11",
-
-        mode:
-          "READ_ONLY_DIAGNOSTIC",
-
-        stage:
-          "CONTEXT_EXTRACTION",
-
-        error:
-          "Missing staticContextId or userContextId",
-
-        page: {
-          status:
-            pageResponse.status,
-
-          ok:
-            pageResponse.ok,
-
-          content_length:
-            html.length
-        },
-
+        diagnostic_version: "V12",
+        stage: "CONTEXT",
+        error: "Missing Betsafe context IDs",
         context: {
           staticContextId,
           userContextId
-        },
-
-        timing_ms:
-          Date.now() -
-          started
+        }
       };
     }
 
 
-    // ========================================================
-    // 2. DIRECT SAME-ORIGIN SSR REQUEST
-    // ========================================================
+    // --------------------------------------------------------
+    // 2. Working SSR live feed
+    // --------------------------------------------------------
 
-    const ssrUrl =
-      SSR_ENDPOINT +
-      "?path=" +
-      encodeURI(
-        LIVE_PATH
+    const liveSsr =
+      await fetchSsr(
+        LIVE_PATH,
+        staticContextId,
+        userContextId
       );
 
-    const ssrResponse =
-      await fetch(
-        ssrUrl,
-        {
-          method: "GET",
-
-          headers: {
-            ...assetHeaders(),
-
-            "x-sb-static-context-id":
-              staticContextId,
-
-            "x-sb-user-context-id":
-              userContextId,
-
-            "x-sb-content-type":
-              "full",
-
-            "Referer":
-              LIVE_URL
-          },
-
-          redirect:
-            "follow"
-        }
-      );
-
-    const ssrText =
-      await ssrResponse.text();
-
-    const decoded =
-      decode(
-        ssrText
-      );
+    if (!liveSsr.ok) {
+      return {
+        success: false,
+        source: "BETSAFE",
+        diagnostic_version: "V12",
+        stage: "LIVE_SSR",
+        live_ssr: liveSsr
+      };
+    }
 
 
-    // ========================================================
-    // 3. COMPACT CONTENT ANALYSIS
-    // ========================================================
+    // --------------------------------------------------------
+    // 3. Extract compact live event list
+    // --------------------------------------------------------
 
-    const lower =
-      decoded.toLowerCase();
+    const events =
+      extractEvents(
+        liveSsr.body
+      )
+      .slice(0, MAX_EVENTS);
 
-    const hints = {
-      football:
-        lower.includes(
-          "football"
-        ),
 
-      soccer:
-        lower.includes(
-          "soccer"
-        ),
+    // --------------------------------------------------------
+    // 4. Probe event-specific paths for 1H events
+    // --------------------------------------------------------
 
-      live:
-        lower.includes(
-          "live"
-        ),
-
-      event:
-        lower.includes(
-          "event"
-        ),
-
-      market:
-        lower.includes(
-          "market"
-        ),
-
-      odds:
-        lower.includes(
-          "odds"
-        ),
-
-      price:
-        lower.includes(
-          "price"
-        ),
-
-      first_half:
-        lower.includes(
-          "first half"
-        ) ||
-        lower.includes(
-          "1st half"
-        ),
-
-      total_goals:
-        lower.includes(
-          "total goals"
-        ),
-
-      over_05:
-        lower.includes(
-          "over 0.5"
-        ) ||
-        lower.includes(
-          "over 0,5"
-        ),
-
-      under_05:
-        lower.includes(
-          "under 0.5"
-        ) ||
-        lower.includes(
-          "under 0,5"
+    const firstHalfEvents =
+      events
+        .filter(
+          event =>
+            event.phase
+              ?.toLowerCase()
+              .includes("1st half")
         )
-    };
+        .slice(0, MAX_1H_PROBES);
 
+    const probes: Record<string, any>[] = [];
 
-    // ========================================================
-    // 4. USEFUL SMALL CONTEXTS ONLY
-    // ========================================================
+    for (const event of firstHalfEvents) {
+      const eventId = event.event_id;
 
-    const contexts = {
-      first_half:
-        findContexts(
-          decoded,
-          [
-            "1st Half",
-            "First Half"
-          ],
-          5,
-          700
-        ),
+      if (!eventId) continue;
 
-      total_goals:
-        findContexts(
-          decoded,
-          [
-            "Total Goals",
-            "total goals"
-          ],
-          5,
-          700
-        ),
+      const candidates = [
+        // Path shape closest to the current live page.
+        `${LIVE_PATH}?eventId=${eventId}`,
 
-      over_05:
-        findContexts(
-          decoded,
-          [
-            "Over 0.5",
-            "over 0.5",
-            "Over 0,5",
-            "over 0,5"
-          ],
-          5,
-          700
-        ),
+        // Common event route variants worth testing.
+        `/en/sportsbook/event/${eventId}`,
+        `/en/sportsbook/live/event/${eventId}`
+      ];
 
-      market:
-        findContexts(
-          decoded,
-          [
-            "\"markets\"",
-            "\"market\"",
-            "marketName",
-            "market-name"
-          ],
-          5,
-          700
-        ),
+      const candidateResults: Record<string, any>[] = [];
 
-      odds:
-        findContexts(
-          decoded,
-          [
-            "\"odds\"",
-            "\"price\"",
-            "decimalOdds",
-            "decimal-odds"
-          ],
-          5,
-          700
-        )
-    };
+      for (const candidatePath of candidates) {
+        const result =
+          await fetchSsr(
+            candidatePath,
+            staticContextId,
+            userContextId
+          );
 
+        candidateResults.push({
+          path: candidatePath,
+          status: result.status,
+          ok: result.ok,
+          content_type: result.content_type,
+          content_length: result.body.length,
+          signals: analyseTargetMarket(result.body),
+          sample: targetMarketSample(result.body)
+        });
+      }
 
-    // ========================================================
-    // 5. DETECT RESPONSE SHAPE
-    // ========================================================
-
-    const trimmed =
-      ssrText.trim();
-
-    const looksJson =
-      trimmed.startsWith(
-        "{"
-      ) ||
-      trimmed.startsWith(
-        "["
-      );
-
-    const looksHtml =
-      lower.includes(
-        "<html"
-      ) ||
-      lower.includes(
-        "<div"
-      ) ||
-      lower.includes(
-        "<sb-"
-      );
+      probes.push({
+        event_id: eventId,
+        home: event.home,
+        away: event.away,
+        phase: event.phase,
+        candidates: candidateResults
+      });
+    }
 
 
     return {
       success: true,
-
       source: "BETSAFE",
-
-      diagnostic_version:
-        "V11",
-
-      mode:
-        "READ_ONLY_DIAGNOSTIC",
-
-      discovery:
-        "SAME_ORIGIN_SSR_ENDPOINT",
+      diagnostic_version: "V12",
+      mode: "READ_ONLY_DIAGNOSTIC",
 
       page: {
-        status:
-          pageResponse.status,
-
-        ok:
-          pageResponse.ok,
-
-        content_length:
-          html.length
+        status: pageResponse.status,
+        ok: pageResponse.ok
       },
 
       context: {
@@ -367,139 +179,589 @@ export async function debugBetsafe(): Promise<Record<string, any>> {
         userContextId
       },
 
-      ssr_request: {
-        url:
-          ssrUrl,
-
-        headers_used: {
-          "x-sb-static-context-id":
-            staticContextId,
-
-          "x-sb-user-context-id":
-            userContextId,
-
-          "x-sb-content-type":
-            "full"
-        }
+      live_ssr: {
+        status: liveSsr.status,
+        ok: liveSsr.ok,
+        content_length: liveSsr.body.length
       },
 
-      ssr_response: {
-        status:
-          ssrResponse.status,
+      events,
 
-        ok:
-          ssrResponse.ok,
+      event_probes: probes,
 
-        content_type:
-          ssrResponse.headers.get(
-            "content-type"
-          ),
-
-        content_length:
-          ssrText.length,
-
-        looks_json:
-          looksJson,
-
-        looks_html:
-          looksHtml
-      },
-
-      hints,
-
-      contexts,
-
-      preview:
-        normalizeContext(
-          decoded.slice(
-            0,
-            1200
-          )
-        ),
-
-      timing_ms:
-        Date.now() -
-        started
+      timing_ms: Date.now() - started
     };
 
   } catch (error: any) {
-
     return {
       success: false,
-
       source: "BETSAFE",
-
-      diagnostic_version:
-        "V11",
-
-      mode:
-        "READ_ONLY_DIAGNOSTIC",
-
-      error:
-        error?.message ??
-        String(error),
-
-      timing_ms:
-        Date.now() -
-        started
+      diagnostic_version: "V12",
+      mode: "READ_ONLY_DIAGNOSTIC",
+      error: error?.message ?? String(error),
+      timing_ms: Date.now() - started
     };
   }
 }
 
 
 // ============================================================
-// EXTRACT JSON-LIKE VALUE
+// SSR FETCH
 // ============================================================
 
-function extractJsonValue(
-  text: string,
-  key: string
-): string | null {
+async function fetchSsr(
+  path: string,
+  staticContextId: string,
+  userContextId: string
+): Promise<{
+  status: number;
+  ok: boolean;
+  content_type: string | null;
+  body: string;
+}> {
 
-  const escaped =
-    escapeRegex(
-      key
+  // URLSearchParams is deliberate here:
+  // nested ?eventId= is encoded safely inside the path parameter.
+  const params = new URLSearchParams({
+    path
+  });
+
+  const url =
+    `${SSR_ENDPOINT}?${params.toString()}`;
+
+  const response =
+    await fetch(url, {
+      method: "GET",
+      headers: {
+        ...assetHeaders(),
+
+        "x-sb-static-context-id":
+          staticContextId,
+
+        "x-sb-user-context-id":
+          userContextId,
+
+        "x-sb-content-type":
+          "full",
+
+        "Referer":
+          LIVE_URL
+      },
+      redirect: "follow"
+    });
+
+  const text =
+    decode(
+      await response.text()
     );
 
-  const patterns = [
+  return {
+    status: response.status,
+    ok: response.ok,
+    content_type:
+      response.headers.get(
+        "content-type"
+      ),
+    body: text
+  };
+}
 
-    new RegExp(
-      `["']${escaped}["']\\s*:\\s*["']([^"']+)["']`,
-      "i"
-    ),
 
-    new RegExp(
-      `${escaped}\\s*:\\s*["']([^"']+)["']`,
-      "i"
-    ),
+// ============================================================
+// EVENT EXTRACTION
+// ============================================================
 
-    new RegExp(
-      `${escaped}\\s*=\\s*["']([^"']+)["']`,
-      "i"
-    )
-  ];
+function extractEvents(
+  html: string
+): Record<string, any>[] {
 
-  for (
-    const pattern
-    of patterns
+  const results: Record<string, any>[] = [];
+
+  // Split around event-info blocks while preserving enough nearby HTML.
+  const eventIdRegex =
+    /(?:selection-id|market-id)="[^"]*?(f-[A-Za-z0-9_-]+)[^"]*"/g;
+
+  const seen =
+    new Set<string>();
+
+  let match:
+    RegExpExecArray | null;
+
+  while (
+    (match =
+      eventIdRegex.exec(html))
   ) {
 
-    const match =
-      text.match(
-        pattern
-      );
+    const eventId =
+      match[1];
 
     if (
-      match &&
-      match[1]
+      seen.has(eventId)
     ) {
-      return clean(
-        match[1]
+      continue;
+    }
+
+    seen.add(eventId);
+
+    const index =
+      match.index;
+
+    const from =
+      Math.max(
+        0,
+        index - 9000
       );
+
+    const to =
+      Math.min(
+        html.length,
+        index + 14000
+      );
+
+    const block =
+      html.slice(
+        from,
+        to
+      );
+
+    const phase =
+      firstMatch(
+        block,
+        /<span class="phase">\s*([^<]+?)\s*<\/span>/i
+      );
+
+    const participants =
+      extractParticipantNames(
+        block
+      );
+
+    const visibleMarkets =
+      extractVisibleMarkets(
+        block
+      );
+
+    results.push({
+      event_id:
+        eventId,
+
+      phase:
+        phase,
+
+      home:
+        participants[0] ??
+        null,
+
+      away:
+        participants[1] ??
+        null,
+
+      visible_markets:
+        visibleMarkets
+    });
+
+    if (
+      results.length >=
+      MAX_EVENTS * 3
+    ) {
+      break;
     }
   }
 
-  return null;
+  return dedupeEvents(
+    results
+  );
+}
+
+
+// ============================================================
+// PARTICIPANTS
+// ============================================================
+
+function extractParticipantNames(
+  block: string
+): string[] {
+
+  const names: string[] = [];
+
+  const patterns = [
+    /test-id="event-info\.participant-name"[^>]*>\s*([^<]+?)\s*</gi,
+    /class="[^"]*participant-name[^"]*"[^>]*>\s*([^<]+?)\s*</gi,
+    /class="[^"]*participants-name[^"]*"[^>]*>\s*([^<]+?)\s*</gi
+  ];
+
+  for (const regex of patterns) {
+    let match: RegExpExecArray | null;
+
+    while (
+      (match =
+        regex.exec(block))
+    ) {
+
+      const value =
+        htmlText(
+          match[1]
+        );
+
+      if (
+        value &&
+        !names.includes(value)
+      ) {
+        names.push(value);
+      }
+
+      if (names.length >= 2) {
+        return names;
+      }
+    }
+  }
+
+  return names;
+}
+
+
+// ============================================================
+// VISIBLE MARKETS
+// ============================================================
+
+function extractVisibleMarkets(
+  block: string
+): Record<string, any>[] {
+
+  const markets: Record<string, any>[] = [];
+
+  const marketRegex =
+    /<obg-event-row-market-container\b([^>]*)>([\s\S]*?)<\/obg-event-row-market-container>/gi;
+
+  let match:
+    RegExpExecArray | null;
+
+  while (
+    (match =
+      marketRegex.exec(block))
+  ) {
+
+    const attrs =
+      match[1];
+
+    const body =
+      match[2];
+
+    const marketId =
+      firstMatch(
+        attrs,
+        /market-id="([^"]+)"/i
+      );
+
+    const label =
+      firstMatch(
+        body,
+        /event-row\.market-header\.label"[^>]*>\s*([^<]+?)\s*</i
+      );
+
+    const selections =
+      extractSelections(
+        body
+      );
+
+    if (
+      label ||
+      marketId ||
+      selections.length
+    ) {
+      markets.push({
+        market_id:
+          marketId,
+
+        label:
+          label,
+
+        selections
+      });
+    }
+
+    if (markets.length >= 6) {
+      break;
+    }
+  }
+
+  return markets;
+}
+
+
+function extractSelections(
+  body: string
+): Record<string, any>[] {
+
+  const out: Record<string, any>[] = [];
+
+  const selectionRegex =
+    /<obg-selection-container\b([^>]*)>([\s\S]*?)<\/obg-selection-container>/gi;
+
+  let match:
+    RegExpExecArray | null;
+
+  while (
+    (match =
+      selectionRegex.exec(body))
+  ) {
+
+    const attrs =
+      match[1];
+
+    const inner =
+      match[2];
+
+    const selectionId =
+      firstMatch(
+        attrs,
+        /selection-id="([^"]+)"/i
+      );
+
+    const label =
+      firstMatch(
+        inner,
+        /class="obg-selection-label"[^>]*>\s*([^<]+?)\s*</i
+      );
+
+    const odds =
+      firstMatch(
+        inner,
+        /test-id="odds"[^>]*>\s*([0-9]+(?:\.[0-9]+)?)\s*</i
+      );
+
+    if (
+      selectionId ||
+      label ||
+      odds
+    ) {
+      out.push({
+        selection_id:
+          selectionId,
+
+        label:
+          label,
+
+        odds:
+          odds
+            ? Number(odds)
+            : null
+      });
+    }
+  }
+
+  return out;
+}
+
+
+// ============================================================
+// TARGET MARKET ANALYSIS
+// ============================================================
+
+function analyseTargetMarket(
+  html: string
+): Record<string, any> {
+
+  const lower =
+    html.toLowerCase();
+
+  return {
+    first_half:
+      lower.includes(
+        "1st half"
+      ) ||
+      lower.includes(
+        "first half"
+      ),
+
+    total_goals:
+      lower.includes(
+        "total goals"
+      ),
+
+    over_05:
+      lower.includes(
+        "over 0.5"
+      ) ||
+      lower.includes(
+        "over 0,5"
+      ),
+
+    under_05:
+      lower.includes(
+        "under 0.5"
+      ) ||
+      lower.includes(
+        "under 0,5"
+      ),
+
+    exact_text_combo:
+      lower.includes(
+        "1st half - total goals"
+      ) ||
+      lower.includes(
+        "first half - total goals"
+      ) ||
+      lower.includes(
+        "1st half total goals"
+      ) ||
+      lower.includes(
+        "first half total goals"
+      ),
+
+    first_half_market_templates:
+      findTemplateIds(
+        html,
+        [
+          "1H",
+          "FHT",
+          "HT",
+          "TOTAL"
+        ]
+      )
+  };
+}
+
+
+// ============================================================
+// TARGET SAMPLE
+// ============================================================
+
+function targetMarketSample(
+  html: string
+): string[] {
+
+  return findContexts(
+    html,
+    [
+      "Over 0.5",
+      "Under 0.5",
+      "1st Half - Total Goals",
+      "First Half - Total Goals",
+      "1st half",
+      "Total Goals"
+    ],
+    5,
+    500
+  );
+}
+
+
+// ============================================================
+// TEMPLATE IDS
+// ============================================================
+
+function findTemplateIds(
+  html: string,
+  tokens: string[]
+): string[] {
+
+  const out =
+    new Set<string>();
+
+  const regex =
+    /market-template-ids="([^"]+)"/gi;
+
+  let match:
+    RegExpExecArray | null;
+
+  while (
+    (match =
+      regex.exec(html))
+  ) {
+
+    const value =
+      match[1];
+
+    const upper =
+      value.toUpperCase();
+
+    if (
+      tokens.some(
+        token =>
+          upper.includes(
+            token
+          )
+      )
+    ) {
+      out.add(value);
+    }
+
+    if (out.size >= 20) {
+      break;
+    }
+  }
+
+  return Array.from(out);
+}
+
+
+// ============================================================
+// DEDUPE
+// ============================================================
+
+function dedupeEvents(
+  events: Record<string, any>[]
+): Record<string, any>[] {
+
+  const map =
+    new Map<string, Record<string, any>>();
+
+  for (const event of events) {
+    const existing =
+      map.get(
+        event.event_id
+      );
+
+    if (!existing) {
+      map.set(
+        event.event_id,
+        event
+      );
+      continue;
+    }
+
+    if (
+      !existing.phase &&
+      event.phase
+    ) {
+      existing.phase =
+        event.phase;
+    }
+
+    if (
+      !existing.home &&
+      event.home
+    ) {
+      existing.home =
+        event.home;
+    }
+
+    if (
+      !existing.away &&
+      event.away
+    ) {
+      existing.away =
+        event.away;
+    }
+
+    if (
+      (
+        existing.visible_markets?.length ??
+        0
+      ) <
+      (
+        event.visible_markets?.length ??
+        0
+      )
+    ) {
+      existing.visible_markets =
+        event.visible_markets;
+    }
+  }
+
+  return Array.from(
+    map.values()
+  );
 }
 
 
@@ -511,40 +773,30 @@ function findContexts(
   text: string,
   needles: string[],
   maxResults = 5,
-  radius = 700
+  radius = 500
 ): string[] {
 
-  const out:
-    string[] = [];
-
+  const out: string[] = [];
   const lower =
     text.toLowerCase();
 
-  for (
-    const rawNeedle
-    of needles
-  ) {
-
+  for (const rawNeedle of needles) {
     const needle =
       rawNeedle.toLowerCase();
 
-    let start =
-      0;
+    let start = 0;
 
     while (
       out.length <
       maxResults
     ) {
-
       const index =
         lower.indexOf(
           needle,
           start
         );
 
-      if (
-        index === -1
-      ) {
+      if (index === -1) {
         break;
       }
 
@@ -558,8 +810,8 @@ function findContexts(
         Math.min(
           text.length,
           index +
-          needle.length +
-          radius
+            needle.length +
+            radius
         );
 
       const context =
@@ -572,13 +824,9 @@ function findContexts(
 
       if (
         context &&
-        !out.includes(
-          context
-        )
+        !out.includes(context)
       ) {
-        out.push(
-          context
-        );
+        out.push(context);
       }
 
       start =
@@ -595,6 +843,126 @@ function findContexts(
   }
 
   return out;
+}
+
+
+// ============================================================
+// GENERIC HELPERS
+// ============================================================
+
+function firstMatch(
+  text: string,
+  regex: RegExp
+): string | null {
+
+  const match =
+    text.match(
+      regex
+    );
+
+  if (
+    !match ||
+    !match[1]
+  ) {
+    return null;
+  }
+
+  return htmlText(
+    match[1]
+  );
+}
+
+
+function htmlText(
+  value: string
+): string {
+
+  return decode(
+    value
+  )
+    .replace(
+      /<[^>]+>/g,
+      " "
+    )
+    .replace(
+      /&nbsp;/gi,
+      " "
+    )
+    .replace(
+      /&#39;/g,
+      "'"
+    )
+    .replace(
+      /&quot;/g,
+      "\""
+    )
+    .replace(
+      /&amp;/g,
+      "&"
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+
+function extractJsonValue(
+  text: string,
+  key: string
+): string | null {
+
+  const escaped =
+    escapeRegex(
+      key
+    );
+
+  const patterns = [
+    new RegExp(
+      `["']${escaped}["']\\s*:\\s*["']([^"']+)["']`,
+      "i"
+    ),
+    new RegExp(
+      `${escaped}\\s*:\\s*["']([^"']+)["']`,
+      "i"
+    ),
+    new RegExp(
+      `${escaped}\\s*=\\s*["']([^"']+)["']`,
+      "i"
+    )
+  ];
+
+  for (const pattern of patterns) {
+    const match =
+      text.match(
+        pattern
+      );
+
+    if (
+      match &&
+      match[1]
+    ) {
+      return decode(
+        match[1]
+      ).trim();
+    }
+  }
+
+  return null;
+}
+
+
+function normalizeContext(
+  value: string
+): string {
+
+  return value
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
 }
 
 
@@ -649,31 +1017,8 @@ function assetHeaders(): Record<string, string> {
 
 
 // ============================================================
-// CLEAN / DECODE
+// DECODE
 // ============================================================
-
-function normalizeContext(
-  value: string
-): string {
-
-  return value
-    .replace(
-      /\s+/g,
-      " "
-    )
-    .trim();
-}
-
-
-function clean(
-  value: any
-): string {
-
-  return decode(
-    value
-  ).trim();
-}
-
 
 function decode(
   value: any
@@ -687,51 +1032,15 @@ function decode(
   }
 
   return String(value)
-
-    .replace(
-      /\\\\\//g,
-      "/"
-    )
-
-    .replace(
-      /\\\//g,
-      "/"
-    )
-
-    .replace(
-      /\\u002F/gi,
-      "/"
-    )
-
-    .replace(
-      /\\u003A/gi,
-      ":"
-    )
-
-    .replace(
-      /\\u0026/gi,
-      "&"
-    )
-
-    .replace(
-      /\\u003D/gi,
-      "="
-    )
-
-    .replace(
-      /\\u003F/gi,
-      "?"
-    )
-
-    .replace(
-      /&amp;/g,
-      "&"
-    )
-
-    .replace(
-      /&quot;/g,
-      "\""
-    );
+    .replace(/\\\\\//g, "/")
+    .replace(/\\\//g, "/")
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\u003A/gi, ":")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\u003D/gi, "=")
+    .replace(/\\u003F/gi, "?")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"");
 }
 
 
