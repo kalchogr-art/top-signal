@@ -1,323 +1,467 @@
 // ============================================================
-// TOP SIGNAL — BETSAFE DIAGNOSTIC V7
+// TOP SIGNAL — BETSAFE DIAGNOSTIC V8
 // READ ONLY
 //
-// V7:
-// - fetch Betsafe live HTML
-// - search exact sportsbook bootstrap inputs
-// - locate sbApiBaseUrl source
-// - inspect attribute mapping around observedAttributes
+// PURPOSE:
+// Find where sbApiBaseUrl is injected client-side.
 //
 // NO BETTING
 // NO LOGIN
 // NO D1 WRITES
 // ============================================================
 
-const BETSAFE_URL =
-  "https://www.betsafe.com/en/sportsbook/live";
+const ORIGIN =
+  "https://www.betsafe.com";
+
+const LIVE_URL =
+  ORIGIN +
+  "/en/sportsbook/live";
+
+const MAX_BYTES =
+  2_500_000;
+
+
+// ============================================================
+// MAIN
+// ============================================================
 
 export async function debugBetsafe(): Promise<Record<string, any>> {
-  const started = Date.now();
+  const started =
+    Date.now();
 
   try {
-    const response = await fetch(
-      BETSAFE_URL,
-      {
-        method: "GET",
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-            "AppleWebKit/537.36 (KHTML, like Gecko) " +
-            "Chrome/140.0.0.0 Safari/537.36",
 
-          "Accept":
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    // ========================================================
+    // PAGE
+    // ========================================================
 
-          "Accept-Language":
-            "en-US,en;q=0.9",
+    const pageResponse =
+      await fetch(
+        LIVE_URL,
+        {
+          headers:
+            pageHeaders(),
 
-          "Cache-Control":
-            "no-cache",
-
-          "Pragma":
-            "no-cache"
-        },
-
-        redirect: "follow"
-      }
-    );
+          redirect:
+            "follow"
+        }
+      );
 
     const html =
-      await response.text();
+      await pageResponse.text();
 
-    const decoded =
+
+    // ========================================================
+    // DISCOVER TARGET FILES
+    // ========================================================
+
+    const htmlDecoded =
       decode(html);
 
+    const scriptPaths =
+      discoverTargetScripts(
+        htmlDecoded
+      );
 
-    // ========================================================
-    // FIND EXACT VALUES
-    // ========================================================
-
-    const direct = {
-      sbApiBaseUrl:
-        findFirstValue(
-          decoded,
-          [
-            "sbApiBaseUrl",
-            "sb-api-base-url"
-          ]
-        ),
-
-      staticContextId:
-        findFirstValue(
-          decoded,
-          [
-            "staticContextId",
-            "static-context-id"
-          ]
-        ),
-
-      userContextId:
-        findFirstValue(
-          decoded,
-          [
-            "userContextId",
-            "user-context-id"
-          ]
-        )
-    };
+    const results:
+      Record<string, any>[] =
+      [];
 
 
     // ========================================================
-    // CONTEXTS
+    // INLINE HTML ANALYSIS
     // ========================================================
 
-    const contexts = {
-
-      sb_api_base_url:
-        findContexts(
-          decoded,
-          [
-            "sbApiBaseUrl",
-            "sb-api-base-url"
-          ],
-          30,
-          1200
-        ),
-
-      sportsbook_element:
-        findContexts(
-          decoded,
-          [
-            "<sb-xp-sportsbook",
-            "sb-xp-sportsbook"
-          ],
-          20,
-          1200
-        ),
-
-      static_context:
-        findContexts(
-          decoded,
-          [
-            "staticContextId",
-            "static-context-id"
-          ],
-          15,
-          900
-        ),
-
-      user_context:
-        findContexts(
-          decoded,
-          [
-            "userContextId",
-            "user-context-id"
-          ],
-          15,
-          900
-        ),
-
-      api:
-        findContexts(
-          decoded,
-          [
-            "/api/sb",
-            "/sb/",
-            "sportsbookApi",
-            "apiBaseUrl"
-          ],
-          20,
-          900
-        )
-    };
+    results.push(
+      analyse(
+        "HTML",
+        LIVE_URL,
+        htmlDecoded
+      )
+    );
 
 
     // ========================================================
-    // ALL HTML ATTRIBUTES ON SPORTBOOK TAG
+    // FETCH TARGET JS FILES
     // ========================================================
 
-    const sportsbookTags =
-      extractSportsbookTags(
-        decoded
+    for (
+      const path
+      of scriptPaths
+    ) {
+
+      const url =
+        absoluteUrl(
+          path
+        );
+
+      try {
+
+        const response =
+          await fetch(
+            url,
+            {
+              headers: {
+                ...assetHeaders(),
+
+                "Referer":
+                  LIVE_URL
+              },
+
+              redirect:
+                "follow"
+            }
+          );
+
+        const raw =
+          await response.text();
+
+        const source =
+          raw.length >
+          MAX_BYTES
+            ? raw.slice(
+                0,
+                MAX_BYTES
+              )
+            : raw;
+
+        results.push({
+          ...analyse(
+            path,
+            url,
+            source
+          ),
+
+          http: {
+            status:
+              response.status,
+
+            ok:
+              response.ok,
+
+            content_type:
+              response.headers.get(
+                "content-type"
+              ),
+
+            content_length:
+              raw.length,
+
+            inspected_length:
+              source.length,
+
+            truncated:
+              raw.length >
+              MAX_BYTES
+          }
+        });
+
+      } catch (error: any) {
+
+        results.push({
+          file:
+            path,
+
+          url,
+
+          error:
+            error?.message ??
+            String(error)
+        });
+      }
+    }
+
+
+    // ========================================================
+    // IMPORTANT ONLY
+    // ========================================================
+
+    const important =
+      results.filter(
+        x =>
+          x?.hints?.sb_api_base_url ||
+          x?.hints?.sb_api_attribute ||
+          x?.hints?.sbb2b ||
+          x?.hints?.set_attribute
       );
 
 
     return {
-      success: true,
+      success:
+        true,
 
-      source: "BETSAFE",
+      source:
+        "BETSAFE",
 
-      diagnostic_version: "V7",
+      diagnostic_version:
+        "V8",
 
-      mode: "READ_ONLY_DIAGNOSTIC",
+      mode:
+        "READ_ONLY_DIAGNOSTIC",
 
       page: {
         status:
-          response.status,
+          pageResponse.status,
 
         ok:
-          response.ok,
-
-        final_url:
-          response.url,
+          pageResponse.ok,
 
         content_length:
           html.length
       },
 
-      direct,
+      target_scripts:
+        scriptPaths,
 
-      sportsbook_tags:
-        sportsbookTags,
-
-      contexts,
+      important_hits:
+        important,
 
       timing_ms:
-        Date.now() - started
+        Date.now() -
+        started
     };
 
   } catch (error: any) {
+
     return {
-      success: false,
+      success:
+        false,
 
-      source: "BETSAFE",
+      source:
+        "BETSAFE",
 
-      diagnostic_version: "V7",
+      diagnostic_version:
+        "V8",
 
       error:
         error?.message ??
         String(error),
 
       timing_ms:
-        Date.now() - started
+        Date.now() -
+        started
     };
   }
 }
 
 
 // ============================================================
-// FIND FIRST VALUE
+// ANALYSE
 // ============================================================
 
-function findFirstValue(
-  text: string,
-  keys: string[]
-): string | null {
+function analyse(
+  file: string,
+  url: string,
+  text: string
+): Record<string, any> {
 
-  for (const key of keys) {
-    const escaped =
-      escapeRegex(key);
+  const lower =
+    text.toLowerCase();
 
-    const patterns = [
-      new RegExp(
-        `["']${escaped}["']\\s*:\\s*["']([^"']+)["']`,
-        "i"
-      ),
+  return {
+    file,
+    url,
 
-      new RegExp(
-        `${escaped}\\s*:\\s*["']([^"']+)["']`,
-        "i"
-      ),
+    hints: {
+      sb_api_base_url:
+        text.includes(
+          "sbApiBaseUrl"
+        ),
 
-      new RegExp(
-        `${escaped}\\s*=\\s*["']([^"']+)["']`,
-        "i"
-      ),
+      sb_api_attribute:
+        lower.includes(
+          "sb-api-base-url"
+        ),
 
-      new RegExp(
-        `${escaped}=["']([^"']+)["']`,
-        "i"
-      )
-    ];
+      sbb2b:
+        text.includes(
+          "SBB2B_SPORTSBOOK"
+        ),
 
-    for (const pattern of patterns) {
-      const match =
-        text.match(pattern);
+      set_attribute:
+        lower.includes(
+          "setattribute"
+        ),
 
-      if (
-        match &&
-        match[1]
-      ) {
-        return clean(
-          match[1]
-        );
-      }
+      static_context:
+        lower.includes(
+          "static-context-id"
+        ) ||
+        text.includes(
+          "staticContextId"
+        ),
+
+      user_context:
+        lower.includes(
+          "user-context-id"
+        ) ||
+        text.includes(
+          "userContextId"
+        )
+    },
+
+    contexts: {
+
+      sb_api_base_url:
+        findContexts(
+          text,
+          [
+            "sbApiBaseUrl",
+            "sb-api-base-url"
+          ],
+          20,
+          1600
+        ),
+
+      sbb2b:
+        findContexts(
+          text,
+          [
+            "SBB2B_SPORTSBOOK"
+          ],
+          20,
+          1600
+        ),
+
+      set_attribute:
+        findContexts(
+          text,
+          [
+            "setAttribute",
+            "setattribute"
+          ],
+          25,
+          1400
+        ),
+
+      static_context:
+        findContexts(
+          text,
+          [
+            "staticContextId",
+            "static-context-id"
+          ],
+          20,
+          1300
+        ),
+
+      user_context:
+        findContexts(
+          text,
+          [
+            "userContextId",
+            "user-context-id"
+          ],
+          20,
+          1300
+        ),
+
+      api_sb:
+        findContexts(
+          text,
+          [
+            "/api/sb",
+            "/sb/"
+          ],
+          20,
+          1300
+        )
     }
-  }
-
-  return null;
+  };
 }
 
 
 // ============================================================
-// SPORTBOOK TAG EXTRACTION
+// DISCOVER TARGET SCRIPTS
 // ============================================================
 
-function extractSportsbookTags(
+function discoverTargetScripts(
   html: string
 ): string[] {
 
   const out =
     new Set<string>();
 
-  const regex =
-    /<sb-xp-sportsbook\b[^>]*>/gi;
+  const patterns = [
 
-  let match:
-    RegExpExecArray |
-    null;
+    /<script[^>]+src=["']([^"']+\.js[^"']*)["']/gi,
 
-  while (
-    (
-      match =
-        regex.exec(html)
-    )
+    /["']([^"']*entry-client-routing[^"']*\.js)["']/gi,
+
+    /["']([^"']*shell\.[^"']*\.js)["']/gi,
+
+    /["']([^"']*main-[^"']*\.js)["']/gi
+  ];
+
+  for (
+    const regex
+    of patterns
   ) {
 
-    out.add(
-      match[0]
-        .replace(
-          /\s+/g,
-          " "
+    let match:
+      RegExpExecArray |
+      null;
+
+    while (
+      (
+        match =
+          regex.exec(html)
+      )
+    ) {
+
+      const value =
+        clean(
+          match[1]
+        );
+
+      if (
+        !value ||
+        value.includes(
+          "awst"
+        ) ||
+        value.includes(
+          "challenge."
         )
-        .trim()
-    );
+      ) {
+        continue;
+      }
+
+      if (
+        value.includes(
+          "sportsbook"
+        ) ||
+        value.includes(
+          "entry-client-routing"
+        ) ||
+        value.includes(
+          "shell."
+        ) ||
+        value.includes(
+          "main-"
+        )
+      ) {
+        out.add(
+          value
+        );
+      }
+    }
   }
 
-  return Array.from(out);
+  return Array.from(
+    out
+  );
 }
 
 
 // ============================================================
-// CONTEXT FINDER
+// CONTEXT
 // ============================================================
 
 function findContexts(
   text: string,
   needles: string[],
   maxResults = 10,
-  radius = 600
+  radius = 800
 ): string[] {
 
   const out:
@@ -326,9 +470,13 @@ function findContexts(
   const lower =
     text.toLowerCase();
 
-  for (const rawNeedle of needles) {
+  for (
+    const raw
+    of needles
+  ) {
+
     const needle =
-      rawNeedle.toLowerCase();
+      raw.toLowerCase();
 
     let start =
       0;
@@ -345,7 +493,8 @@ function findContexts(
         );
 
       if (
-        index === -1
+        index ===
+        -1
       ) {
         break;
       }
@@ -378,9 +527,13 @@ function findContexts(
 
       if (
         context &&
-        !out.includes(context)
+        !out.includes(
+          context
+        )
       ) {
-        out.push(context);
+        out.push(
+          context
+        );
       }
 
       start =
@@ -401,8 +554,111 @@ function findContexts(
 
 
 // ============================================================
-// DECODE
+// URL
 // ============================================================
+
+function absoluteUrl(
+  value: string
+): string {
+
+  const v =
+    clean(
+      value
+    );
+
+  if (
+    v.startsWith(
+      "http://"
+    ) ||
+    v.startsWith(
+      "https://"
+    )
+  ) {
+    return v;
+  }
+
+  if (
+    v.startsWith(
+      "/"
+    )
+  ) {
+    return (
+      ORIGIN +
+      v
+    );
+  }
+
+  return (
+    ORIGIN +
+    "/" +
+    v
+  );
+}
+
+
+// ============================================================
+// HEADERS
+// ============================================================
+
+function pageHeaders(): Record<string, string> {
+
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/140.0.0.0 Safari/537.36",
+
+    "Accept":
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+
+    "Accept-Language":
+      "en-US,en;q=0.9",
+
+    "Cache-Control":
+      "no-cache",
+
+    "Pragma":
+      "no-cache"
+  };
+}
+
+
+function assetHeaders(): Record<string, string> {
+
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+      "AppleWebKit/537.36 (KHTML, like Gecko) " +
+      "Chrome/140.0.0.0 Safari/537.36",
+
+    "Accept":
+      "*/*",
+
+    "Accept-Language":
+      "en-US,en;q=0.9",
+
+    "Cache-Control":
+      "no-cache",
+
+    "Pragma":
+      "no-cache"
+  };
+}
+
+
+// ============================================================
+// CLEAN / DECODE
+// ============================================================
+
+function clean(
+  value: any
+): string {
+
+  return decode(
+    value
+  ).trim();
+}
+
 
 function decode(
   value: any
@@ -416,70 +672,49 @@ function decode(
   }
 
   return String(value)
+
     .replace(
       /\\\\\//g,
       "/"
     )
+
     .replace(
       /\\\//g,
       "/"
     )
+
     .replace(
       /\\u002F/gi,
       "/"
     )
+
     .replace(
       /\\u003A/gi,
       ":"
     )
+
     .replace(
       /\\u0026/gi,
       "&"
     )
+
     .replace(
       /\\u003D/gi,
       "="
     )
+
     .replace(
       /\\u003F/gi,
       "?"
     )
+
     .replace(
       /&amp;/g,
       "&"
     )
+
     .replace(
       /&quot;/g,
       "\""
     );
-}
-
-
-// ============================================================
-// CLEAN
-// ============================================================
-
-function clean(
-  value: any
-): string {
-
-  return decode(
-    value
-  )
-    .trim();
-}
-
-
-// ============================================================
-// ESCAPE REGEX
-// ============================================================
-
-function escapeRegex(
-  value: string
-): string {
-
-  return value.replace(
-    /[.*+?^${}()|[\]\\]/g,
-    "\\$&"
-  );
-}
+          }
