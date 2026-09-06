@@ -1,5 +1,5 @@
 // ============================================================
-// TOP SIGNAL V1.8.0 — MANUAL TARGET CONTROL
+// TOP SIGNAL V1.9.0 — BET STATUS
 //
 // TRACKER
 //   ↓
@@ -23,24 +23,40 @@
 // BET NOW:
 // Dashboard -> exact Cloudbet event
 // -> Violentmonkey selects 1H O0.5
-// -> fills 1 USDT
-// -> STOPS BEFORE PLACE BET
+// -> user confirms final Place Bet manually
+// -> Violentmonkey detects successful confirmation
+// -> POST /api/bet-status
+// -> Dashboard shows ЗАЛОЖЕН ✅
 //
 // IMPORTANT:
 // - Keeps V1.7.1 Matcher fix.
-// - signal: "HUNTER_ENTRY" is NOT forwarded to Matcher.
-// - REAL BET SUBMISSION IS DISABLED.
+// - signal: "HUNTER_ENTRY" is NOT forwarded as nested Matcher signal.
+// - Worker DOES NOT submit a real bet.
+// - BET_PLACED is stored per Cloudbet event_id.
+// - Invalid odds <= 1 or > 50 are NEVER treated as READY.
 // ============================================================
 
-const VERSION = "V1.8.0 MANUAL TARGET";
-const APP_NAME = "top-signal";
+const VERSION =
+  "V1.9.0 BET STATUS";
 
-type Obj = Record<string, any>;
+const APP_NAME =
+  "top-signal";
+
+
+type Obj =
+  Record<string, any>;
+
 
 interface Env {
-  DB: D1Database;
-  TRACKER: Fetcher;
-  MATCHER: Fetcher;
+
+  DB:
+    D1Database;
+
+  TRACKER:
+    Fetcher;
+
+  MATCHER:
+    Fetcher;
 }
 
 
@@ -56,7 +72,9 @@ export default {
   ): Promise<Response> {
 
     const url =
-      new URL(request.url);
+      new URL(
+        request.url
+      );
 
 
     // ========================================================
@@ -64,13 +82,17 @@ export default {
     // ========================================================
 
     if (
-      request.method === "OPTIONS"
+      request.method ===
+      "OPTIONS"
     ) {
+
       return new Response(
         null,
         {
           status: 204,
-          headers: corsHeaders()
+
+          headers:
+            corsHeaders()
         }
       );
     }
@@ -86,7 +108,9 @@ export default {
     ) {
 
       return json({
-        success: true,
+
+        success:
+          true,
 
         worker:
           APP_NAME,
@@ -98,12 +122,13 @@ export default {
           "MANUAL_TARGET_CONTROL",
 
         betting:
-          "FINAL_SUBMIT_DISABLED",
+          "MANUAL_FINAL_CONFIRMATION",
 
         storage:
           "D1",
 
         bindings: {
+
           DB:
             !!env.DB,
 
@@ -115,7 +140,13 @@ export default {
         },
 
         flow:
-          "TRACKER -> MATCHER -> DASHBOARD -> CLOUDBET FRONTEND -> D1"
+          "TRACKER -> MATCHER -> DASHBOARD -> CLOUDBET FRONTEND -> D1",
+
+        bet_status:
+          "SUPPORTED",
+
+        final_submit:
+          "NOT_PERFORMED_BY_WORKER"
       });
     }
 
@@ -137,16 +168,22 @@ export default {
             "/entries"
           );
 
+
         const signals =
           extractHunterSignals(
             data
           );
 
+
         return json({
-          success: true,
+
+          success:
+            true,
 
           raw_type:
-            Array.isArray(data)
+            Array.isArray(
+              data
+            )
               ? "ARRAY"
               : typeof data,
 
@@ -162,7 +199,9 @@ export default {
 
         return json(
           {
-            success: false,
+
+            success:
+              false,
 
             error:
               error?.message ??
@@ -191,10 +230,12 @@ export default {
             "/entries"
           );
 
+
         const signals =
           extractHunterSignals(
             tracker
           );
+
 
         const matcher =
           await callMatcher(
@@ -202,8 +243,11 @@ export default {
             signals
           );
 
+
         return json({
-          success: true,
+
+          success:
+            true,
 
           tracker_signals:
             signals.length,
@@ -217,7 +261,8 @@ export default {
             null,
 
           hunter_results:
-            matcher?.hunter_results ??
+            matcher
+              ?.hunter_results ??
             []
         });
 
@@ -227,7 +272,9 @@ export default {
 
         return json(
           {
-            success: false,
+
+            success:
+              false,
 
             error:
               error?.message ??
@@ -246,6 +293,7 @@ export default {
     if (
       url.pathname ===
         "/api/target" &&
+
       request.method ===
         "GET"
     ) {
@@ -257,12 +305,16 @@ export default {
             env
           );
 
+
         const target =
           result.targets[0] ??
           null;
 
+
         return json({
-          success: true,
+
+          success:
+            true,
 
           found:
             !!target,
@@ -272,13 +324,39 @@ export default {
           stats: {
 
             tracker_signals:
-              result.trackerSignals,
+              result
+                .trackerSignals,
 
             matcher_hunter_results:
-              result.matcherHunterResults,
+              result
+                .matcherHunterResults,
 
             secure_targets:
-              result.targets.length
+              result
+                .targets
+                .length,
+
+            odds_ready:
+              result
+                .targets
+                .filter(
+                  item =>
+                    item.ready ===
+                      true &&
+                    item.betPlaced !==
+                      true
+                )
+                .length,
+
+            bet_placed:
+              result
+                .targets
+                .filter(
+                  item =>
+                    item.betPlaced ===
+                    true
+                )
+                .length
           },
 
           timestamp:
@@ -295,13 +373,18 @@ export default {
           error
         );
 
+
         return json(
           {
-            success: false,
 
-            found: false,
+            success:
+              false,
 
-            target: null,
+            found:
+              false,
+
+            target:
+              null,
 
             error:
               error?.message ??
@@ -320,6 +403,7 @@ export default {
     if (
       url.pathname ===
         "/api/targets" &&
+
       request.method ===
         "GET"
     ) {
@@ -331,20 +415,49 @@ export default {
             env
           );
 
+
         return json({
-          success: true,
+
+          success:
+            true,
 
           version:
             VERSION,
 
           count:
-            result.targets.length,
+            result
+              .targets
+              .length,
 
           tracker_signals:
-            result.trackerSignals,
+            result
+              .trackerSignals,
 
           matcher_hunter_results:
-            result.matcherHunterResults,
+            result
+              .matcherHunterResults,
+
+          odds_ready:
+            result
+              .targets
+              .filter(
+                item =>
+                  item.ready ===
+                    true &&
+                  item.betPlaced !==
+                    true
+              )
+              .length,
+
+          bet_placed:
+            result
+              .targets
+              .filter(
+                item =>
+                  item.betPlaced ===
+                  true
+              )
+              .length,
 
           targets:
             result.targets
@@ -356,9 +469,12 @@ export default {
 
         return json(
           {
-            success: false,
 
-            targets: [],
+            success:
+              false,
+
+            targets:
+              [],
 
             error:
               error?.message ??
@@ -377,6 +493,7 @@ export default {
     if (
       url.pathname ===
         "/api/odds" &&
+
       request.method ===
         "POST"
     ) {
@@ -384,20 +501,24 @@ export default {
       try {
 
         const body =
-          await request.json<Obj>();
+          await request
+            .json<Obj>();
+
 
         const eventId =
           safe(
             body?.eventId
           );
 
+
         const overOdds =
-          numberOrNull(
+          validOdds(
             body?.overOdds
           );
 
+
         const underOdds =
-          numberOrNull(
+          validOdds(
             body?.underOdds
           );
 
@@ -408,14 +529,15 @@ export default {
 
         if (
           !eventId ||
-          overOdds === null ||
-          overOdds <= 1 ||
-          overOdds > 50
+          overOdds === null
         ) {
 
           return json(
             {
-              success: false,
+
+              success:
+                false,
+
               error:
                 "INVALID_ODDS_PAYLOAD"
             },
@@ -496,10 +618,18 @@ export default {
 
 
         return json({
-          success: true,
+
+          success:
+            true,
 
           action:
             "ODDS_SAVED",
+
+          eventId,
+
+          overOdds,
+
+          underOdds,
 
           data:
             stored
@@ -511,7 +641,9 @@ export default {
 
         return json(
           {
-            success: false,
+
+            success:
+              false,
 
             error:
               error?.message ??
@@ -530,6 +662,7 @@ export default {
     if (
       url.pathname ===
         "/api/odds" &&
+
       request.method ===
         "GET"
     ) {
@@ -539,11 +672,15 @@ export default {
         const eventId =
           safe(
             url.searchParams
-              .get("eventId")
+              .get(
+                "eventId"
+              )
           );
 
 
-        if (eventId) {
+        if (
+          eventId
+        ) {
 
           const row =
             await getStoredEvent(
@@ -551,10 +688,16 @@ export default {
               eventId
             );
 
+
           return json({
-            success: true,
+
+            success:
+              true,
+
             data:
-              row ?? null
+              sanitizeStoredOdds(
+                row
+              )
           });
         }
 
@@ -571,7 +714,290 @@ export default {
 
 
         return json({
-          success: true,
+
+          success:
+            true,
+
+          data:
+            sanitizeStoredOdds(
+              row as Obj | null
+            )
+        });
+
+      } catch (
+        error: any
+      ) {
+
+        return json(
+          {
+
+            success:
+              false,
+
+            error:
+              error?.message ??
+              String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // SAVE BET STATUS
+    // ========================================================
+
+    if (
+      url.pathname ===
+        "/api/bet-status" &&
+
+      request.method ===
+        "POST"
+    ) {
+
+      try {
+
+        await ensureBetStatusTable(
+          env
+        );
+
+
+        const body =
+          await request
+            .json<Obj>();
+
+
+        const eventId =
+          safe(
+            body?.eventId
+          );
+
+
+        const status =
+          safe(
+            body?.status
+          )
+            .toUpperCase();
+
+
+        if (
+          !eventId ||
+          status !==
+            "BET_PLACED"
+        ) {
+
+          return json(
+            {
+
+              success:
+                false,
+
+              error:
+                "INVALID_BET_STATUS_PAYLOAD"
+            },
+            400
+          );
+        }
+
+
+        // ----------------------------------------------------
+        // REQUIRE EVENT TO EXIST
+        // ----------------------------------------------------
+
+        const storedEvent =
+          await getStoredEvent(
+            env,
+            eventId
+          );
+
+
+        if (
+          !storedEvent
+        ) {
+
+          return json(
+            {
+
+              success:
+                false,
+
+              error:
+                "EVENT_NOT_FOUND"
+            },
+            404
+          );
+        }
+
+
+        const now =
+          new Date()
+            .toISOString();
+
+
+        await env.DB
+          .prepare(`
+            INSERT INTO bet_status (
+              event_id,
+              status,
+              placed,
+              placed_at,
+              updated_at
+            )
+
+            VALUES (
+              ?1,
+              'BET_PLACED',
+              1,
+              ?2,
+              ?2
+            )
+
+            ON CONFLICT(event_id)
+
+            DO UPDATE SET
+
+              status =
+                'BET_PLACED',
+
+              placed =
+                1,
+
+              placed_at =
+                COALESCE(
+                  bet_status.placed_at,
+                  excluded.placed_at
+                ),
+
+              updated_at =
+                excluded.updated_at
+          `)
+
+          .bind(
+            eventId,
+            now
+          )
+
+          .run();
+
+
+        const stored =
+          await getBetStatus(
+            env,
+            eventId
+          );
+
+
+        return json({
+
+          success:
+            true,
+
+          action:
+            "BET_PLACED_SAVED",
+
+          eventId,
+
+          placed:
+            true,
+
+          data:
+            stored
+        });
+
+      } catch (
+        error: any
+      ) {
+
+        return json(
+          {
+
+            success:
+              false,
+
+            error:
+              error?.message ??
+              String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // GET BET STATUS
+    // ========================================================
+
+    if (
+      url.pathname ===
+        "/api/bet-status" &&
+
+      request.method ===
+        "GET"
+    ) {
+
+      try {
+
+        await ensureBetStatusTable(
+          env
+        );
+
+
+        const eventId =
+          safe(
+            url.searchParams
+              .get(
+                "eventId"
+              )
+          );
+
+
+        if (
+          !eventId
+        ) {
+
+          return json(
+            {
+
+              success:
+                false,
+
+              error:
+                "EVENT_ID_REQUIRED"
+            },
+            400
+          );
+        }
+
+
+        const row =
+          await getBetStatus(
+            env,
+            eventId
+          );
+
+
+        return json({
+
+          success:
+            true,
+
+          eventId,
+
+          placed:
+            Number(
+              row?.placed ??
+              0
+            ) === 1,
+
+          status:
+            row?.status ??
+            null,
+
+          placedAt:
+            row?.placed_at ??
+            null,
 
           data:
             row ?? null
@@ -583,7 +1009,9 @@ export default {
 
         return json(
           {
-            success: false,
+
+            success:
+              false,
 
             error:
               error?.message ??
@@ -602,6 +1030,7 @@ export default {
     return new Response(
       renderHtml(),
       {
+
         headers: {
 
           "content-type":
@@ -624,13 +1053,21 @@ async function buildTargets(
   env: Env
 ): Promise<{
 
-  trackerSignals: number;
+  trackerSignals:
+    number;
 
-  matcherHunterResults: number;
+  matcherHunterResults:
+    number;
 
-  targets: Obj[];
+  targets:
+    Obj[];
 
 }> {
+
+  await ensureBetStatusTable(
+    env
+  );
+
 
   const trackerData =
     await fetchServiceJSON(
@@ -646,16 +1083,20 @@ async function buildTargets(
 
 
   if (
-    signals.length === 0
+    signals.length ===
+    0
   ) {
 
     return {
 
-      trackerSignals: 0,
+      trackerSignals:
+        0,
 
-      matcherHunterResults: 0,
+      matcherHunterResults:
+        0,
 
-      targets: []
+      targets:
+        []
     };
   }
 
@@ -672,8 +1113,10 @@ async function buildTargets(
       matcherData
         ?.hunter_results
     )
+
       ? matcherData
           .hunter_results
+
       : [];
 
 
@@ -692,6 +1135,7 @@ async function buildTargets(
             item
               ?.cloudbet
               ?.id ??
+
             item
               ?.cloudbet
               ?.event_id
@@ -714,7 +1158,9 @@ async function buildTargets(
 
         return (
           !!eventId &&
+
           secure &&
+
           classification ===
             "CONFIDENT_MATCH"
         );
@@ -740,6 +1186,7 @@ async function buildTargets(
     if (
       !target.eventId
     ) {
+
       continue;
     }
 
@@ -766,9 +1213,36 @@ async function buildTargets(
 
 
     const storedOdds =
-      numberOrNull(
-        stored?.over_odds
+      validOdds(
+        stored
+          ?.over_odds
       );
+
+
+    const storedUnderOdds =
+      validOdds(
+        stored
+          ?.under_odds
+      );
+
+
+    // --------------------------------------------------------
+    // LOAD BET STATUS
+    // --------------------------------------------------------
+
+    const betStatus =
+      await getBetStatus(
+        env,
+        target.eventId
+      );
+
+
+    const betPlaced =
+      Number(
+        betStatus
+          ?.placed ??
+        0
+      ) === 1;
 
 
     targets.push({
@@ -779,9 +1253,7 @@ async function buildTargets(
         storedOdds,
 
       underOdds:
-        numberOrNull(
-          stored?.under_odds
-        ),
+        storedUnderOdds,
 
       oddsUpdatedAt:
         stored
@@ -794,7 +1266,20 @@ async function buildTargets(
         null,
 
       ready:
-        storedOdds !== null
+        storedOdds !==
+          null,
+
+      betPlaced,
+
+      betStatus:
+        betStatus
+          ?.status ??
+        null,
+
+      betPlacedAt:
+        betStatus
+          ?.placed_at ??
+        null
     });
   }
 
@@ -815,11 +1300,13 @@ async function buildTargets(
           0
         );
 
+
       const bi =
         Number(
           b.signalId ??
           0
         );
+
 
       return (
         bi -
@@ -861,6 +1348,7 @@ async function callMatcher(
 
   return await fetchServiceJSON(
     env.MATCHER,
+
     "/match?signals=" +
       encoded
   );
@@ -968,6 +1456,7 @@ function isHunterEntry(
           "string"
 
           ? item.signal
+
           : ""
       ) ??
 
@@ -995,6 +1484,7 @@ function isHunterEntry(
     type ===
     "HUNTER_ENTRY"
   ) {
+
     return true;
   }
 
@@ -1002,9 +1492,11 @@ function isHunterEntry(
   if (
     action ===
       "ENTRY" &&
+
     status ===
       "TRACKING"
   ) {
+
     return true;
   }
 
@@ -1156,8 +1648,11 @@ function normalizeSignal(
     score:
       item?.score ??
       {
-        home: 0,
-        away: 0
+        home:
+          0,
+
+        away:
+          0
       },
 
     home:
@@ -1397,6 +1892,7 @@ async function saveTarget(
     `)
 
     .bind(
+
       target.eventId,
 
       target.matchName ||
@@ -1442,6 +1938,94 @@ async function getStoredEvent(
 
 
 // ============================================================
+// BET STATUS TABLE
+// ============================================================
+
+async function ensureBetStatusTable(
+  env: Env
+): Promise<void> {
+
+  await env.DB
+    .prepare(`
+      CREATE TABLE IF NOT EXISTS bet_status (
+
+        event_id TEXT PRIMARY KEY,
+
+        status TEXT NOT NULL DEFAULT 'NONE',
+
+        placed INTEGER NOT NULL DEFAULT 0,
+
+        placed_at TEXT,
+
+        updated_at TEXT
+      )
+    `)
+
+    .run();
+}
+
+
+// ============================================================
+// GET BET STATUS
+// ============================================================
+
+async function getBetStatus(
+  env: Env,
+  eventId: string
+): Promise<Obj | null> {
+
+  return await env.DB
+    .prepare(`
+      SELECT *
+      FROM bet_status
+      WHERE event_id = ?1
+      LIMIT 1
+    `)
+
+    .bind(
+      eventId
+    )
+
+    .first();
+}
+
+
+// ============================================================
+// SANITIZE STORED ODDS
+// ============================================================
+
+function sanitizeStoredOdds(
+  row: Obj | null
+): Obj | null {
+
+  if (
+    !row
+  ) {
+
+    return null;
+  }
+
+
+  return {
+
+    ...row,
+
+    over_odds:
+      validOdds(
+        row
+          ?.over_odds
+      ),
+
+    under_odds:
+      validOdds(
+        row
+          ?.under_odds
+      )
+  };
+}
+
+
+// ============================================================
 // SERVICE JSON
 // ============================================================
 
@@ -1459,10 +2043,12 @@ async function fetchServiceJSON(
           path,
 
         {
+
           method:
             "GET",
 
           headers: {
+
             accept:
               "application/json"
           }
@@ -1472,7 +2058,8 @@ async function fetchServiceJSON(
 
 
   const responseText =
-    await response.text();
+    await response
+      .text();
 
 
   if (
@@ -1527,9 +2114,13 @@ function extractTeamName(
 ): string {
 
   if (
-    value === null ||
-    value === undefined
+    value ===
+      null ||
+
+    value ===
+      undefined
   ) {
+
     return "";
   }
 
@@ -1594,8 +2185,12 @@ function splitMatch(
   ) {
 
     return {
-      home: "",
-      away: ""
+
+      home:
+        "",
+
+      away:
+        ""
     };
   }
 
@@ -1633,7 +2228,8 @@ function splitMatch(
 
 
     if (
-      index >= 0
+      index >=
+      0
     ) {
 
       return {
@@ -1659,8 +2255,12 @@ function splitMatch(
 
 
   return {
-    home: "",
-    away: ""
+
+    home:
+      "",
+
+    away:
+      ""
   };
 }
 
@@ -1674,9 +2274,13 @@ function scoreToString(
 ): string | null {
 
   if (
-    value === null ||
-    value === undefined
+    value ===
+      null ||
+
+    value ===
+      undefined
   ) {
+
     return null;
   }
 
@@ -1697,14 +2301,19 @@ function scoreToString(
     Array.isArray(
       value
     ) &&
-    value.length >= 2
+
+    value.length >=
+      2
   ) {
 
     return (
+
       String(
         value[0]
       ) +
+
       ":" +
+
       String(
         value[1]
       )
@@ -1736,14 +2345,24 @@ function scoreToString(
 
 
     if (
-      home !== undefined &&
-      away !== undefined
+      home !==
+        undefined &&
+
+      away !==
+        undefined
     ) {
 
       return (
-        String(home) +
+
+        String(
+          home
+        ) +
+
         ":" +
-        String(away)
+
+        String(
+          away
+        )
       );
     }
   }
@@ -1762,9 +2381,13 @@ function safe(
 ): string {
 
   if (
-    value === null ||
-    value === undefined
+    value ===
+      null ||
+
+    value ===
+      undefined
   ) {
+
     return "";
   }
 
@@ -1784,9 +2407,14 @@ function numberOrNull(
 ): number | null {
 
   if (
-    value === null ||
-    value === undefined ||
-    value === ""
+    value ===
+      null ||
+
+    value ===
+      undefined ||
+
+    value ===
+      ""
   ) {
 
     return null;
@@ -1802,8 +2430,43 @@ function numberOrNull(
   return Number.isFinite(
     number
   )
+
     ? number
+
     : null;
+}
+
+
+// ============================================================
+// VALID ODDS
+// ============================================================
+
+function validOdds(
+  value: any
+): number | null {
+
+  const number =
+    numberOrNull(
+      value
+    );
+
+
+  if (
+    number ===
+      null ||
+
+    number <=
+      1 ||
+
+    number >
+      50
+  ) {
+
+    return null;
+  }
+
+
+  return number;
 }
 
 
@@ -1845,6 +2508,7 @@ function json(
     ),
 
     {
+
       status,
 
       headers: {
@@ -1886,9 +2550,11 @@ function renderHtml():
 Top Signal Control
 </title>
 
+
 <style>
 
 * {
+
   box-sizing:
     border-box;
 }
@@ -1961,7 +2627,7 @@ body {
 
   grid-template-columns:
     repeat(
-      3,
+      4,
       1fr
     );
 
@@ -1983,7 +2649,7 @@ body {
     13px;
 
   padding:
-    12px;
+    12px 8px;
 
   text-align:
     center;
@@ -2046,6 +2712,13 @@ body {
 
   border-radius:
     16px;
+}
+
+
+.card.placed {
+
+  border-color:
+    #166534;
 }
 
 
@@ -2155,6 +2828,16 @@ body {
 }
 
 
+.placedText {
+
+  font-size:
+    29px;
+
+  color:
+    #86efac;
+}
+
+
 .state {
 
   font-size:
@@ -2179,6 +2862,13 @@ body {
 
   color:
     #fbbf24;
+}
+
+
+.placedState {
+
+  color:
+    #86efac;
 }
 
 
@@ -2240,7 +2930,7 @@ body {
 }
 
 
-.bet[disabled] {
+.btn[disabled] {
 
   background:
     #26303c;
@@ -2353,36 +3043,55 @@ body {
 ) {
 
   .app {
+
     padding:
       12px;
   }
 
 
   .title {
+
     font-size:
       22px;
   }
 
 
   .odds {
+
     font-size:
       34px;
   }
 
 
+  .placedText {
+
+    font-size:
+      25px;
+  }
+
+
   .summary {
+
+    grid-template-columns:
+      repeat(
+        2,
+        1fr
+      );
+
     gap:
       6px;
   }
 
 
   .sum {
+
     padding:
       10px 6px;
   }
 
 
   .actions {
+
     grid-template-columns:
       1fr;
   }
@@ -2399,13 +3108,15 @@ body {
 
 
   <div class="title">
+
     ⚡ TOP SIGNAL MANUAL
+
   </div>
 
 
   <div class="subtitle">
 
-    V1.8.0 MANUAL TARGET
+    V1.9.0 BET STATUS
 
     · TRACKER → MATCHER → SELECT MATCH
 
@@ -2427,7 +3138,9 @@ body {
       </div>
 
       <div class="l">
+
         TARGETS
+
       </div>
 
     </div>
@@ -2443,7 +3156,27 @@ body {
       </div>
 
       <div class="l">
+
         ODDS READY
+
+      </div>
+
+    </div>
+
+
+    <div class="sum">
+
+      <div
+        id="sumPlaced"
+        class="v"
+      >
+        0
+      </div>
+
+      <div class="l">
+
+        PLACED
+
       </div>
 
     </div>
@@ -2459,7 +3192,9 @@ body {
       </div>
 
       <div class="l">
+
         BEST O0.5
+
       </div>
 
     </div>
@@ -2472,7 +3207,9 @@ body {
     id="stats"
     class="stats"
   >
+
     Loading...
+
   </div>
 
 
@@ -2482,11 +3219,11 @@ body {
 
   <div class="footer">
 
-    CLOUDBET OPENS ONLY FOR THE TARGET YOU CHOOSE
+    CHECK READS REAL 1H O0.5 ODDS
 
-    · SAFE STAKE 1 USDT
+    · BET NOW OPENS ONLY THE SELECTED EVENT
 
-    · PLACE BET IS NEVER AUTO-CLICKED
+    · FINAL BET CONFIRMATION IS MANUAL
 
   </div>
 
@@ -2544,13 +3281,60 @@ function esc(v) {
 
 function num(v) {
 
+  if (
+    v ===
+      null ||
+
+    v ===
+      undefined ||
+
+    v ===
+      ''
+  ) {
+
+    return null;
+  }
+
+
   const x =
     Number(v);
 
+
   return Number
     .isFinite(x)
+
       ? x
+
       : null;
+}
+
+
+// ==========================================================
+// VALID ODDS
+// ==========================================================
+
+function validOdds(v) {
+
+  const x =
+    num(v);
+
+
+  if (
+    x ===
+      null ||
+
+    x <=
+      1 ||
+
+    x >
+      50
+  ) {
+
+    return null;
+  }
+
+
+  return x;
 }
 
 
@@ -2618,6 +3402,16 @@ function go(
   if (
     !target?.eventId
   ) {
+
+    return;
+  }
+
+
+  if (
+    target?.betPlaced ===
+    true
+  ) {
+
     return;
   }
 
@@ -2686,13 +3480,20 @@ async function copyId(
 function card(t) {
 
   const odds =
-    num(
+    validOdds(
       t?.overOdds
     );
 
 
+  const placed =
+    t?.betPlaced ===
+    true;
+
+
   const ready =
-    odds !== null;
+    !placed &&
+    odds !==
+      null;
 
 
   const match =
@@ -2715,8 +3516,11 @@ function card(t) {
 
   const minute =
 
-    t?.minute !== null &&
-    t?.minute !== undefined
+    t?.minute !==
+      null &&
+
+    t?.minute !==
+      undefined
 
       ? esc(
           t.minute
@@ -2727,8 +3531,11 @@ function card(t) {
 
   const hunter =
 
-    t?.hunterScore !== null &&
-    t?.hunterScore !== undefined
+    t?.hunterScore !==
+      null &&
+
+    t?.hunterScore !==
+      undefined
 
       ? esc(
           t.hunterScore
@@ -2739,8 +3546,11 @@ function card(t) {
 
   const matcher =
 
-    t?.matcherScore !== null &&
-    t?.matcherScore !== undefined
+    t?.matcherScore !==
+      null &&
+
+    t?.matcherScore !==
+      undefined
 
       ? esc(
           t.matcherScore
@@ -2756,19 +3566,40 @@ function card(t) {
     );
 
 
+  const placedAt =
+    t?.betPlacedAt
+      ? esc(
+          t.betPlacedAt
+        )
+      : '';
+
+
   return (
 
-    '<div class="card">' +
+    '<div class="card ' +
+
+      (
+        placed
+          ? 'placed'
+          : ''
+      ) +
+
+    '">' +
 
 
       '<div class="match">' +
+
         match +
+
       '</div>' +
 
 
       '<div class="event">' +
+
         'Cloudbet Event ID: ' +
+
         eventId +
+
       '</div>' +
 
 
@@ -2776,26 +3607,38 @@ function card(t) {
 
 
         '<div class="badge">' +
+
           '⏱ ' +
+
           minute +
+
         '</div>' +
 
 
         '<div class="badge">' +
+
           '🎯 Hunter ' +
+
           hunter +
+
         '</div>' +
 
 
         '<div class="badge">' +
+
           '🔗 Matcher ' +
+
           matcher +
+
         '</div>' +
 
 
         '<div class="badge">' +
+
           '⚽ ' +
+
           score +
+
         '</div>' +
 
 
@@ -2804,7 +3647,7 @@ function card(t) {
 
       '<div class="market">' +
 
-        '1H TOTAL GOALS · OVER 0.5 · SAFE STAKE 1 USDT' +
+        '1H TOTAL GOALS · OVER 0.5' +
 
       '</div>' +
 
@@ -2812,17 +3655,29 @@ function card(t) {
       '<div class="oddsline">' +
 
 
-        '<div class="odds">' +
+        '<div class="odds ' +
 
           (
-            ready
+            placed
+              ? 'placedText'
+              : ''
+          ) +
 
-              ? '@ ' +
-                odds.toFixed(
-                  2
-                )
+        '">' +
 
-              : '@ —'
+          (
+            placed
+
+              ? 'ЗАЛОЖЕН ✅'
+
+              : ready
+
+                ? '@ ' +
+                  odds.toFixed(
+                    2
+                  )
+
+                : '@ —'
           ) +
 
         '</div>' +
@@ -2831,25 +3686,47 @@ function card(t) {
         '<div class="state ' +
 
           (
-            ready
-              ? 'ready'
-              : 'waiting'
+            placed
+
+              ? 'placedState'
+
+              : ready
+
+                ? 'ready'
+
+                : 'waiting'
           ) +
 
         '">' +
 
           (
-            ready
+            placed
 
-              ? 'ODDS READY ✅'
+              ? 'BET PLACED ✅'
 
-              : 'WAITING FOR CHECK'
+              : ready
+
+                ? 'ODDS READY ✅'
+
+                : 'WAITING FOR CHECK ⏳'
           ) +
 
         '</div>' +
 
 
       '</div>' +
+
+
+      (
+        placedAt
+
+          ? '<div class="small">' +
+              'Placed: ' +
+              placedAt +
+            '</div>'
+
+          : ''
+      ) +
 
 
       '<div class="actions">' +
@@ -2863,9 +3740,23 @@ function card(t) {
 
           'data-id="' +
             eventId +
-          '">' +
+          '" ' +
 
-          'CHECK ODDS' +
+          (
+            placed
+              ? 'disabled'
+              : ''
+          ) +
+
+        '>' +
+
+          (
+            placed
+
+              ? 'CHECKED ✅'
+
+              : 'CHECK ODDS'
+          ) +
 
         '</button>' +
 
@@ -2881,14 +3772,23 @@ function card(t) {
           '" ' +
 
           (
-            ready
-              ? ''
-              : 'disabled'
+            placed ||
+            !ready
+
+              ? 'disabled'
+
+              : ''
           ) +
 
         '>' +
 
-          'BET NOW' +
+          (
+            placed
+
+              ? 'ЗАЛОЖЕН ✅'
+
+              : 'BET NOW'
+          ) +
 
         '</button>' +
 
@@ -2913,13 +3813,16 @@ function card(t) {
 
       '<div class="small">' +
 
-        'CHECK ODDS → отваря само този мач, ' +
+        (
+          placed
 
-        'чете реалния 1H O0.5 коефициент и се връща тук.<br>' +
+            ? 'Този Event ID вече е маркиран като BET_PLACED. ' +
+              'BET NOW е заключен срещу повторно действие.'
 
-        'BET NOW → подготвя O0.5 + stake 1 USDT, ' +
-
-        'без да натиска Place bet.' +
+            : 'CHECK ODDS → чете реалния 1H O0.5 коефициент.<br>' +
+              'BET NOW → отваря точния мач и подготвя избора. ' +
+              'След успешно ръчно потвърждение статусът става ЗАЛОЖЕН ✅.'
+        ) +
 
       '</div>' +
 
@@ -2952,6 +3855,7 @@ async function refresh() {
           Date.now(),
 
         {
+
           cache:
             'no-store'
         }
@@ -2959,7 +3863,8 @@ async function refresh() {
 
 
     const d =
-      await r.json();
+      await r
+        .json();
 
 
     if (
@@ -2990,13 +3895,26 @@ async function refresh() {
         : [];
 
 
+    const placed =
+      latestTargets
+        .filter(
+          x =>
+            x?.betPlaced ===
+            true
+        );
+
+
     const ready =
       latestTargets
         .filter(
           x =>
-            num(
+            x?.betPlaced !==
+              true &&
+
+            validOdds(
               x?.overOdds
-            ) !== null
+            ) !==
+              null
         );
 
 
@@ -3006,14 +3924,15 @@ async function refresh() {
 
         .map(
           x =>
-            num(
-              x.overOdds
+            validOdds(
+              x?.overOdds
             )
         )
 
         .filter(
           x =>
-            x !== null
+            x !==
+            null
         )
 
         .sort(
@@ -3050,11 +3969,22 @@ async function refresh() {
 
     document
       .getElementById(
+        'sumPlaced'
+      )
+      .textContent =
+        String(
+          placed.length
+        );
+
+
+    document
+      .getElementById(
         'sumBest'
       )
       .textContent =
 
-        best === null
+        best ===
+          null
 
           ? '—'
 
@@ -3087,6 +4017,14 @@ async function refresh() {
         ' · Secure ' +
 
         latestTargets.length +
+
+        ' · Ready ' +
+
+        ready.length +
+
+        ' · Placed ' +
+
+        placed.length +
 
         ' · refresh 3s';
 
@@ -3162,6 +4100,15 @@ document
       if (
         !b
       ) {
+
+        return;
+      }
+
+
+      if (
+        b.disabled
+      ) {
+
         return;
       }
 
@@ -3207,6 +4154,16 @@ document
       if (
         !target
       ) {
+
+        return;
+      }
+
+
+      if (
+        target?.betPlaced ===
+        true
+      ) {
+
         return;
       }
 
@@ -3227,9 +4184,24 @@ document
 
       if (
         action ===
-          'bet' &&
-        !b.disabled
+        'bet'
       ) {
+
+        const odds =
+          validOdds(
+            target
+              ?.overOdds
+          );
+
+
+        if (
+          odds ===
+          null
+        ) {
+
+          return;
+        }
+
 
         go(
           target,
@@ -3258,4 +4230,4 @@ setInterval(
 </body>
 
 </html>`;
-      }
+}
