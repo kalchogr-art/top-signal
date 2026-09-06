@@ -18,7 +18,7 @@
 // - browser/Monkey logic is unchanged
 // ============================================================
 
-const VERSION = "V2.0.3 WINDOW.NAME HANDOFF";
+const VERSION = "V2.0.4 LIVE V27 STATE";
 const APP_NAME = "top-signal";
 const TIME_ZONE = "Europe/Sofia";
 
@@ -28,6 +28,8 @@ interface Env {
   DB: D1Database;
   TRACKER: Fetcher;
   MATCHER: Fetcher;
+  // Optional. If not bound, Worker falls back to the public V27 endpoint.
+  V27?: Fetcher;
 }
 
 let tablesReady: Promise<void> | null = null;
@@ -76,10 +78,12 @@ export default {
         daily_log: true,
         anti_overlap: true,
         timezone: TIME_ZONE,
+        live_state: "V27_CURRENT_MINUTE_SCORE",
         bindings: {
           DB: !!env.DB,
           TRACKER: !!env.TRACKER,
-          MATCHER: !!env.MATCHER
+          MATCHER: !!env.MATCHER,
+          V27: !!env.V27
         },
         polling: {
           targets_ms: 10000,
@@ -147,7 +151,9 @@ export default {
             tracker_signals: result.trackerSignals,
             matcher_hunter_results: result.matcherHunterResults,
             secure_targets: result.targets.length,
-            placed: result.targets.filter(x => x.betPlaced).length
+            placed: result.targets.filter(x => x.betPlaced).length,
+            live_feed_ok: result.liveFeedOk,
+            live_matches: result.liveMatches
           },
           timestamp: new Date().toISOString()
         });
@@ -173,6 +179,8 @@ export default {
           tracker_signals: result.trackerSignals,
           matcher_hunter_results: result.matcherHunterResults,
           placed: result.targets.filter(x => x.betPlaced).length,
+          live_feed_ok: result.liveFeedOk,
+          live_matches: result.liveMatches,
           targets: result.targets
         });
       } catch (error: any) {
@@ -298,7 +306,10 @@ export default {
         const eventId = safe(body?.eventId);
         const status = safe(body?.status).toUpperCase();
 
-        if (!eventId || status !== "PLACED") {
+        if (
+          !eventId ||
+          (status !== "PLACED" && status !== "BET_PLACED")
+        ) {
           return json({
             success: false,
             error: "INVALID_BET_STATUS_PAYLOAD"
@@ -496,10 +507,16 @@ async function buildTargets(env: Env) {
   const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
   const signals = extractHunterSignals(tracker);
 
+  // Current minute / result comes from the live V27 feed, not from ENTRY data.
+  // Failure of V27 must not erase the current dashboard targets.
+  const v27 = await fetchV27Snapshot(env);
+
   if (!signals.length) {
     return {
       trackerSignals: 0,
       matcherHunterResults: 0,
+      liveFeedOk: v27.ok,
+      liveMatches: v27.matches.length,
       targets: []
     };
   }
@@ -573,6 +590,22 @@ async function buildTargets(env: Env) {
     const matchId = safe(signal?.match_id ?? item?.match_id);
     const entryTime = safe(signal?.entry_time ?? signal?.created_at);
 
+    const live = findV27Match(
+      v27.matches,
+      matchId,
+      matchName
+    );
+
+    const liveState = normalizeV27LiveState(live);
+    const canAct =
+      !v27.ok
+        ? true
+        : (
+            liveState.found &&
+            liveState.firstHalf &&
+            liveState.zeroZero
+          );
+
     await saveTarget(env, {
       eventId,
       matchName,
@@ -608,7 +641,30 @@ async function buildTargets(env: Env) {
       betStatus: betRow?.status ?? null,
       betPlacedAt: betRow?.placed_at ?? null,
       betStake: numberOrNull(betRow?.stake),
-      betOdds: numberOrNull(betRow?.odds)
+      betOdds: numberOrNull(betRow?.odds),
+
+      // CURRENT V27 STATE
+      liveFeedOk: v27.ok,
+      liveFound: liveState.found,
+      liveMatchId: liveState.id,
+      liveMinute: liveState.minute,
+      liveMinuteDisplay: liveState.minuteDisplay,
+      livePeriod: liveState.period,
+      liveHomeScore: liveState.homeScore,
+      liveAwayScore: liveState.awayScore,
+      liveZeroZero: liveState.zeroZero,
+      liveFirstHalf: liveState.firstHalf,
+      canAct,
+      liveReason:
+        !v27.ok
+          ? "LIVE_FEED_UNAVAILABLE"
+          : !liveState.found
+            ? "MATCH_NOT_IN_V27_LIVE"
+            : !liveState.firstHalf
+              ? "NOT_FIRST_HALF"
+              : !liveState.zeroZero
+                ? "NOT_ZERO_ZERO"
+                : "LIVE_OK"
     });
   }
 
@@ -627,6 +683,8 @@ async function buildTargets(env: Env) {
   return {
     trackerSignals: signals.length,
     matcherHunterResults: hunterResults.length,
+    liveFeedOk: v27.ok,
+    liveMatches: v27.matches.length,
     targets
   };
 }
@@ -675,6 +733,253 @@ async function getBetStatus(env: Env, eventId: string): Promise<any> {
     WHERE event_id = ?1
     LIMIT 1
   `).bind(eventId).first();
+}
+
+
+
+// ============================================================
+// CURRENT V27 LIVE STATE
+// ============================================================
+
+const V27_PUBLIC_URL =
+  "https://goal-watch-proxy.kalchogr.workers.dev/";
+
+async function fetchV27Snapshot(
+  env: Env
+): Promise<{ ok: boolean; matches: Obj[]; error?: string }> {
+  try {
+    let data: any;
+
+    if (env.V27) {
+      const response = await env.V27.fetch(
+        new Request(
+          "https://v27.internal/",
+          {
+            method: "GET",
+            headers: {
+              "accept": "application/json",
+              "cache-control": "no-store"
+            }
+          }
+        )
+      );
+
+      const text = await response.text();
+
+      if (!response.ok) {
+        throw new Error(
+          "V27 BINDING HTTP " +
+          response.status +
+          ": " +
+          text.slice(0, 300)
+        );
+      }
+
+      data = JSON.parse(text);
+    } else {
+      const response = await fetch(
+        V27_PUBLIC_URL +
+        "?top_signal_live=" +
+        Date.now(),
+        {
+          method: "GET",
+          headers: {
+            "accept": "application/json",
+            "cache-control": "no-store"
+          }
+        }
+      );
+
+      const text = await response.text();
+
+      if (!response.ok) {
+        throw new Error(
+          "V27 PUBLIC HTTP " +
+          response.status +
+          ": " +
+          text.slice(0, 300)
+        );
+      }
+
+      data = JSON.parse(text);
+    }
+
+    const matches =
+      Array.isArray(data?.matches)
+        ? data.matches
+        : Array.isArray(data?.feed?.matches)
+          ? data.feed.matches
+          : Array.isArray(data?.data?.matches)
+            ? data.data.matches
+            : [];
+
+    return {
+      ok: true,
+      matches: matches.filter(
+        (x: any) =>
+          x &&
+          typeof x === "object"
+      )
+    };
+  } catch (error: any) {
+    console.warn(
+      "V27 LIVE STATE ERROR",
+      error
+    );
+
+    return {
+      ok: false,
+      matches: [],
+      error:
+        error?.message ??
+        String(error)
+    };
+  }
+}
+
+
+function findV27Match(
+  matches: Obj[],
+  matchId: string,
+  matchName: string
+): Obj | null {
+  if (!matches.length) {
+    return null;
+  }
+
+  const id = safe(matchId);
+
+  if (id) {
+    const exact = matches.find(
+      m =>
+        safe(
+          m?.id ??
+          m?.match_id
+        ) === id
+    );
+
+    if (exact) {
+      return exact;
+    }
+  }
+
+  const wanted =
+    normalizeName(matchName);
+
+  if (!wanted) {
+    return null;
+  }
+
+  const exactName =
+    matches.find(
+      m =>
+        normalizeName(
+          m?.match ??
+          m?.match_name ??
+          (
+            safe(m?.home?.name ?? m?.home) +
+            " - " +
+            safe(m?.away?.name ?? m?.away)
+          )
+        ) === wanted
+    );
+
+  return exactName ?? null;
+}
+
+
+function normalizeV27LiveState(
+  m: Obj | null
+) {
+  if (!m) {
+    return {
+      found: false,
+      id: null,
+      minute: null,
+      minuteDisplay: null,
+      period: null,
+      homeScore: null,
+      awayScore: null,
+      zeroZero: false,
+      firstHalf: false
+    };
+  }
+
+  const score =
+    m?.score &&
+    typeof m.score === "object"
+      ? m.score
+      : {};
+
+  const minute =
+    numberOrNull(
+      m?.minute
+    );
+
+  const minuteDisplay =
+    safe(
+      m?.minute_display ??
+      m?.minuteDisplay
+    ) || (
+      minute !== null
+        ? String(minute) + "'"
+        : null
+    );
+
+  const period =
+    safe(
+      m?.period ??
+      m?.statusShort ??
+      m?.phase
+    );
+
+  const homeScore =
+    numberOrNull(
+      score?.home ??
+      m?.home_score ??
+      m?.score_home
+    );
+
+  const awayScore =
+    numberOrNull(
+      score?.away ??
+      m?.away_score ??
+      m?.score_away
+    );
+
+  const zeroZero =
+    homeScore === 0 &&
+    awayScore === 0;
+
+  const p =
+    period
+      .toUpperCase()
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const firstHalf =
+    p === "1H" ||
+    p === "FIRST" ||
+    p === "FIRST HALF" ||
+    p === "1ST HALF" ||
+    p.includes("1H");
+
+  return {
+    found: true,
+    id:
+      safe(
+        m?.id ??
+        m?.match_id
+      ) || null,
+    minute,
+    minuteDisplay,
+    period:
+      period || null,
+    homeScore,
+    awayScore,
+    zeroZero,
+    firstHalf
+  };
 }
 
 
@@ -1469,6 +1774,64 @@ body{
   color:#adb5c2;
   font-size:9px
 }
+.liveLine{
+  margin-top:7px;
+  display:grid;
+  grid-template-columns:auto auto 1fr;
+  gap:6px;
+  align-items:center;
+  padding:7px 8px;
+  background:#0f141c;
+  border:1px solid #283241;
+  border-radius:8px;
+  font-size:10px;
+  font-weight:900
+}
+.liveLine.ok{
+  border-color:#166534;
+  background:#0c1711
+}
+.liveLine.bad{
+  border-color:#7f1d1d;
+  background:#1d1010
+}
+.liveLine.unknown{
+  border-color:#854d0e;
+  background:#1c160b
+}
+.liveMinute{color:#67e8f9}
+.liveScore{
+  font-size:16px;
+  color:#fff
+}
+.livePeriod{
+  color:#9ca3af;
+  text-align:right
+}
+.invalidBanner{
+  margin-top:6px;
+  padding:5px 7px;
+  border-radius:6px;
+  background:#450a0a;
+  color:#fecaca;
+  font-size:8px;
+  font-weight:900;
+  text-align:center
+}
+.unknownBanner{
+  margin-top:6px;
+  padding:5px 7px;
+  border-radius:6px;
+  background:#422006;
+  color:#fde68a;
+  font-size:8px;
+  font-weight:900;
+  text-align:center
+}
+.btn[disabled]{
+  cursor:not-allowed;
+  opacity:.48
+}
 .marketLine{
   margin-top:7px;
   display:flex;
@@ -1598,7 +1961,7 @@ body{
 
 <div class="title">⚡ TOP SIGNAL MANUAL</div>
 <div class="subtitle">
-V2.0.3 WINDOW.NAME HANDOFF · TRACKER → MATCHER
+V2.0.4 LIVE V27 STATE · TRACKER → MATCHER → V27 LIVE
 </div>
 
 <div class="summary">
@@ -1708,13 +2071,72 @@ function card(t){
   const ready=odds!==null;
   const placed=t?.betPlaced===true;
 
+  const liveFeedOk=t?.liveFeedOk===true;
+  const liveFound=t?.liveFound===true;
+  const liveValid=t?.canAct===true;
+
+  const liveMinute=
+    t?.liveMinuteDisplay||
+    (
+      num(t?.liveMinute)!==null
+        ? String(num(t?.liveMinute))+"'"
+        : '—'
+    );
+
+  const liveScore=
+    num(t?.liveHomeScore)!==null&&
+    num(t?.liveAwayScore)!==null
+      ? String(num(t?.liveHomeScore))+':'+String(num(t?.liveAwayScore))
+      : '—';
+
+  const livePeriod=
+    String(t?.livePeriod??'—');
+
+  let liveClass='unknown';
+  let liveBanner='';
+
+  if(liveFeedOk&&liveFound){
+    if(liveValid){
+      liveClass='ok';
+    }else{
+      liveClass='bad';
+      liveBanner=
+        '<div class="invalidBanner">'+
+        '❌ ВЕЧЕ НЕ Е 1H 0:0 · CHECK/BET LOCKED'+
+        '</div>';
+    }
+  }else if(liveFeedOk&&!liveFound){
+    liveClass='bad';
+    liveBanner=
+      '<div class="invalidBanner">'+
+      '❌ МАЧЪТ НЕ Е В ТЕКУЩИЯ V27 LIVE FEED · LOCKED'+
+      '</div>';
+  }else{
+    liveBanner=
+      '<div class="unknownBanner">'+
+      '⚠ LIVE DATA TEMPORARILY UNAVAILABLE · ENTRY DATA ONLY'+
+      '</div>';
+  }
+
+  const actionLocked=
+    liveFeedOk&&!liveValid;
+
   return (
     '<div class="card '+(placed?'placed':'')+'">'+
     (placed?'<div class="placedBanner">✅ ЗАЛОЖЕНО</div>':'')+
     '<div class="match">⚽ '+esc(t?.matchName||'Hunter target')+'</div>'+
     '<div class="event">Event '+esc(t?.eventId||'')+'</div>'+
+
+    '<div class="liveLine '+liveClass+'">'+
+      '<span class="liveMinute">⏱ '+esc(liveMinute)+'</span>'+
+      '<span class="liveScore">⚽ '+esc(liveScore)+'</span>'+
+      '<span class="livePeriod">'+esc(livePeriod)+'</span>'+
+    '</div>'+
+
+    liveBanner+
+
     '<div class="meta">'+
-      '<span>⏱ '+esc(t?.minute??'—')+"'</span>"+
+      '<span>ENTRY '+esc(t?.minute??'—')+"'</span>"+
       '<span>🎯 Hunter '+esc(t?.hunterScore??'—')+'</span>'+
     '</div>'+
     '<div class="marketLine">'+
@@ -1727,10 +2149,13 @@ function card(t){
       '</div>'+
     '</div>'+
     '<div class="actions">'+
-      '<button class="btn check" data-action="check" data-id="'+esc(t?.eventId)+'">CHECK</button>'+
+      '<button class="btn check" data-action="check" data-id="'+esc(t?.eventId)+'" '+
+        (actionLocked?'disabled':'')+'>'+
+        (actionLocked?'CHECK LOCKED':'CHECK')+
+      '</button>'+
       '<button class="btn bet" data-action="bet" data-id="'+esc(t?.eventId)+'" '+
-        ((placed||!ready)?'disabled':'')+'>'+
-        (placed?'✅ ЗАЛОЖЕНО':'BET NOW')+
+        ((placed||!ready||actionLocked)?'disabled':'')+'>'+
+        (placed?'✅ ЗАЛОЖЕНО':actionLocked?'BET LOCKED':'BET NOW')+
       '</button>'+
     '</div>'+
     '</div>'
@@ -1838,6 +2263,8 @@ async function refreshTargets(){
     'Tracker '+(d.tracker_signals??0)+
     ' · Matcher '+(d.matcher_hunter_results??0)+
     ' · Secure '+latestTargets.length+
+    ' · V27 '+(d.live_feed_ok?'LIVE ✅':'ERROR ⚠')+
+    ' · live matches '+(d.live_matches??'—')+
     ' · targets 10s · daily 30s';
 
   document.getElementById('list').innerHTML=
@@ -1967,14 +2394,17 @@ document.addEventListener('click',e=>{
   if(!target)return;
 
   if(action==='check'){
-    go(target,'check');
+    if(!b.disabled&&target?.canAct!==false){
+      go(target,'check');
+    }
     return;
   }
 
   if(
     action==='bet'&&
     !b.disabled&&
-    !target?.betPlaced
+    !target?.betPlaced&&
+    target?.canAct!==false
   ){
     go(target,'bet');
   }
