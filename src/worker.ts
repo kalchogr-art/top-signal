@@ -1,3 +1,5 @@
+import { debugBetsafe } from "./odds/betsafe";
+
 // ============================================================
 // TOP SIGNAL V2.0.1 — DAILY LOG + ANTI-OVERLAP
 //
@@ -64,6 +66,33 @@ export default {
         version: VERSION,
         error: "DB_INIT_FAILED: " + (error?.message ?? String(error))
       }, 500);
+    }
+
+    // ========================================================
+    // DEBUG BETSAFE — READ ONLY
+    // ========================================================
+
+    if (
+      url.pathname === "/api/debug/betsafe" &&
+      request.method === "GET"
+    ) {
+      try {
+        const result = await debugBetsafe();
+
+        return json(
+          result,
+          result?.success === false ? 502 : 200
+        );
+
+      } catch (error: any) {
+        return json({
+          success: false,
+          source: "BETSAFE",
+          error:
+            error?.message ??
+            String(error)
+        }, 500);
+      }
     }
 
     // STATUS
@@ -507,8 +536,6 @@ async function buildTargets(env: Env) {
   const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
   const signals = extractHunterSignals(tracker);
 
-  // Current minute / result comes from the live V27 feed, not from ENTRY data.
-  // Failure of V27 must not erase the current dashboard targets.
   const v27 = await fetchV27Snapshot(env);
 
   if (!signals.length) {
@@ -597,6 +624,7 @@ async function buildTargets(env: Env) {
     );
 
     const liveState = normalizeV27LiveState(live);
+
     const canAct =
       !v27.ok
         ? true
@@ -643,7 +671,6 @@ async function buildTargets(env: Env) {
       betStake: numberOrNull(betRow?.stake),
       betOdds: numberOrNull(betRow?.odds),
 
-      // CURRENT V27 STATE
       liveFeedOk: v27.ok,
       liveFound: liveState.found,
       liveMatchId: liveState.id,
@@ -655,6 +682,7 @@ async function buildTargets(env: Env) {
       liveZeroZero: liveState.zeroZero,
       liveFirstHalf: liveState.firstHalf,
       canAct,
+
       liveReason:
         !v27.ok
           ? "LIVE_FEED_UNAVAILABLE"
@@ -734,7 +762,6 @@ async function getBetStatus(env: Env, eventId: string): Promise<any> {
     LIMIT 1
   `).bind(eventId).first();
 }
-
 
 
 // ============================================================
@@ -999,8 +1026,6 @@ async function callMatcher(env: Env, signals: Obj[]) {
     };
   }
 
-  // Important matcher compatibility:
-  // do not pass signal: "HUNTER_ENTRY" as a nested signal object.
   const cleanSignals = signals.map(s => {
     const copy: Obj = { ...s };
 
@@ -1331,22 +1356,34 @@ async function syncDailyFromTrackerData(env: Env, tracker: any) {
   if (!records.length) return;
 
   const today = sofiaDate();
+
   const rows = await env.DB.prepare(`
     SELECT event_id, signal_id, match_id, match_name
     FROM daily_matches
     WHERE day_key = ?1
   `).bind(today).all();
 
-  const daily = Array.isArray(rows?.results) ? rows.results : [];
+  const daily =
+    Array.isArray(rows?.results)
+      ? rows.results
+      : [];
 
   for (const row of daily) {
-    const record = findTrackerRecordForDaily(row, records);
+    const record =
+      findTrackerRecordForDaily(
+        row,
+        records
+      );
+
     if (!record) continue;
 
-    const normalized = normalizeTrackerResult(record);
+    const normalized =
+      normalizeTrackerResult(record);
+
     if (!normalized) continue;
 
-    const now = new Date().toISOString();
+    const now =
+      new Date().toISOString();
 
     await env.DB.prepare(`
       UPDATE daily_matches
@@ -1429,26 +1466,49 @@ function extractTrackerRecords(data: any): Obj[] {
 }
 
 
-function findTrackerRecordForDaily(row: any, records: Obj[]): Obj | null {
-  const signalId = safe(row?.signal_id);
-  const matchId = safe(row?.match_id);
-  const matchName = normalizeName(row?.match_name);
+function findTrackerRecordForDaily(
+  row: any,
+  records: Obj[]
+): Obj | null {
+  const signalId =
+    safe(row?.signal_id);
+
+  const matchId =
+    safe(row?.match_id);
+
+  const matchName =
+    normalizeName(row?.match_name);
 
   let best: Obj | null = null;
 
   for (const r of records) {
-    if (signalId && safe(r?.id) === signalId) {
+    if (
+      signalId &&
+      safe(r?.id) === signalId
+    ) {
       return r;
     }
 
-    if (matchId && safe(r?.match_id) === matchId) {
+    if (
+      matchId &&
+      safe(r?.match_id) === matchId
+    ) {
       best = r;
       continue;
     }
 
-    const rName = normalizeName(r?.match_name ?? r?.match);
+    const rName =
+      normalizeName(
+        r?.match_name ??
+        r?.match
+      );
 
-    if (!best && matchName && rName && matchName === rName) {
+    if (
+      !best &&
+      matchName &&
+      rName &&
+      matchName === rName
+    ) {
       best = r;
     }
   }
@@ -1458,12 +1518,24 @@ function findTrackerRecordForDaily(row: any, records: Obj[]): Obj | null {
 
 
 function normalizeTrackerResult(record: Obj) {
-  const status = safe(record?.status).toUpperCase();
-  const result = safe(record?.result).toUpperCase();
-  const action = safe(record?.action).toUpperCase();
-  const type = safe(record?.type).toUpperCase();
+  const status =
+    safe(record?.status).toUpperCase();
 
-  const text = [status, result, action, type]
+  const result =
+    safe(record?.result).toUpperCase();
+
+  const action =
+    safe(record?.action).toUpperCase();
+
+  const type =
+    safe(record?.type).toUpperCase();
+
+  const text = [
+    status,
+    result,
+    action,
+    type
+  ]
     .join(" ")
     .replace(/_/g, " ");
 
@@ -1472,9 +1544,12 @@ function normalizeTrackerResult(record: Obj) {
     text.includes("NO-GOAL")
   ) {
     return {
-      trackerStatus: status || "FINISHED",
-      trackerResult: result || "NO GOAL",
-      resultStatus: "LOSS"
+      trackerStatus:
+        status || "FINISHED",
+      trackerResult:
+        result || "NO GOAL",
+      resultStatus:
+        "LOSS"
     };
   }
 
@@ -1483,9 +1558,12 @@ function normalizeTrackerResult(record: Obj) {
     /\bGOAL\b/.test(text)
   ) {
     return {
-      trackerStatus: status || "FINISHED",
-      trackerResult: result || "GOAL HIT",
-      resultStatus: "WIN"
+      trackerStatus:
+        status || "FINISHED",
+      trackerResult:
+        result || "GOAL HIT",
+      resultStatus:
+        "WIN"
     };
   }
 
@@ -1495,9 +1573,12 @@ function normalizeTrackerResult(record: Obj) {
     text.includes("PENDING")
   ) {
     return {
-      trackerStatus: status || "TRACKING",
-      trackerResult: result || "PENDING",
-      resultStatus: "PENDING"
+      trackerStatus:
+        status || "TRACKING",
+      trackerResult:
+        result || "PENDING",
+      resultStatus:
+        "PENDING"
     };
   }
 
@@ -1506,14 +1587,17 @@ function normalizeTrackerResult(record: Obj) {
 
 
 async function getDailyMatches(env: Env): Promise<Obj[]> {
-  const result = await env.DB.prepare(`
-    SELECT *
-    FROM daily_matches
-    WHERE day_key = ?1
-    ORDER BY
-      COALESCE(entry_time, first_seen_at) DESC,
-      first_seen_at DESC
-  `).bind(sofiaDate()).all();
+  const result =
+    await env.DB.prepare(`
+      SELECT *
+      FROM daily_matches
+      WHERE day_key = ?1
+      ORDER BY
+        COALESCE(entry_time, first_seen_at) DESC,
+        first_seen_at DESC
+    `)
+    .bind(sofiaDate())
+    .all();
 
   return Array.isArray(result?.results)
     ? result.results as Obj[]
@@ -1522,33 +1606,52 @@ async function getDailyMatches(env: Env): Promise<Obj[]> {
 
 
 function buildDailySummary(matches: Obj[]) {
-  const today = matches.length;
-  const placedRows = matches.filter(
-    x => safe(x?.bet_status).toUpperCase() === "PLACED"
-  );
+  const today =
+    matches.length;
 
-  const wins = placedRows.filter(
-    x => safe(x?.result_status).toUpperCase() === "WIN"
-  ).length;
+  const placedRows =
+    matches.filter(
+      x =>
+        safe(x?.bet_status)
+          .toUpperCase() === "PLACED"
+    );
 
-  const losses = placedRows.filter(
-    x => safe(x?.result_status).toUpperCase() === "LOSS"
-  ).length;
+  const wins =
+    placedRows.filter(
+      x =>
+        safe(x?.result_status)
+          .toUpperCase() === "WIN"
+    ).length;
 
-  const settled = wins + losses;
+  const losses =
+    placedRows.filter(
+      x =>
+        safe(x?.result_status)
+          .toUpperCase() === "LOSS"
+    ).length;
+
+  const settled =
+    wins + losses;
 
   return {
     today,
     placed: placedRows.length,
     wins,
     losses,
-    notPlaced: today - placedRows.length,
-    pending: placedRows.filter(
-      x => safe(x?.result_status).toUpperCase() === "PENDING"
-    ).length,
-    successRate: settled > 0
-      ? (wins / settled) * 100
-      : null
+    notPlaced:
+      today - placedRows.length,
+
+    pending:
+      placedRows.filter(
+        x =>
+          safe(x?.result_status)
+            .toUpperCase() === "PENDING"
+      ).length,
+
+    successRate:
+      settled > 0
+        ? (wins / settled) * 100
+        : null
   };
 }
 
@@ -1561,24 +1664,29 @@ async function fetchServiceJSON(
   service: Fetcher,
   path: string
 ): Promise<any> {
-  const response = await service.fetch(
-    new Request(
-      "https://internal" + path,
-      {
-        method: "GET",
-        headers: {
-          "accept": "application/json",
-          "cache-control": "no-store"
+  const response =
+    await service.fetch(
+      new Request(
+        "https://internal" + path,
+        {
+          method: "GET",
+          headers: {
+            "accept": "application/json",
+            "cache-control": "no-store"
+          }
         }
-      }
-    )
-  );
+      )
+    );
 
-  const text = await response.text();
+  const text =
+    await response.text();
 
   if (!response.ok) {
     throw new Error(
-      "HTTP " + response.status + ": " + text.slice(0, 500)
+      "HTTP " +
+      response.status +
+      ": " +
+      text.slice(0, 500)
     );
   }
 
@@ -1586,7 +1694,8 @@ async function fetchServiceJSON(
     return JSON.parse(text);
   } catch {
     throw new Error(
-      "INVALID_JSON: " + text.slice(0, 500)
+      "INVALID_JSON: " +
+      text.slice(0, 500)
     );
   }
 }
@@ -1597,15 +1706,22 @@ async function fetchServiceJSON(
 // ============================================================
 
 function sofiaDate(value?: string): string {
-  const date = value ? new Date(value) : new Date();
+  const date =
+    value
+      ? new Date(value)
+      : new Date();
 
   try {
-    const parts = new Intl.DateTimeFormat("en-CA", {
-      timeZone: TIME_ZONE,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit"
-    }).formatToParts(date);
+    const parts =
+      new Intl.DateTimeFormat(
+        "en-CA",
+        {
+          timeZone: TIME_ZONE,
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit"
+        }
+      ).formatToParts(date);
 
     const map: Obj = {};
 
@@ -1617,7 +1733,9 @@ function sofiaDate(value?: string): string {
 
     return `${map.year}-${map.month}-${map.day}`;
   } catch {
-    return date.toISOString().slice(0, 10);
+    return date
+      .toISOString()
+      .slice(0, 10);
   }
 }
 
@@ -1634,18 +1752,31 @@ function normalizeName(value: any): string {
 
 
 function safe(value: any): string {
-  if (value === null || value === undefined) return "";
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
   return String(value).trim();
 }
 
 
 function numberOrNull(value: any): number | null {
-  if (value === null || value === undefined || value === "") {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
     return null;
   }
 
   const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+
+  return Number.isFinite(n)
+    ? n
+    : null;
 }
 
 
@@ -1658,14 +1789,25 @@ function corsHeaders() {
 }
 
 
-function json(data: any, status = 200): Response {
+function json(
+  data: any,
+  status = 200
+): Response {
   return new Response(
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     {
       status,
       headers: {
-        "content-type": "application/json; charset=UTF-8",
-        "cache-control": "no-store",
+        "content-type":
+          "application/json; charset=UTF-8",
+
+        "cache-control":
+          "no-store",
+
         ...corsHeaders()
       }
     }
@@ -2412,7 +2554,7 @@ document.addEventListener('click',e=>{
 
 
 // ==========================================================
-// START — NO MASTER Promise.all(), NO 3s OVERLAP
+// START
 // ==========================================================
 
 safeRefreshTargets();
@@ -2431,4 +2573,4 @@ setInterval(
 </script>
 </body>
 </html>`;
-}
+      }
