@@ -612,7 +612,7 @@ export async function debugCloudbet(): Promise<any> {
         ),
 
 
-      useful_scripts,
+      useful_scripts: usefulScripts,
 
 
       timing_ms:
@@ -1838,4 +1838,4 @@ async function fetchText(
 
   }
 
-}
+      }
