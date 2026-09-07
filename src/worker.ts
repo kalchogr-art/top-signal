@@ -1,4 +1,5 @@
 import { debugBetsafe } from "./odds/betsafe";
+import { debugCloudbet } from "./odds/cloudbet";
 
 // ============================================================
 // TOP SIGNAL V2.0.1 — DAILY LOG + ANTI-OVERLAP
@@ -88,6 +89,33 @@ export default {
         return json({
           success: false,
           source: "BETSAFE",
+          error:
+            error?.message ??
+            String(error)
+        }, 500);
+      }
+    }
+
+    // ========================================================
+    // DEBUG CLOUDBET — READ ONLY
+    // ========================================================
+
+    if (
+      url.pathname === "/api/debug/cloudbet" &&
+      request.method === "GET"
+    ) {
+      try {
+        const result = await debugCloudbet();
+
+        return json(
+          result,
+          result?.success === false ? 502 : 200
+        );
+
+      } catch (error: any) {
+        return json({
+          success: false,
+          source: "CLOUDBET",
           error:
             error?.message ??
             String(error)
@@ -2573,4 +2601,4 @@ setInterval(
 </script>
 </body>
 </html>`;
-      }
+  }
