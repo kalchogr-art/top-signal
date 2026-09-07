@@ -1,32 +1,41 @@
 // ============================================================
-// TOP SIGNAL — CLOUDBET DIAGNOSTIC V2
+// TOP SIGNAL — CLOUDBET DIAGNOSTIC V3
 // FILE: src/odds/cloudbet.ts
 //
-// READ ONLY
+// READ ONLY — TARGETED SPORTS API DISCOVERY
 //
-// PURPOSE:
-// - inspect public Cloudbet frontend
-// - discover sportsbook API paths
-// - discover request construction
-// - inspect market-related frontend code
+// V3:
+// - targets Cloudbet sportsbook chunks only
+// - searches concrete sports-api request construction
+// - searches api.cloudbet.com
+// - searches event / market request builders
+// - searches exact 1H total goals market type
+// - DOES NOT call betting/place/order endpoints
 //
 // NO:
 // - login
-// - authorization
+// - auth token
 // - cookies
+// - POST
 // - bet placement
 // ============================================================
 
-const VERSION = "V2";
+const VERSION = "V3";
 const MODE = "READ_ONLY_DIAGNOSTIC";
 
-const TARGET_PAGES = [
+const CLOUDBET =
+  "https://www.cloudbet.com";
+
+const PAGES = [
   "https://www.cloudbet.com/en/sports/live",
   "https://www.cloudbet.com/en/sports/soccer"
 ];
 
-const MAX_SCRIPTS = 40;
-const FETCH_TIMEOUT_MS = 8000;
+const MAX_SCRIPTS = 65;
+const TIMEOUT_MS = 8000;
+
+const TARGET_MARKET =
+  "soccer_total_goals_period_first_half";
 
 
 // ============================================================
@@ -40,21 +49,25 @@ export async function debugCloudbet(): Promise<any> {
   try {
 
     // ========================================================
-    // 1. FETCH PUBLIC CLOUDBET PAGES
+    // 1. LOAD CLOUDBET SPORTS PAGES
     // ========================================================
 
     const pages: any[] = [];
 
+    const allScripts =
+      new Set<string>();
+
     let bestHtml = "";
     let bestPage = "";
 
-    for (const pageUrl of TARGET_PAGES) {
+
+    for (const page of PAGES) {
 
       const result =
-        await fetchText(pageUrl);
+        await fetchText(page);
 
       pages.push({
-        url: pageUrl,
+        url: page,
         final_url: result.finalUrl,
         status: result.status,
         ok: result.ok,
@@ -63,13 +76,41 @@ export async function debugCloudbet(): Promise<any> {
         error: result.error || null
       });
 
+
       if (
         result.ok &&
-        result.text.length > bestHtml.length
+        result.text.length >
+          bestHtml.length
       ) {
-        bestHtml = result.text;
-        bestPage = result.finalUrl;
+
+        bestHtml =
+          result.text;
+
+        bestPage =
+          result.finalUrl;
+
       }
+
+
+      if (result.ok) {
+
+        const scripts =
+          extractScripts(
+            result.text,
+            result.finalUrl
+          );
+
+        for (
+          const script
+          of scripts
+        ) {
+          allScripts.add(
+            script
+          );
+        }
+
+      }
+
     }
 
 
@@ -80,258 +121,283 @@ export async function debugCloudbet(): Promise<any> {
         source: "CLOUDBET",
         diagnostic_version: VERSION,
         mode: MODE,
-        error: "NO_PUBLIC_PAGE_AVAILABLE",
+        error: "NO_CLOUDBET_HTML",
         pages,
-        timing_ms: Date.now() - started
+        timing_ms:
+          Date.now() - started
       };
+
     }
 
 
     // ========================================================
-    // 2. DISCOVER NEXT.JS SCRIPTS
+    // 2. PRIORITIZE CHUNKS
     // ========================================================
 
-    const discoveredScripts =
-      extractScriptUrls(
-        bestHtml,
-        bestPage
-      );
-
-    const scriptsToCheck =
-      prioritizeScripts(
-        discoveredScripts
-      ).slice(0, MAX_SCRIPTS);
-
-
-    // ========================================================
-    // 3. ANALYZE HTML
-    // ========================================================
-
-    const htmlAnalysis =
-      analyzeSource(
-        bestHtml,
-        bestPage
-      );
+    const scripts =
+      [...allScripts]
+        .sort(
+          (a, b) =>
+            scriptScore(b) -
+            scriptScore(a)
+        )
+        .slice(
+          0,
+          MAX_SCRIPTS
+        );
 
 
     // ========================================================
-    // 4. ANALYZE JS CHUNKS
+    // 3. TARGET COLLECTION
     // ========================================================
 
     const usefulScripts: any[] = [];
 
-    const endpointMap =
+    const apiPaths =
       new Map<string, any>();
 
-    const requests: any[] = [];
+    const absoluteUrls =
+      new Map<string, any>();
 
-    const marketFindings: any[] = [];
+    const requestBuilders: any[] = [];
 
+    const apiContexts: any[] = [];
 
-    // Add endpoints found in HTML
+    const marketContexts: any[] = [];
 
-    for (
-      const endpoint
-      of htmlAnalysis.endpoints
-    ) {
-
-      addEndpoint(
-        endpointMap,
-        endpoint,
-        bestPage
-      );
-    }
+    const eventContexts: any[] = [];
 
 
     // ========================================================
-    // SCRIPT LOOP
+    // 4. ANALYZE HTML
+    // ========================================================
+
+    analyzeTargetSource(
+      bestHtml,
+      bestPage,
+      apiPaths,
+      absoluteUrls,
+      requestBuilders,
+      apiContexts,
+      marketContexts,
+      eventContexts
+    );
+
+
+    // ========================================================
+    // 5. ANALYZE JS
     // ========================================================
 
     for (
       const scriptUrl
-      of scriptsToCheck
+      of scripts
     ) {
 
-      const result =
+      const response =
         await fetchText(
           scriptUrl
         );
 
+
       if (
-        !result.ok ||
-        !result.text
+        !response.ok ||
+        !response.text
       ) {
         continue;
       }
 
 
-      const analysis =
-        analyzeSource(
-          result.text,
-          scriptUrl
+      const text =
+        response.text;
+
+      const lower =
+        text.toLowerCase();
+
+
+      const relevant =
+        lower.includes(
+          "/sports-api/"
+        ) ||
+
+        lower.includes(
+          "api.cloudbet.com"
+        ) ||
+
+        lower.includes(
+          TARGET_MARKET
+        ) ||
+
+        lower.includes(
+          "soccer_total_goals"
+        ) ||
+
+        (
+          lower.includes(
+            "eventid"
+          ) &&
+          lower.includes(
+            "market"
+          )
         );
 
 
-      const useful =
-        analysis.endpoints.length > 0 ||
-        analysis.requests.length > 0 ||
-        analysis.hints.sports_api ||
-        analysis.hints.sports_betting ||
-        analysis.hints.sports_data ||
-        analysis.hints.market ||
-        analysis.hints.odds ||
-        analysis.hints.total_goals ||
-        analysis.hints.first_half;
-
-
-      if (!useful) {
+      if (!relevant) {
         continue;
       }
 
 
-      // ======================================================
-      // STORE SCRIPT
-      // ======================================================
+      const before = {
+
+        paths:
+          apiPaths.size,
+
+        urls:
+          absoluteUrls.size,
+
+        requests:
+          requestBuilders.length,
+
+        apiContexts:
+          apiContexts.length,
+
+        marketContexts:
+          marketContexts.length,
+
+        eventContexts:
+          eventContexts.length
+
+      };
+
+
+      analyzeTargetSource(
+        text,
+        scriptUrl,
+        apiPaths,
+        absoluteUrls,
+        requestBuilders,
+        apiContexts,
+        marketContexts,
+        eventContexts
+      );
+
 
       usefulScripts.push({
 
-        url: scriptUrl,
-
-        status:
-          result.status,
+        url:
+          scriptUrl,
 
         content_length:
-          result.text.length,
+          text.length,
 
-        hints:
-          analysis.hints,
+        hints: {
 
-        endpoints:
-          analysis.endpoints.slice(
-            0,
-            50
-          ),
+          sports_api:
+            lower.includes(
+              "/sports-api/"
+            ),
 
-        requests:
-          analysis.requests.slice(
-            0,
-            30
-          ),
+          api_cloudbet:
+            lower.includes(
+              "api.cloudbet.com"
+            ),
 
-        contexts:
-          analysis.contexts.slice(
-            0,
-            20
-          )
+          event_id:
+            lower.includes(
+              "eventid"
+            ) ||
+            lower.includes(
+              "event_id"
+            ),
 
-      });
+          market:
+            lower.includes(
+              "market"
+            ),
 
+          selections:
+            lower.includes(
+              "selection"
+            ),
 
-      // ======================================================
-      // ENDPOINTS
-      // ======================================================
-
-      for (
-        const endpoint
-        of analysis.endpoints
-      ) {
-
-        addEndpoint(
-          endpointMap,
-          endpoint,
-          scriptUrl
-        );
-      }
-
-
-      // ======================================================
-      // REQUEST CANDIDATES
-      // ======================================================
-
-      for (
-        const request
-        of analysis.requests
-      ) {
-
-        requests.push({
-          ...request,
-          source: scriptUrl
-        });
-      }
-
-
-      // ======================================================
-      // MARKET FINDINGS
-      // ======================================================
-
-      if (
-        analysis.hints.total_goals ||
-        analysis.hints.first_half ||
-        analysis.hints.over_05 ||
-        analysis.hints.soccer_total_goals
-      ) {
-
-        marketFindings.push({
-
-          source:
-            scriptUrl,
+          exact_target_market:
+            lower.includes(
+              TARGET_MARKET
+            ),
 
           soccer_total_goals:
-            analysis.hints
-              .soccer_total_goals,
+            lower.includes(
+              "soccer_total_goals"
+            )
 
-          total_goals:
-            analysis.hints
-              .total_goals,
+        },
 
-          first_half:
-            analysis.hints
-              .first_half,
+        new_findings: {
 
-          over_05:
-            analysis.hints
-              .over_05,
+          api_paths:
+            apiPaths.size -
+            before.paths,
 
-          contexts:
-            analysis.contexts
-              .filter((x: any) =>
-                [
-                  "soccer.total_goals",
-                  "first_half",
-                  "first half",
-                  "total=0.5",
-                  "\"total\":0.5",
-                  "marketType",
-                  "marketUrl"
-                ].includes(
-                  x.needle
-                )
-              )
-              .slice(0, 15)
+          absolute_urls:
+            absoluteUrls.size -
+            before.urls,
 
-        });
+          request_builders:
+            requestBuilders.length -
+            before.requests,
 
-      }
+          api_contexts:
+            apiContexts.length -
+            before.apiContexts,
+
+          market_contexts:
+            marketContexts.length -
+            before.marketContexts,
+
+          event_contexts:
+            eventContexts.length -
+            before.eventContexts
+
+        }
+
+      });
 
     }
 
 
     // ========================================================
-    // 5. RANK ENDPOINTS
+    // 6. PREPARE PATHS
     // ========================================================
 
-    const endpoints =
-      Array.from(
-        endpointMap.values()
-      )
-        .map((endpoint: any) => ({
-          ...endpoint,
+    const discoveredPaths =
+      [...apiPaths.values()]
+        .map(
+          (x: any) => ({
+            ...x,
 
-          score:
-            endpointScore(
-              endpoint.path
-            )
-        }))
+            score:
+              scoreApiPath(
+                x.path
+              )
+          })
+        )
+        .sort(
+          (a: any, b: any) =>
+            b.score - a.score
+        );
+
+
+    const discoveredUrls =
+      [...absoluteUrls.values()]
+        .map(
+          (x: any) => ({
+            ...x,
+
+            score:
+              scoreAbsoluteUrl(
+                x.url
+              )
+          })
+        )
         .sort(
           (a: any, b: any) =>
             b.score - a.score
@@ -339,21 +405,29 @@ export async function debugCloudbet(): Promise<any> {
 
 
     // ========================================================
-    // 6. RANK REQUESTS
+    // 7. REQUEST BUILDERS
     // ========================================================
 
-    const requestCandidates =
-      dedupeRequests(
-        requests
+    const requests =
+      dedupeObjects(
+        requestBuilders,
+        item =>
+          [
+            item.type,
+            item.method,
+            item.context
+          ].join("|")
       )
-        .map((request: any) => ({
-          ...request,
+        .map(
+          (x: any) => ({
+            ...x,
 
-          score:
-            requestScore(
-              request
-            )
-        }))
+            score:
+              scoreRequest(
+                x
+              )
+          })
+        )
         .sort(
           (a: any, b: any) =>
             b.score - a.score
@@ -361,7 +435,7 @@ export async function debugCloudbet(): Promise<any> {
 
 
     // ========================================================
-    // 7. RESULT
+    // RESULT
     // ========================================================
 
     return {
@@ -378,52 +452,32 @@ export async function debugCloudbet(): Promise<any> {
         MODE,
 
 
-      summary: {
+      safety: {
 
-        public_page_reachable:
-          true,
+        http_methods_used_by_diagnostic: [
+          "GET"
+        ],
 
-        best_page:
-          bestPage,
+        login:
+          false,
 
-        scripts_discovered:
-          discoveredScripts.length,
+        auth:
+          false,
 
-        scripts_checked:
-          scriptsToCheck.length,
+        cookies:
+          false,
 
-        useful_scripts:
-          usefulScripts.length,
+        betting:
+          false,
 
-        endpoints_found:
-          endpoints.length,
+        place_endpoint_called:
+          false,
 
-        request_candidates:
-          requestCandidates.length,
+        orders_endpoint_called:
+          false,
 
-        sports_api_found:
-          endpoints.some(
-            (x: any) =>
-              x.path.includes(
-                "/sports-api/"
-              )
-          ),
-
-        sports_betting_found:
-          endpoints.some(
-            (x: any) =>
-              x.path.includes(
-                "/sports-betting/"
-              )
-          ),
-
-        sports_data_found:
-          endpoints.some(
-            (x: any) =>
-              x.path.includes(
-                "/sports-data/"
-              )
-          )
+        lines_endpoint_called:
+          false
 
       },
 
@@ -436,22 +490,65 @@ export async function debugCloudbet(): Promise<any> {
         period:
           "FIRST_HALF",
 
-        market:
-          "TOTAL_GOALS",
+        market_type:
+          TARGET_MARKET,
 
-        selection:
-          "OVER",
+        outcome:
+          "over",
 
-        line:
-          0.5,
+        params:
+          "total=0.5"
 
-        structures: [
+      },
 
-          "soccer.total_goals + period=1h + over + total=0.5",
 
-          "soccer.total_goals_period_first_half + over + total=0.5"
+      summary: {
 
-        ]
+        best_page:
+          bestPage,
+
+        scripts_discovered:
+          allScripts.size,
+
+        scripts_checked:
+          scripts.length,
+
+        useful_scripts:
+          usefulScripts.length,
+
+        api_paths_found:
+          discoveredPaths.length,
+
+        absolute_api_urls_found:
+          discoveredUrls.length,
+
+        request_builders_found:
+          requests.length,
+
+        exact_market_found:
+          marketContexts.some(
+            x =>
+              x.context
+                .toLowerCase()
+                .includes(
+                  TARGET_MARKET
+                )
+          ),
+
+        api_cloudbet_found:
+          discoveredUrls.some(
+            x =>
+              x.url.includes(
+                "api.cloudbet.com"
+              )
+          ) ||
+
+          apiContexts.some(
+            x =>
+              x.context.includes(
+                "api.cloudbet.com"
+              )
+          )
 
       },
 
@@ -459,54 +556,63 @@ export async function debugCloudbet(): Promise<any> {
       pages,
 
 
-      top_endpoints:
-        endpoints.slice(
+      // ======================================================
+      // MOST IMPORTANT OUTPUT
+      // ======================================================
+
+      discovered_api_paths:
+        discoveredPaths.slice(
           0,
           100
         ),
 
 
-      top_request_candidates:
-        requestCandidates.slice(
+      discovered_absolute_urls:
+        discoveredUrls.slice(
           0,
-          60
+          50
         ),
 
 
-      market_findings:
-        marketFindings.slice(
+      request_builders:
+        requests.slice(
           0,
-          30
+          80
         ),
 
 
-      html: {
+      // ======================================================
+      // RAW CONTEXTS
+      // ======================================================
 
-        content_length:
-          bestHtml.length,
-
-        hints:
-          htmlAnalysis.hints,
-
-        endpoints:
-          htmlAnalysis.endpoints
-            .slice(
-              0,
-              30
-            ),
-
-        contexts:
-          htmlAnalysis.contexts
-            .slice(
-              0,
-              20
-            )
-
-      },
+      api_contexts:
+        dedupeContexts(
+          apiContexts
+        ).slice(
+          0,
+          50
+        ),
 
 
-      useful_scripts:
-        usefulScripts,
+      market_contexts:
+        dedupeContexts(
+          marketContexts
+        ).slice(
+          0,
+          40
+        ),
+
+
+      event_contexts:
+        dedupeContexts(
+          eventContexts
+        ).slice(
+          0,
+          40
+        ),
+
+
+      useful_scripts,
 
 
       timing_ms:
@@ -516,7 +622,9 @@ export async function debugCloudbet(): Promise<any> {
     };
 
 
-  } catch (error: any) {
+  } catch (
+    error: any
+  ) {
 
     return {
 
@@ -547,357 +655,160 @@ export async function debugCloudbet(): Promise<any> {
 
 
 // ============================================================
-// SOURCE ANALYZER
+// TARGET SOURCE ANALYZER
 // ============================================================
 
-function analyzeSource(
+function analyzeTargetSource(
+
   source: string,
-  sourceUrl: string
+
+  sourceUrl: string,
+
+  apiPaths:
+    Map<string, any>,
+
+  absoluteUrls:
+    Map<string, any>,
+
+  requestBuilders:
+    any[],
+
+  apiContexts:
+    any[],
+
+  marketContexts:
+    any[],
+
+  eventContexts:
+    any[]
+
 ) {
 
-  const lower =
-    source.toLowerCase();
+  // ==========================================================
+  // API PATHS
+  // ==========================================================
 
-
-  const hints = {
-
-    cloudbet:
-      lower.includes(
-        "cloudbet"
-      ),
-
-    sportsbook:
-      lower.includes(
-        "sportsbook"
-      ),
-
-    sports_api:
-      lower.includes(
-        "/sports-api/"
-      ),
-
-    sports_betting:
-      lower.includes(
-        "/sports-betting/"
-      ),
-
-    sports_data:
-      lower.includes(
-        "/sports-data/"
-      ),
-
-    soccer:
-      lower.includes(
-        "soccer"
-      ),
-
-    live:
-      lower.includes(
-        "live"
-      ),
-
-    odds:
-      lower.includes(
-        "odds"
-      ),
-
-    market:
-      lower.includes(
-        "market"
-      ),
-
-    selection:
-      lower.includes(
-        "selection"
-      ),
-
-    event:
-      lower.includes(
-        "event"
-      ),
-
-    event_id:
-      lower.includes(
-        "eventid"
-      ) ||
-      lower.includes(
-        "event_id"
-      ),
-
-    first_half:
-      lower.includes(
-        "first_half"
-      ) ||
-      lower.includes(
-        "first half"
-      ),
-
-    total_goals:
-      lower.includes(
-        "total_goals"
-      ) ||
-      lower.includes(
-        "total goals"
-      ),
-
-    soccer_total_goals:
-      lower.includes(
-        "soccer.total_goals"
-      ),
-
-    over_05:
-      lower.includes(
-        "total=0.5"
-      ) ||
-      lower.includes(
-        "total%3d0.5"
-      ) ||
-      lower.includes(
-        "\"total\":0.5"
-      ) ||
-      lower.includes(
-        "total:0.5"
-      )
-
-  };
-
-
-  return {
-
-    source:
-      sourceUrl,
-
-    hints,
-
-    endpoints:
-      discoverEndpoints(
-        source
-      ),
-
-    requests:
-      discoverRequests(
-        source
-      ),
-
-    contexts:
-      extractContexts(
-        source,
-        [
-          "/sports-api/",
-          "/sports-betting/",
-          "/sports-data/",
-          "soccer.total_goals",
-          "marketType",
-          "marketUrl",
-          "eventId",
-          "event_id",
-          "first_half",
-          "first half",
-          "total=0.5",
-          "\"total\":0.5",
-          "selection",
-          "outcome"
-        ]
-      )
-
-  };
-
-}
-
-
-// ============================================================
-// ENDPOINT DISCOVERY
-// ============================================================
-
-function discoverEndpoints(
-  source: string
-) {
-
-  const found =
-    new Map<string, any>();
-
-
-  const patterns = [
-
-    /["'`](\/sports-api\/[^"'`\s\\]*)["'`]/gi,
-
-    /["'`](\/sports-betting\/[^"'`\s\\]*)["'`]/gi,
-
-    /["'`](\/sports-data\/[^"'`\s\\]*)["'`]/gi,
-
-    /["'`](\/sports-data-research\/[^"'`\s\\]*)["'`]/gi,
-
-    /["'`](\/sports-sharing\/[^"'`\s\\]*)["'`]/gi,
-
-    /["'`](\/sports-players\/[^"'`\s\\]*)["'`]/gi,
-
-    /["'`](\/api\/prod-proxy\/sports-api\/[^"'`\s\\]*)["'`]/gi,
-
-    /["'`](\/api\/prod-proxy\/sports-betting\/[^"'`\s\\]*)["'`]/gi
-
-  ];
-
-
-  for (
-    const pattern
-    of patterns
-  ) {
-
-    let match:
-      RegExpExecArray |
-      null;
-
-
-    while (
-      (
-        match =
-          pattern.exec(
-            source
-          )
-      ) !== null
-    ) {
-
-      const path =
-        cleanEndpoint(
-          match[1]
-        );
-
-
-      if (
-        !path ||
-        path.length > 300
-      ) {
-        continue;
-      }
-
-
-      if (
-        !found.has(
-          path
-        )
-      ) {
-
-        found.set(
-          path,
-          {
-
-            path,
-
-            category:
-              categorizeEndpoint(
-                path
-              )
-
-          }
-        );
-
-      }
-
-    }
-
-  }
+  discoverApiPaths(
+    source,
+    sourceUrl,
+    apiPaths
+  );
 
 
   // ==========================================================
-  // LOOSE PATH DISCOVERY
+  // ABSOLUTE URLS
   // ==========================================================
 
-  const loosePattern =
-    /\/(?:sports-api|sports-betting|sports-data|sports-data-research|sports-sharing|sports-players)\/[A-Za-z0-9_?=&%${}./:[\]-]{1,200}/g;
+  discoverAbsoluteUrls(
+    source,
+    sourceUrl,
+    absoluteUrls
+  );
 
 
-  const matches =
-    source.match(
-      loosePattern
-    ) || [];
+  // ==========================================================
+  // REQUEST CONSTRUCTION
+  // ==========================================================
+
+  discoverRequestBuilders(
+    source,
+    sourceUrl,
+    requestBuilders
+  );
 
 
-  for (
-    const raw
-    of matches
-  ) {
+  // ==========================================================
+  // API CONTEXT
+  // ==========================================================
 
-    const path =
-      cleanEndpoint(
-        raw
-      );
-
-
-    if (
-      !path ||
-      path.length > 300
-    ) {
-      continue;
-    }
+  pushContexts(
+    source,
+    sourceUrl,
+    [
+      "/sports-api/",
+      "api.cloudbet.com",
+      "api-staging.cloudbet.com",
+      "api-sandbox.cloudbet.com"
+    ],
+    apiContexts
+  );
 
 
-    if (
-      !found.has(
-        path
-      )
-    ) {
+  // ==========================================================
+  // MARKET CONTEXT
+  // ==========================================================
 
-      found.set(
-        path,
-        {
-
-          path,
-
-          category:
-            categorizeEndpoint(
-              path
-            )
-
-        }
-      );
-
-    }
-
-  }
+  pushContexts(
+    source,
+    sourceUrl,
+    [
+      TARGET_MARKET,
+      "soccer_total_goals",
+      "soccer.total_goals",
+      "marketType",
+      "submarketKey",
+      "selection.params",
+      ".outcome",
+      "total=0.5"
+    ],
+    marketContexts
+  );
 
 
-  return Array.from(
-    found.values()
+  // ==========================================================
+  // EVENT CONTEXT
+  // ==========================================================
+
+  pushContexts(
+    source,
+    sourceUrl,
+    [
+      "eventId",
+      "event_id",
+      "events",
+      "eventData",
+      "marketDefinitions"
+    ],
+    eventContexts
   );
 
 }
 
 
 // ============================================================
-// REQUEST DISCOVERY
+// API PATH DISCOVERY
 // ============================================================
 
-function discoverRequests(
-  source: string
+function discoverApiPaths(
+
+  source: string,
+
+  sourceUrl: string,
+
+  output:
+    Map<string, any>
+
 ) {
 
-  const results: any[] = [];
+  const patterns = [
 
+    /["'`](\/sports-api\/[^"'`\s\\]{0,300})["'`]/gi,
 
-  const methods = [
-    "get",
-    "post",
-    "put",
-    "patch",
-    "delete"
+    /["'`](\/sports-data\/[^"'`\s\\]{0,300})["'`]/gi,
+
+    /["'`](\/sports-betting\/[^"'`\s\\]{0,300})["'`]/gi,
+
+    /["'`](\/api\/prod-proxy\/sports-api\/[^"'`\s\\]{0,300})["'`]/gi,
+
+    /["'`](\/api\/prod-proxy\/sports-data\/[^"'`\s\\]{0,300})["'`]/gi
+
   ];
 
 
-  // ==========================================================
-  // CLIENT.GET / CLIENT.POST ETC
-  // ==========================================================
-
   for (
-    const method
-    of methods
+    const regex
+    of patterns
   ) {
-
-    const regex =
-      new RegExp(
-        `(?:client|axios|this\\.client|api|http|request)\\.${method}\\s*\\(`,
-        "gi"
-      );
-
 
     let match:
       RegExpExecArray |
@@ -913,46 +824,249 @@ function discoverRequests(
       ) !== null
     ) {
 
-      const position =
+      const path =
+        cleanString(
+          match[1]
+        );
+
+
+      addUnique(
+        output,
+        path,
+        {
+          path,
+          source:
+            sourceUrl
+        }
+      );
+
+    }
+
+  }
+
+
+  // ==========================================================
+  // LOOSE SPORTS API PATHS
+  // ==========================================================
+
+  const loose =
+    source.match(
+      /\/sports-api\/[A-Za-z0-9_?=&%${}./:[\]-]{1,250}/g
+    ) || [];
+
+
+  for (
+    const raw
+    of loose
+  ) {
+
+    const path =
+      cleanString(
+        raw
+      );
+
+
+    addUnique(
+      output,
+      path,
+      {
+        path,
+        source:
+          sourceUrl
+      }
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// ABSOLUTE URL DISCOVERY
+// ============================================================
+
+function discoverAbsoluteUrls(
+
+  source: string,
+
+  sourceUrl: string,
+
+  output:
+    Map<string, any>
+
+) {
+
+  const regex =
+    /https?:\/\/(?:api\.cloudbet\.com|api-staging\.cloudbet\.com|api-sandbox\.cloudbet\.com|www\.cloudbet\.com)[^"'`\s\\]{0,400}/gi;
+
+
+  const matches =
+    source.match(
+      regex
+    ) || [];
+
+
+  for (
+    const raw
+    of matches
+  ) {
+
+    const url =
+      cleanString(
+        raw
+      );
+
+
+    addUnique(
+      output,
+      url,
+      {
+        url,
+        source:
+          sourceUrl
+      }
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// REQUEST BUILDERS
+// ============================================================
+
+function discoverRequestBuilders(
+
+  source: string,
+
+  sourceUrl: string,
+
+  output: any[]
+
+) {
+
+  const patterns = [
+
+    {
+      type:
+        "FETCH",
+
+      regex:
+        /\bfetch\s*\(/gi
+    },
+
+    {
+      type:
+        "CLIENT_GET",
+
+      regex:
+        /\.get\s*\(/gi
+    },
+
+    {
+      type:
+        "REQUEST_FUNCTION",
+
+      regex:
+        /\bQ\s*\(/g
+    }
+
+  ];
+
+
+  for (
+    const item
+    of patterns
+  ) {
+
+    let match:
+      RegExpExecArray |
+      null;
+
+
+    while (
+      (
+        match =
+          item.regex.exec(
+            source
+          )
+      ) !== null
+    ) {
+
+      const index =
         match.index;
 
 
-      const context =
+      const raw =
         source.substring(
 
           Math.max(
             0,
-            position - 300
+            index - 600
           ),
 
           Math.min(
             source.length,
-            position + 1200
+            index + 1800
           )
 
         );
 
 
+      const lower =
+        raw.toLowerCase();
+
+
       if (
-        !isSportsRelated(
-          context
+        !lower.includes(
+          "sports"
+        ) &&
+
+        !lower.includes(
+          "event"
+        ) &&
+
+        !lower.includes(
+          "market"
+        ) &&
+
+        !lower.includes(
+          "api.cloudbet.com"
         )
       ) {
         continue;
       }
 
 
-      results.push({
+      // Diagnostic only records likely GET/read code.
+      // Explicit POST/PUT/PATCH/DELETE builders are ignored.
+
+      if (
+        containsWriteMethod(
+          raw
+        )
+      ) {
+        continue;
+      }
+
+
+      output.push({
 
         type:
-          "HTTP_CLIENT",
+          item.type,
 
         method:
-          method.toUpperCase(),
+          detectMethod(
+            raw
+          ),
+
+        source:
+          sourceUrl,
 
         context:
-          sanitizeContext(
-            context
+          sanitize(
+            raw
           )
 
       });
@@ -961,103 +1075,27 @@ function discoverRequests(
 
   }
 
-
-  // ==========================================================
-  // FETCH()
-  // ==========================================================
-
-  const fetchRegex =
-    /\bfetch\s*\(/gi;
-
-
-  let fetchMatch:
-    RegExpExecArray |
-    null;
-
-
-  while (
-    (
-      fetchMatch =
-        fetchRegex.exec(
-          source
-        )
-    ) !== null
-  ) {
-
-    const position =
-      fetchMatch.index;
-
-
-    const context =
-      source.substring(
-
-        Math.max(
-          0,
-          position - 300
-        ),
-
-        Math.min(
-          source.length,
-          position + 1400
-        )
-
-      );
-
-
-    if (
-      !isSportsRelated(
-        context
-      )
-    ) {
-      continue;
-    }
-
-
-    const methodMatch =
-      context.match(
-        /method\s*:\s*["'`](GET|POST|PUT|PATCH|DELETE)["'`]/i
-      );
-
-
-    results.push({
-
-      type:
-        "FETCH",
-
-      method:
-        methodMatch
-          ? methodMatch[1]
-              .toUpperCase()
-          : "UNKNOWN",
-
-      context:
-        sanitizeContext(
-          context
-        )
-
-    });
-
-  }
-
-
-  return results;
-
 }
 
 
 // ============================================================
-// CONTEXT EXTRACTION
+// CONTEXT COLLECTION
 // ============================================================
 
-function extractContexts(
+function pushContexts(
+
   source: string,
-  needles: string[]
+
+  sourceUrl: string,
+
+  needles: string[],
+
+  output: any[]
+
 ) {
 
   const lower =
     source.toLowerCase();
-
-  const results: any[] = [];
 
 
   for (
@@ -1065,21 +1103,21 @@ function extractContexts(
     of needles
   ) {
 
-    const search =
+    const target =
       needle.toLowerCase();
 
-    let position = 0;
-    let count = 0;
+    let start = 0;
+    let hits = 0;
 
 
     while (
-      count < 5
+      hits < 10
     ) {
 
       const index =
         lower.indexOf(
-          search,
-          position
+          target,
+          start
         );
 
 
@@ -1090,56 +1128,60 @@ function extractContexts(
       }
 
 
-      results.push({
+      const context =
+        source.substring(
+
+          Math.max(
+            0,
+            index - 700
+          ),
+
+          Math.min(
+            source.length,
+            index + 1400
+          )
+
+        );
+
+
+      output.push({
 
         needle,
 
+        source:
+          sourceUrl,
+
         context:
-          sanitizeContext(
-            source.substring(
-
-              Math.max(
-                0,
-                index - 400
-              ),
-
-              Math.min(
-                source.length,
-                index + 800
-              )
-
-            )
+          sanitize(
+            context
           )
 
       });
 
 
-      position =
-        index +
-        search.length;
+      hits++;
 
-      count++;
+      start =
+        index +
+        target.length;
 
     }
 
   }
 
-
-  return results;
-
 }
 
 
 // ============================================================
-// SCRIPT DISCOVERY
+// SCRIPT EXTRACTION
 // ============================================================
 
-function extractScriptUrls(
+function extractScripts(
   html: string,
   pageUrl: string
 ) {
 
-  const scripts =
+  const output =
     new Set<string>();
 
 
@@ -1163,7 +1205,7 @@ function extractScriptUrls(
 
     try {
 
-      scripts.add(
+      output.add(
         new URL(
           match[1],
           pageUrl
@@ -1175,32 +1217,18 @@ function extractScriptUrls(
   }
 
 
-  return Array.from(
-    scripts
-  );
+  return [
+    ...output
+  ];
 
 }
 
 
 // ============================================================
-// SCRIPT PRIORITY
+// SCRIPT SCORE
 // ============================================================
 
-function prioritizeScripts(
-  scripts: string[]
-) {
-
-  return [...scripts]
-    .sort(
-      (a, b) =>
-        scriptPriority(b) -
-        scriptPriority(a)
-    );
-
-}
-
-
-function scriptPriority(
+function scriptScore(
   url: string
 ) {
 
@@ -1212,28 +1240,19 @@ function scriptPriority(
 
   if (
     lower.includes(
-      "/chunks/"
+      "/pages/_app"
     )
   ) {
-    score += 5;
+    score += 100;
   }
 
 
   if (
     lower.includes(
-      "/pages/"
+      "/pages/sports/"
     )
   ) {
-    score += 5;
-  }
-
-
-  if (
-    lower.includes(
-      "_app"
-    )
-  ) {
-    score += 20;
+    score += 100;
   }
 
 
@@ -1248,10 +1267,10 @@ function scriptPriority(
 
   if (
     lower.includes(
-      "main-"
+      "/chunks/"
     )
   ) {
-    score += 10;
+    score += 20;
   }
 
 
@@ -1261,65 +1280,10 @@ function scriptPriority(
 
 
 // ============================================================
-// ENDPOINT MAP
+// PATH SCORE
 // ============================================================
 
-function addEndpoint(
-  map: Map<string, any>,
-  endpoint: any,
-  source: string
-) {
-
-  const key =
-    endpoint.path;
-
-
-  if (
-    !map.has(
-      key
-    )
-  ) {
-
-    map.set(
-      key,
-      {
-        ...endpoint,
-        sources: [
-          source
-        ]
-      }
-    );
-
-    return;
-  }
-
-
-  const existing =
-    map.get(
-      key
-    );
-
-
-  if (
-    !existing.sources.includes(
-      source
-    )
-  ) {
-
-    existing.sources.push(
-      source
-    );
-
-  }
-
-}
-
-
-// ============================================================
-// ENDPOINT SCORE
-// ============================================================
-
-function endpointScore(
+function scoreApiPath(
   path: string
 ) {
 
@@ -1340,10 +1304,97 @@ function endpointScore(
 
   if (
     lower.includes(
-      "/sports-betting/"
+      "event"
     )
   ) {
-    score += 90;
+    score += 60;
+  }
+
+
+  if (
+    lower.includes(
+      "market"
+    )
+  ) {
+    score += 60;
+  }
+
+
+  if (
+    lower.includes(
+      "odds"
+    )
+  ) {
+    score += 50;
+  }
+
+
+  if (
+    lower.includes(
+      "live"
+    )
+  ) {
+    score += 40;
+  }
+
+
+  if (
+    lower.includes(
+      "soccer"
+    )
+  ) {
+    score += 30;
+  }
+
+
+  // Betting write paths should rank last.
+
+  if (
+    lower.includes(
+      "/place"
+    ) ||
+    lower.includes(
+      "/orders"
+    )
+  ) {
+    score -= 200;
+  }
+
+
+  return score;
+
+}
+
+
+// ============================================================
+// URL SCORE
+// ============================================================
+
+function scoreAbsoluteUrl(
+  url: string
+) {
+
+  const lower =
+    url.toLowerCase();
+
+  let score = 0;
+
+
+  if (
+    lower.includes(
+      "api.cloudbet.com"
+    )
+  ) {
+    score += 100;
+  }
+
+
+  if (
+    lower.includes(
+      "sports-api"
+    )
+  ) {
+    score += 100;
   }
 
 
@@ -1362,33 +1413,6 @@ function endpointScore(
     )
   ) {
     score += 40;
-  }
-
-
-  if (
-    lower.includes(
-      "odds"
-    )
-  ) {
-    score += 35;
-  }
-
-
-  if (
-    lower.includes(
-      "live"
-    )
-  ) {
-    score += 25;
-  }
-
-
-  if (
-    lower.includes(
-      "soccer"
-    )
-  ) {
-    score += 20;
   }
 
 
@@ -1401,14 +1425,13 @@ function endpointScore(
 // REQUEST SCORE
 // ============================================================
 
-function requestScore(
-  candidate: any
+function scoreRequest(
+  request: any
 ) {
 
-  const text =
+  const lower =
     String(
-      candidate.context ||
-      ""
+      request.context || ""
     ).toLowerCase();
 
 
@@ -1416,7 +1439,7 @@ function requestScore(
 
 
   if (
-    text.includes(
+    lower.includes(
       "/sports-api/"
     )
   ) {
@@ -1425,56 +1448,41 @@ function requestScore(
 
 
   if (
-    text.includes(
-      "/sports-betting/"
+    lower.includes(
+      "api.cloudbet.com"
     )
   ) {
-    score += 90;
+    score += 80;
   }
 
 
   if (
-    text.includes(
+    lower.includes(
+      "eventid"
+    ) ||
+    lower.includes(
+      "event_id"
+    )
+  ) {
+    score += 60;
+  }
+
+
+  if (
+    lower.includes(
       "market"
     )
   ) {
-    score += 35;
+    score += 50;
   }
 
 
   if (
-    text.includes(
-      "event"
+    lower.includes(
+      TARGET_MARKET
     )
   ) {
-    score += 30;
-  }
-
-
-  if (
-    text.includes(
-      "odds"
-    )
-  ) {
-    score += 30;
-  }
-
-
-  if (
-    text.includes(
-      "selection"
-    )
-  ) {
-    score += 20;
-  }
-
-
-  if (
-    text.includes(
-      "soccer"
-    )
-  ) {
-    score += 15;
+    score += 100;
   }
 
 
@@ -1484,11 +1492,116 @@ function requestScore(
 
 
 // ============================================================
-// REQUEST DEDUPE
+// METHOD DETECTION
 // ============================================================
 
-function dedupeRequests(
-  requests: any[]
+function detectMethod(
+  text: string
+) {
+
+  const match =
+    text.match(
+      /method\s*:\s*["'`](GET|POST|PUT|PATCH|DELETE)["'`]/i
+    );
+
+
+  if (
+    match
+  ) {
+
+    return match[1]
+      .toUpperCase();
+
+  }
+
+
+  if (
+    /\.get\s*\(/i.test(
+      text
+    )
+  ) {
+
+    return "GET";
+
+  }
+
+
+  return "UNKNOWN";
+
+}
+
+
+// ============================================================
+// WRITE FILTER
+// ============================================================
+
+function containsWriteMethod(
+  text: string
+) {
+
+  return (
+    /method\s*:\s*["'`](POST|PUT|PATCH|DELETE)["'`]/i
+      .test(
+        text
+      )
+  );
+
+}
+
+
+// ============================================================
+// UNIQUE MAP
+// ============================================================
+
+function addUnique(
+
+  map:
+    Map<string, any>,
+
+  key:
+    string,
+
+  value:
+    any
+
+) {
+
+  if (
+    !key ||
+    key.length > 500
+  ) {
+    return;
+  }
+
+
+  if (
+    !map.has(
+      key
+    )
+  ) {
+
+    map.set(
+      key,
+      value
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// DEDUPE
+// ============================================================
+
+function dedupeObjects(
+
+  items: any[],
+
+  keyFn:
+    (item: any) =>
+      string
+
 ) {
 
   const map =
@@ -1496,22 +1609,14 @@ function dedupeRequests(
 
 
   for (
-    const request
-    of requests
+    const item
+    of items
   ) {
 
     const key =
-      [
-        request.type,
-        request.method,
-        String(
-          request.context ||
-          ""
-        ).slice(
-          0,
-          400
-        )
-      ].join("|");
+      keyFn(
+        item
+      );
 
 
     if (
@@ -1522,7 +1627,7 @@ function dedupeRequests(
 
       map.set(
         key,
-        request
+        item
       );
 
     }
@@ -1530,169 +1635,95 @@ function dedupeRequests(
   }
 
 
-  return Array.from(
-    map.values()
+  return [
+    ...map.values()
+  ];
+
+}
+
+
+function dedupeContexts(
+  items: any[]
+) {
+
+  return dedupeObjects(
+    items,
+    item =>
+      [
+        item.needle,
+        item.source,
+        String(
+          item.context
+        ).slice(
+          0,
+          600
+        )
+      ].join("|")
   );
 
 }
 
 
 // ============================================================
-// CATEGORY
+// CLEAN STRING
 // ============================================================
 
-function categorizeEndpoint(
-  path: string
-) {
-
-  if (
-    path.includes(
-      "/sports-api/"
-    )
-  ) {
-    return "SPORTS_API";
-  }
-
-
-  if (
-    path.includes(
-      "/sports-betting/"
-    )
-  ) {
-    return "SPORTS_BETTING";
-  }
-
-
-  if (
-    path.includes(
-      "/sports-data-research/"
-    )
-  ) {
-    return "SPORTS_DATA_RESEARCH";
-  }
-
-
-  if (
-    path.includes(
-      "/sports-data/"
-    )
-  ) {
-    return "SPORTS_DATA";
-  }
-
-
-  if (
-    path.includes(
-      "/sports-sharing/"
-    )
-  ) {
-    return "SPORTS_SHARING";
-  }
-
-
-  if (
-    path.includes(
-      "/sports-players/"
-    )
-  ) {
-    return "SPORTS_PLAYERS";
-  }
-
-
-  return "UNKNOWN";
-
-}
-
-
-// ============================================================
-// SPORTS RELATED
-// ============================================================
-
-function isSportsRelated(
+function cleanString(
   text: string
 ) {
 
-  const lower =
-    text.toLowerCase();
+  return text
 
-
-  return (
-    lower.includes(
-      "/sports-api/"
-    ) ||
-    lower.includes(
-      "/sports-betting/"
-    ) ||
-    lower.includes(
-      "/sports-data/"
-    ) ||
-    lower.includes(
-      "sportsbook"
-    ) ||
-    lower.includes(
-      "market"
-    ) ||
-    lower.includes(
-      "odds"
-    )
-  );
-
-}
-
-
-// ============================================================
-// CLEAN ENDPOINT
-// ============================================================
-
-function cleanEndpoint(
-  value: string
-) {
-
-  return value
     .replace(
       /\\u002F/gi,
       "/"
     )
+
     .replace(
       /\\\//g,
       "/"
     )
+
     .replace(
       /\\x2f/gi,
       "/"
     )
+
     .replace(
       /[),;\]}]+$/g,
       ""
     )
+
     .trim();
 
 }
 
 
 // ============================================================
-// CONTEXT CLEANUP
+// SANITIZE CONTEXT
 // ============================================================
 
-function sanitizeContext(
+function sanitize(
   text: string
 ) {
 
   return text
+
     .replace(
       /\s+/g,
       " "
     )
+
     .slice(
       0,
-      1800
+      2600
     );
 
 }
 
 
 // ============================================================
-// FETCH
+// HTTP GET
 // ============================================================
 
 async function fetchText(
@@ -1710,11 +1741,11 @@ async function fetchText(
     new AbortController();
 
 
-  const timer =
+  const timeout =
     setTimeout(
       () =>
         controller.abort(),
-      FETCH_TIMEOUT_MS
+      TIMEOUT_MS
     );
 
 
@@ -1737,7 +1768,7 @@ async function fetchText(
           headers: {
 
             "User-Agent":
-              "Mozilla/5.0 (compatible; TopSignalCloudbetDiagnostic/2.0)",
+              "Mozilla/5.0 (compatible; TopSignalCloudbetDiagnostic/3.0)",
 
             "Accept":
               "text/html,application/javascript,text/javascript,*/*"
@@ -1774,7 +1805,9 @@ async function fetchText(
     };
 
 
-  } catch (error: any) {
+  } catch (
+    error: any
+  ) {
 
     return {
 
@@ -1788,8 +1821,7 @@ async function fetchText(
       contentType:
         "",
 
-      text:
-        "",
+      text: "",
 
       error:
         error?.message ||
@@ -1801,9 +1833,9 @@ async function fetchText(
   } finally {
 
     clearTimeout(
-      timer
+      timeout
     );
 
   }
 
-          }
+}
