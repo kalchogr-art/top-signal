@@ -1,41 +1,51 @@
 // ============================================================
-// TOP SIGNAL — CLOUDBET DIAGNOSTIC V3
+// TOP SIGNAL — CLOUDBET V4
 // FILE: src/odds/cloudbet.ts
 //
-// READ ONLY — TARGETED SPORTS API DISCOVERY
+// READ ONLY — REAL LIVE EVENT GET TEST
 //
-// V3:
-// - targets Cloudbet sportsbook chunks only
-// - searches concrete sports-api request construction
-// - searches api.cloudbet.com
-// - searches event / market request builders
-// - searches exact 1H total goals market type
-// - DOES NOT call betting/place/order endpoints
+// TARGET:
+// Soccer
+// Live
+// First Half Total Goals
+// Over 0.5
 //
 // NO:
 // - login
-// - auth token
+// - auth
 // - cookies
 // - POST
-// - bet placement
+// - orders
+// - place bet
 // ============================================================
 
-const VERSION = "V3";
-const MODE = "READ_ONLY_DIAGNOSTIC";
+const VERSION = "V4";
+const MODE = "READ_ONLY_REAL_GET";
 
-const CLOUDBET =
+const HOST =
   "https://www.cloudbet.com";
 
-const PAGES = [
-  "https://www.cloudbet.com/en/sports/live",
-  "https://www.cloudbet.com/en/sports/soccer"
+const BASES = [
+  "/sports-api/c/v6/sports",
+  "/sports-api/v6/sports"
 ];
 
-const MAX_SCRIPTS = 65;
-const TIMEOUT_MS = 8000;
+const TARGET_MARKETS = [
+  "soccer.total_goals_period_first_half",
+  "soccer_total_goals_period_first_half"
+];
 
-const TARGET_MARKET =
-  "soccer_total_goals_period_first_half";
+const TARGET_OUTCOME =
+  "over";
+
+const TARGET_TOTAL =
+  0.5;
+
+const FETCH_TIMEOUT_MS =
+  8000;
+
+const MAX_EVENT_DETAILS =
+  6;
 
 
 // ============================================================
@@ -44,69 +54,120 @@ const TARGET_MARKET =
 
 export async function debugCloudbet(): Promise<any> {
 
-  const started = Date.now();
+  const started =
+    Date.now();
 
   try {
 
     // ========================================================
-    // 1. LOAD CLOUDBET SPORTS PAGES
+    // 1. GET LIVE SOCCER EVENTS
     // ========================================================
 
-    const pages: any[] = [];
+    const listAttempts: any[] = [];
 
-    const allScripts =
-      new Set<string>();
+    let listData: any = null;
 
-    let bestHtml = "";
-    let bestPage = "";
+    let listBase: string | null =
+      null;
 
-
-    for (const page of PAGES) {
-
-      const result =
-        await fetchText(page);
-
-      pages.push({
-        url: page,
-        final_url: result.finalUrl,
-        status: result.status,
-        ok: result.ok,
-        content_type: result.contentType,
-        content_length: result.text.length,
-        error: result.error || null
-      });
+    let listMarket: string | null =
+      null;
 
 
-      if (
-        result.ok &&
-        result.text.length >
-          bestHtml.length
+    // ========================================================
+    // TRY BOTH MARKET KEY FORMATS
+    // ========================================================
+
+    outer:
+
+    for (
+      const base
+      of BASES
+    ) {
+
+      for (
+        const market
+        of TARGET_MARKETS
       ) {
 
-        bestHtml =
-          result.text;
+        const url =
+          buildUrl(
+            base + "/events",
+            {
+              sports:
+                "soccer",
 
-        bestPage =
-          result.finalUrl;
+              markets:
+                market,
 
-      }
+              live:
+                "true",
 
+              limit:
+                "100",
 
-      if (result.ok) {
-
-        const scripts =
-          extractScripts(
-            result.text,
-            result.finalUrl
+              locale:
+                "en"
+            }
           );
 
-        for (
-          const script
-          of scripts
+
+        const response =
+          await getJson(
+            url
+          );
+
+
+        listAttempts.push({
+
+          base,
+
+          market,
+
+          url,
+
+          status:
+            response.status,
+
+          ok:
+            response.ok,
+
+          content_type:
+            response.contentType,
+
+          body_type:
+            typeOfBody(
+              response.data
+            ),
+
+          body_preview:
+            preview(
+              response.data
+            ),
+
+          error:
+            response.error ||
+            null
+
+        });
+
+
+        if (
+          response.ok &&
+          response.data
         ) {
-          allScripts.add(
-            script
-          );
+
+          listData =
+            response.data;
+
+          listBase =
+            base;
+
+          listMarket =
+            market;
+
+          break outer;
+
         }
 
       }
@@ -114,250 +175,189 @@ export async function debugCloudbet(): Promise<any> {
     }
 
 
-    if (!bestHtml) {
+    // ========================================================
+    // 2. FALLBACK WITHOUT MARKET FILTER
+    // ========================================================
+
+    if (!listData) {
+
+      for (
+        const base
+        of BASES
+      ) {
+
+        const url =
+          buildUrl(
+            base + "/events",
+            {
+              sports:
+                "soccer",
+
+              live:
+                "true",
+
+              limit:
+                "100",
+
+              locale:
+                "en"
+            }
+          );
+
+
+        const response =
+          await getJson(
+            url
+          );
+
+
+        listAttempts.push({
+
+          base,
+
+          market:
+            null,
+
+          fallback:
+            "NO_MARKET_FILTER",
+
+          url,
+
+          status:
+            response.status,
+
+          ok:
+            response.ok,
+
+          content_type:
+            response.contentType,
+
+          body_type:
+            typeOfBody(
+              response.data
+            ),
+
+          body_preview:
+            preview(
+              response.data
+            ),
+
+          error:
+            response.error ||
+            null
+
+        });
+
+
+        if (
+          response.ok &&
+          response.data
+        ) {
+
+          listData =
+            response.data;
+
+          listBase =
+            base;
+
+          break;
+
+        }
+
+      }
+
+    }
+
+
+    // ========================================================
+    // NO API RESPONSE
+    // ========================================================
+
+    if (!listData) {
 
       return {
+
         success: false,
-        source: "CLOUDBET",
-        diagnostic_version: VERSION,
-        mode: MODE,
-        error: "NO_CLOUDBET_HTML",
-        pages,
+
+        source:
+          "CLOUDBET",
+
+        diagnostic_version:
+          VERSION,
+
+        mode:
+          MODE,
+
+        stage:
+          "LIVE_EVENTS_GET",
+
+        error:
+          "NO_SUCCESSFUL_LIVE_EVENTS_RESPONSE",
+
+        list_attempts:
+          listAttempts,
+
         timing_ms:
-          Date.now() - started
+          Date.now() -
+          started
+
       };
 
     }
 
 
     // ========================================================
-    // 2. PRIORITIZE CHUNKS
+    // 3. EXTRACT EVENTS RECURSIVELY
     // ========================================================
 
-    const scripts =
-      [...allScripts]
-        .sort(
-          (a, b) =>
-            scriptScore(b) -
-            scriptScore(a)
-        )
-        .slice(
-          0,
-          MAX_SCRIPTS
-        );
-
-
-    // ========================================================
-    // 3. TARGET COLLECTION
-    // ========================================================
-
-    const usefulScripts: any[] = [];
-
-    const apiPaths =
-      new Map<string, any>();
-
-    const absoluteUrls =
-      new Map<string, any>();
-
-    const requestBuilders: any[] = [];
-
-    const apiContexts: any[] = [];
-
-    const marketContexts: any[] = [];
-
-    const eventContexts: any[] = [];
-
-
-    // ========================================================
-    // 4. ANALYZE HTML
-    // ========================================================
-
-    analyzeTargetSource(
-      bestHtml,
-      bestPage,
-      apiPaths,
-      absoluteUrls,
-      requestBuilders,
-      apiContexts,
-      marketContexts,
-      eventContexts
-    );
-
-
-    // ========================================================
-    // 5. ANALYZE JS
-    // ========================================================
-
-    for (
-      const scriptUrl
-      of scripts
-    ) {
-
-      const response =
-        await fetchText(
-          scriptUrl
-        );
-
-
-      if (
-        !response.ok ||
-        !response.text
-      ) {
-        continue;
-      }
-
-
-      const text =
-        response.text;
-
-      const lower =
-        text.toLowerCase();
-
-
-      const relevant =
-        lower.includes(
-          "/sports-api/"
-        ) ||
-
-        lower.includes(
-          "api.cloudbet.com"
-        ) ||
-
-        lower.includes(
-          TARGET_MARKET
-        ) ||
-
-        lower.includes(
-          "soccer_total_goals"
-        ) ||
-
-        (
-          lower.includes(
-            "eventid"
-          ) &&
-          lower.includes(
-            "market"
-          )
-        );
-
-
-      if (!relevant) {
-        continue;
-      }
-
-
-      const before = {
-
-        paths:
-          apiPaths.size,
-
-        urls:
-          absoluteUrls.size,
-
-        requests:
-          requestBuilders.length,
-
-        apiContexts:
-          apiContexts.length,
-
-        marketContexts:
-          marketContexts.length,
-
-        eventContexts:
-          eventContexts.length
-
-      };
-
-
-      analyzeTargetSource(
-        text,
-        scriptUrl,
-        apiPaths,
-        absoluteUrls,
-        requestBuilders,
-        apiContexts,
-        marketContexts,
-        eventContexts
+    const events =
+      collectEvents(
+        listData
       );
 
 
-      usefulScripts.push({
+    // ========================================================
+    // 4. CHECK WHETHER LIST ALREADY CONTAINS TARGET ODDS
+    // ========================================================
 
-        url:
-          scriptUrl,
+    const listMatches: any[] =
+      [];
 
-        content_length:
-          text.length,
 
-        hints: {
+    for (
+      const event
+      of events
+    ) {
 
-          sports_api:
-            lower.includes(
-              "/sports-api/"
-            ),
+      const targets =
+        findTargetSelections(
+          event.raw
+        );
 
-          api_cloudbet:
-            lower.includes(
-              "api.cloudbet.com"
-            ),
 
-          event_id:
-            lower.includes(
-              "eventid"
-            ) ||
-            lower.includes(
-              "event_id"
-            ),
+      if (
+        targets.length === 0
+      ) {
+        continue;
+      }
 
-          market:
-            lower.includes(
-              "market"
-            ),
 
-          selections:
-            lower.includes(
-              "selection"
-            ),
+      listMatches.push({
 
-          exact_target_market:
-            lower.includes(
-              TARGET_MARKET
-            ),
+        event_id:
+          event.id,
 
-          soccer_total_goals:
-            lower.includes(
-              "soccer_total_goals"
-            )
+        name:
+          event.name,
 
-        },
+        status:
+          event.status,
 
-        new_findings: {
-
-          api_paths:
-            apiPaths.size -
-            before.paths,
-
-          absolute_urls:
-            absoluteUrls.size -
-            before.urls,
-
-          request_builders:
-            requestBuilders.length -
-            before.requests,
-
-          api_contexts:
-            apiContexts.length -
-            before.apiContexts,
-
-          market_contexts:
-            marketContexts.length -
-            before.marketContexts,
-
-          event_contexts:
-            eventContexts.length -
-            before.eventContexts
-
-        }
+        selections:
+          targets.slice(
+            0,
+            10
+          )
 
       });
 
@@ -365,73 +365,186 @@ export async function debugCloudbet(): Promise<any> {
 
 
     // ========================================================
-    // 6. PREPARE PATHS
+    // 5. FETCH EVENT DETAILS
+    //
+    // If list endpoint doesn't expose enough market depth,
+    // request individual events.
     // ========================================================
 
-    const discoveredPaths =
-      [...apiPaths.values()]
-        .map(
-          (x: any) => ({
-            ...x,
+    const detailAttempts: any[] =
+      [];
 
-            score:
-              scoreApiPath(
-                x.path
+    const detailMatches: any[] =
+      [];
+
+
+    const eventsToCheck =
+      events.slice(
+        0,
+        MAX_EVENT_DETAILS
+      );
+
+
+    for (
+      const event
+      of eventsToCheck
+    ) {
+
+      if (!event.id) {
+        continue;
+      }
+
+
+      let eventFound =
+        false;
+
+
+      // ======================================================
+      // TRY BOTH KNOWN MARKET FORMATS
+      // ======================================================
+
+      for (
+        const market
+        of TARGET_MARKETS
+      ) {
+
+        const base =
+          listBase ||
+          BASES[0];
+
+
+        const url =
+          buildUrl(
+            base +
+              "/events/" +
+              encodeURIComponent(
+                event.id
+              ),
+            {
+              entities:
+                "all",
+
+              locale:
+                "en",
+
+              markets:
+                market
+            }
+          );
+
+
+        const response =
+          await getJson(
+            url
+          );
+
+
+        const selections =
+          response.ok
+            ? findTargetSelections(
+                response.data
               )
-          })
-        )
-        .sort(
-          (a: any, b: any) =>
-            b.score - a.score
-        );
+            : [];
 
 
-    const discoveredUrls =
-      [...absoluteUrls.values()]
-        .map(
-          (x: any) => ({
-            ...x,
+        detailAttempts.push({
 
-            score:
-              scoreAbsoluteUrl(
-                x.url
+          event_id:
+            event.id,
+
+          event_name:
+            event.name,
+
+          market,
+
+          url,
+
+          status:
+            response.status,
+
+          ok:
+            response.ok,
+
+          selections_found:
+            selections.length,
+
+          body_preview:
+            preview(
+              response.data
+            ),
+
+          error:
+            response.error ||
+            null
+
+        });
+
+
+        if (
+          selections.length > 0
+        ) {
+
+          detailMatches.push({
+
+            event_id:
+              event.id,
+
+            event_name:
+              event.name,
+
+            requested_market:
+              market,
+
+            selections:
+              selections.slice(
+                0,
+                20
               )
-          })
-        )
-        .sort(
-          (a: any, b: any) =>
-            b.score - a.score
-        );
+
+          });
+
+
+          eventFound =
+            true;
+
+          break;
+
+        }
+
+      }
+
+
+      if (eventFound) {
+        continue;
+      }
+
+    }
 
 
     // ========================================================
-    // 7. REQUEST BUILDERS
+    // 6. COMBINE FOUND ODDS
     // ========================================================
 
-    const requests =
-      dedupeObjects(
-        requestBuilders,
-        item =>
-          [
-            item.type,
-            item.method,
-            item.context
-          ].join("|")
-      )
-        .map(
-          (x: any) => ({
-            ...x,
+    const oddsCandidates =
+      [
+        ...listMatches.map(
+          x => ({
+            source:
+              "LIVE_EVENTS_LIST",
 
-            score:
-              scoreRequest(
-                x
-              )
+            ...x
+          })
+        ),
+
+        ...detailMatches.map(
+          x => ({
+            source:
+              "EVENT_DETAIL",
+
+            ...x
           })
         )
-        .sort(
-          (a: any, b: any) =>
-            b.score - a.score
-        );
+      ];
 
 
     // ========================================================
@@ -454,7 +567,7 @@ export async function debugCloudbet(): Promise<any> {
 
       safety: {
 
-        http_methods_used_by_diagnostic: [
+        methods: [
           "GET"
         ],
 
@@ -470,13 +583,10 @@ export async function debugCloudbet(): Promise<any> {
         betting:
           false,
 
-        place_endpoint_called:
+        orders:
           false,
 
-        orders_endpoint_called:
-          false,
-
-        lines_endpoint_called:
+        place_bet:
           false
 
       },
@@ -485,134 +595,121 @@ export async function debugCloudbet(): Promise<any> {
       target: {
 
         sport:
-          "SOCCER",
+          "soccer",
 
-        period:
-          "FIRST_HALF",
+        live:
+          true,
 
-        market_type:
-          TARGET_MARKET,
+        market_candidates:
+          TARGET_MARKETS,
 
         outcome:
-          "over",
+          TARGET_OUTCOME,
 
-        params:
-          "total=0.5"
+        total:
+          TARGET_TOTAL
+
+      },
+
+
+      api: {
+
+        selected_base:
+          listBase,
+
+        selected_market:
+          listMarket,
+
+        endpoint:
+          listBase
+            ? listBase +
+              "/events"
+            : null
 
       },
 
 
       summary: {
 
-        best_page:
-          bestPage,
+        live_api_success:
+          true,
 
-        scripts_discovered:
-          allScripts.size,
+        live_events_found:
+          events.length,
 
-        scripts_checked:
-          scripts.length,
+        list_target_matches:
+          listMatches.length,
 
-        useful_scripts:
-          usefulScripts.length,
+        event_details_checked:
+          eventsToCheck.length,
 
-        api_paths_found:
-          discoveredPaths.length,
+        detail_target_matches:
+          detailMatches.length,
 
-        absolute_api_urls_found:
-          discoveredUrls.length,
+        total_odds_candidates:
+          oddsCandidates.length,
 
-        request_builders_found:
-          requests.length,
-
-        exact_market_found:
-          marketContexts.some(
-            x =>
-              x.context
-                .toLowerCase()
-                .includes(
-                  TARGET_MARKET
-                )
-          ),
-
-        api_cloudbet_found:
-          discoveredUrls.some(
-            x =>
-              x.url.includes(
-                "api.cloudbet.com"
-              )
-          ) ||
-
-          apiContexts.some(
-            x =>
-              x.context.includes(
-                "api.cloudbet.com"
-              )
-          )
+        target_odds_found:
+          oddsCandidates.length > 0
 
       },
 
 
-      pages,
-
-
       // ======================================================
-      // MOST IMPORTANT OUTPUT
+      // MOST IMPORTANT
       // ======================================================
 
-      discovered_api_paths:
-        discoveredPaths.slice(
+      odds_candidates:
+        oddsCandidates.slice(
           0,
-          100
-        ),
-
-
-      discovered_absolute_urls:
-        discoveredUrls.slice(
-          0,
-          50
-        ),
-
-
-      request_builders:
-        requests.slice(
-          0,
-          80
+          30
         ),
 
 
       // ======================================================
-      // RAW CONTEXTS
+      // LIVE EVENTS SAMPLE
       // ======================================================
 
-      api_contexts:
-        dedupeContexts(
-          apiContexts
-        ).slice(
-          0,
-          50
+      live_events:
+        events
+          .slice(
+            0,
+            30
+          )
+          .map(
+            event => ({
+
+              id:
+                event.id,
+
+              name:
+                event.name,
+
+              status:
+                event.status,
+
+              sport:
+                event.sport,
+
+              competition:
+                event.competition
+
+            })
+          ),
+
+
+      list_attempts:
+        listAttempts,
+
+
+      detail_attempts:
+        detailAttempts,
+
+
+      raw_shape:
+        describeShape(
+          listData
         ),
-
-
-      market_contexts:
-        dedupeContexts(
-          marketContexts
-        ).slice(
-          0,
-          40
-        ),
-
-
-      event_contexts:
-        dedupeContexts(
-          eventContexts
-        ).slice(
-          0,
-          40
-        ),
-
-
-      useful_scripts: usefulScripts,
 
 
       timing_ms:
@@ -655,1087 +752,61 @@ export async function debugCloudbet(): Promise<any> {
 
 
 // ============================================================
-// TARGET SOURCE ANALYZER
+// BUILD URL
 // ============================================================
 
-function analyzeTargetSource(
-
-  source: string,
-
-  sourceUrl: string,
-
-  apiPaths:
-    Map<string, any>,
-
-  absoluteUrls:
-    Map<string, any>,
-
-  requestBuilders:
-    any[],
-
-  apiContexts:
-    any[],
-
-  marketContexts:
-    any[],
-
-  eventContexts:
-    any[]
-
-) {
-
-  // ==========================================================
-  // API PATHS
-  // ==========================================================
-
-  discoverApiPaths(
-    source,
-    sourceUrl,
-    apiPaths
-  );
-
-
-  // ==========================================================
-  // ABSOLUTE URLS
-  // ==========================================================
-
-  discoverAbsoluteUrls(
-    source,
-    sourceUrl,
-    absoluteUrls
-  );
-
-
-  // ==========================================================
-  // REQUEST CONSTRUCTION
-  // ==========================================================
-
-  discoverRequestBuilders(
-    source,
-    sourceUrl,
-    requestBuilders
-  );
-
-
-  // ==========================================================
-  // API CONTEXT
-  // ==========================================================
-
-  pushContexts(
-    source,
-    sourceUrl,
-    [
-      "/sports-api/",
-      "api.cloudbet.com",
-      "api-staging.cloudbet.com",
-      "api-sandbox.cloudbet.com"
-    ],
-    apiContexts
-  );
-
-
-  // ==========================================================
-  // MARKET CONTEXT
-  // ==========================================================
-
-  pushContexts(
-    source,
-    sourceUrl,
-    [
-      TARGET_MARKET,
-      "soccer_total_goals",
-      "soccer.total_goals",
-      "marketType",
-      "submarketKey",
-      "selection.params",
-      ".outcome",
-      "total=0.5"
-    ],
-    marketContexts
-  );
-
-
-  // ==========================================================
-  // EVENT CONTEXT
-  // ==========================================================
-
-  pushContexts(
-    source,
-    sourceUrl,
-    [
-      "eventId",
-      "event_id",
-      "events",
-      "eventData",
-      "marketDefinitions"
-    ],
-    eventContexts
-  );
-
-}
-
-
-// ============================================================
-// API PATH DISCOVERY
-// ============================================================
-
-function discoverApiPaths(
-
-  source: string,
-
-  sourceUrl: string,
-
-  output:
-    Map<string, any>
-
-) {
-
-  const patterns = [
-
-    /["'`](\/sports-api\/[^"'`\s\\]{0,300})["'`]/gi,
-
-    /["'`](\/sports-data\/[^"'`\s\\]{0,300})["'`]/gi,
-
-    /["'`](\/sports-betting\/[^"'`\s\\]{0,300})["'`]/gi,
-
-    /["'`](\/api\/prod-proxy\/sports-api\/[^"'`\s\\]{0,300})["'`]/gi,
-
-    /["'`](\/api\/prod-proxy\/sports-data\/[^"'`\s\\]{0,300})["'`]/gi
-
-  ];
-
-
-  for (
-    const regex
-    of patterns
-  ) {
-
-    let match:
-      RegExpExecArray |
-      null;
-
-
-    while (
-      (
-        match =
-          regex.exec(
-            source
-          )
-      ) !== null
-    ) {
-
-      const path =
-        cleanString(
-          match[1]
-        );
-
-
-      addUnique(
-        output,
-        path,
-        {
-          path,
-          source:
-            sourceUrl
-        }
-      );
-
-    }
-
-  }
-
-
-  // ==========================================================
-  // LOOSE SPORTS API PATHS
-  // ==========================================================
-
-  const loose =
-    source.match(
-      /\/sports-api\/[A-Za-z0-9_?=&%${}./:[\]-]{1,250}/g
-    ) || [];
-
-
-  for (
-    const raw
-    of loose
-  ) {
-
-    const path =
-      cleanString(
-        raw
-      );
-
-
-    addUnique(
-      output,
-      path,
-      {
-        path,
-        source:
-          sourceUrl
-      }
-    );
-
-  }
-
-}
-
-
-// ============================================================
-// ABSOLUTE URL DISCOVERY
-// ============================================================
-
-function discoverAbsoluteUrls(
-
-  source: string,
-
-  sourceUrl: string,
-
-  output:
-    Map<string, any>
-
-) {
-
-  const regex =
-    /https?:\/\/(?:api\.cloudbet\.com|api-staging\.cloudbet\.com|api-sandbox\.cloudbet\.com|www\.cloudbet\.com)[^"'`\s\\]{0,400}/gi;
-
-
-  const matches =
-    source.match(
-      regex
-    ) || [];
-
-
-  for (
-    const raw
-    of matches
-  ) {
-
-    const url =
-      cleanString(
-        raw
-      );
-
-
-    addUnique(
-      output,
-      url,
-      {
-        url,
-        source:
-          sourceUrl
-      }
-    );
-
-  }
-
-}
-
-
-// ============================================================
-// REQUEST BUILDERS
-// ============================================================
-
-function discoverRequestBuilders(
-
-  source: string,
-
-  sourceUrl: string,
-
-  output: any[]
-
-) {
-
-  const patterns = [
-
-    {
-      type:
-        "FETCH",
-
-      regex:
-        /\bfetch\s*\(/gi
-    },
-
-    {
-      type:
-        "CLIENT_GET",
-
-      regex:
-        /\.get\s*\(/gi
-    },
-
-    {
-      type:
-        "REQUEST_FUNCTION",
-
-      regex:
-        /\bQ\s*\(/g
-    }
-
-  ];
-
-
-  for (
-    const item
-    of patterns
-  ) {
-
-    let match:
-      RegExpExecArray |
-      null;
-
-
-    while (
-      (
-        match =
-          item.regex.exec(
-            source
-          )
-      ) !== null
-    ) {
-
-      const index =
-        match.index;
-
-
-      const raw =
-        source.substring(
-
-          Math.max(
-            0,
-            index - 600
-          ),
-
-          Math.min(
-            source.length,
-            index + 1800
-          )
-
-        );
-
-
-      const lower =
-        raw.toLowerCase();
-
-
-      if (
-        !lower.includes(
-          "sports"
-        ) &&
-
-        !lower.includes(
-          "event"
-        ) &&
-
-        !lower.includes(
-          "market"
-        ) &&
-
-        !lower.includes(
-          "api.cloudbet.com"
-        )
-      ) {
-        continue;
-      }
-
-
-      // Diagnostic only records likely GET/read code.
-      // Explicit POST/PUT/PATCH/DELETE builders are ignored.
-
-      if (
-        containsWriteMethod(
-          raw
-        )
-      ) {
-        continue;
-      }
-
-
-      output.push({
-
-        type:
-          item.type,
-
-        method:
-          detectMethod(
-            raw
-          ),
-
-        source:
-          sourceUrl,
-
-        context:
-          sanitize(
-            raw
-          )
-
-      });
-
-    }
-
-  }
-
-}
-
-
-// ============================================================
-// CONTEXT COLLECTION
-// ============================================================
-
-function pushContexts(
-
-  source: string,
-
-  sourceUrl: string,
-
-  needles: string[],
-
-  output: any[]
-
-) {
-
-  const lower =
-    source.toLowerCase();
-
-
-  for (
-    const needle
-    of needles
-  ) {
-
-    const target =
-      needle.toLowerCase();
-
-    let start = 0;
-    let hits = 0;
-
-
-    while (
-      hits < 10
-    ) {
-
-      const index =
-        lower.indexOf(
-          target,
-          start
-        );
-
-
-      if (
-        index === -1
-      ) {
-        break;
-      }
-
-
-      const context =
-        source.substring(
-
-          Math.max(
-            0,
-            index - 700
-          ),
-
-          Math.min(
-            source.length,
-            index + 1400
-          )
-
-        );
-
-
-      output.push({
-
-        needle,
-
-        source:
-          sourceUrl,
-
-        context:
-          sanitize(
-            context
-          )
-
-      });
-
-
-      hits++;
-
-      start =
-        index +
-        target.length;
-
-    }
-
-  }
-
-}
-
-
-// ============================================================
-// SCRIPT EXTRACTION
-// ============================================================
-
-function extractScripts(
-  html: string,
-  pageUrl: string
-) {
-
-  const output =
-    new Set<string>();
-
-
-  const regex =
-    /<script[^>]+src=["']([^"']+)["']/gi;
-
-
-  let match:
-    RegExpExecArray |
-    null;
-
-
-  while (
-    (
-      match =
-        regex.exec(
-          html
-        )
-    ) !== null
-  ) {
-
-    try {
-
-      output.add(
-        new URL(
-          match[1],
-          pageUrl
-        ).href
-      );
-
-    } catch {}
-
-  }
-
-
-  return [
-    ...output
-  ];
-
-}
-
-
-// ============================================================
-// SCRIPT SCORE
-// ============================================================
-
-function scriptScore(
-  url: string
-) {
-
-  const lower =
-    url.toLowerCase();
-
-  let score = 0;
-
-
-  if (
-    lower.includes(
-      "/pages/_app"
-    )
-  ) {
-    score += 100;
-  }
-
-
-  if (
-    lower.includes(
-      "/pages/sports/"
-    )
-  ) {
-    score += 100;
-  }
-
-
-  if (
-    lower.includes(
-      "sports"
-    )
-  ) {
-    score += 50;
-  }
-
-
-  if (
-    lower.includes(
-      "/chunks/"
-    )
-  ) {
-    score += 20;
-  }
-
-
-  return score;
-
-}
-
-
-// ============================================================
-// PATH SCORE
-// ============================================================
-
-function scoreApiPath(
-  path: string
-) {
-
-  const lower =
-    path.toLowerCase();
-
-  let score = 0;
-
-
-  if (
-    lower.includes(
-      "/sports-api/"
-    )
-  ) {
-    score += 100;
-  }
-
-
-  if (
-    lower.includes(
-      "event"
-    )
-  ) {
-    score += 60;
-  }
-
-
-  if (
-    lower.includes(
-      "market"
-    )
-  ) {
-    score += 60;
-  }
-
-
-  if (
-    lower.includes(
-      "odds"
-    )
-  ) {
-    score += 50;
-  }
-
-
-  if (
-    lower.includes(
-      "live"
-    )
-  ) {
-    score += 40;
-  }
-
-
-  if (
-    lower.includes(
-      "soccer"
-    )
-  ) {
-    score += 30;
-  }
-
-
-  // Betting write paths should rank last.
-
-  if (
-    lower.includes(
-      "/place"
-    ) ||
-    lower.includes(
-      "/orders"
-    )
-  ) {
-    score -= 200;
-  }
-
-
-  return score;
-
-}
-
-
-// ============================================================
-// URL SCORE
-// ============================================================
-
-function scoreAbsoluteUrl(
-  url: string
-) {
-
-  const lower =
-    url.toLowerCase();
-
-  let score = 0;
-
-
-  if (
-    lower.includes(
-      "api.cloudbet.com"
-    )
-  ) {
-    score += 100;
-  }
-
-
-  if (
-    lower.includes(
-      "sports-api"
-    )
-  ) {
-    score += 100;
-  }
-
-
-  if (
-    lower.includes(
-      "event"
-    )
-  ) {
-    score += 40;
-  }
-
-
-  if (
-    lower.includes(
-      "market"
-    )
-  ) {
-    score += 40;
-  }
-
-
-  return score;
-
-}
-
-
-// ============================================================
-// REQUEST SCORE
-// ============================================================
-
-function scoreRequest(
-  request: any
-) {
-
-  const lower =
-    String(
-      request.context || ""
-    ).toLowerCase();
-
-
-  let score = 0;
-
-
-  if (
-    lower.includes(
-      "/sports-api/"
-    )
-  ) {
-    score += 100;
-  }
-
-
-  if (
-    lower.includes(
-      "api.cloudbet.com"
-    )
-  ) {
-    score += 80;
-  }
-
-
-  if (
-    lower.includes(
-      "eventid"
-    ) ||
-    lower.includes(
-      "event_id"
-    )
-  ) {
-    score += 60;
-  }
-
-
-  if (
-    lower.includes(
-      "market"
-    )
-  ) {
-    score += 50;
-  }
-
-
-  if (
-    lower.includes(
-      TARGET_MARKET
-    )
-  ) {
-    score += 100;
-  }
-
-
-  return score;
-
-}
-
-
-// ============================================================
-// METHOD DETECTION
-// ============================================================
-
-function detectMethod(
-  text: string
-) {
-
-  const match =
-    text.match(
-      /method\s*:\s*["'`](GET|POST|PUT|PATCH|DELETE)["'`]/i
-    );
-
-
-  if (
-    match
-  ) {
-
-    return match[1]
-      .toUpperCase();
-
-  }
-
-
-  if (
-    /\.get\s*\(/i.test(
-      text
-    )
-  ) {
-
-    return "GET";
-
-  }
-
-
-  return "UNKNOWN";
-
-}
-
-
-// ============================================================
-// WRITE FILTER
-// ============================================================
-
-function containsWriteMethod(
-  text: string
-) {
-
-  return (
-    /method\s*:\s*["'`](POST|PUT|PATCH|DELETE)["'`]/i
-      .test(
-        text
-      )
-  );
-
-}
-
-
-// ============================================================
-// UNIQUE MAP
-// ============================================================
-
-function addUnique(
-
-  map:
-    Map<string, any>,
-
-  key:
+function buildUrl(
+  path: string,
+  params: Record<
     string,
-
-  value:
-    any
-
+    string | undefined
+  >
 ) {
 
-  if (
-    !key ||
-    key.length > 500
-  ) {
-    return;
-  }
+  const url =
+    new URL(
+      path,
+      HOST
+    );
 
 
-  if (
-    !map.has(
-      key
+  for (
+    const [
+      key,
+      value
+    ]
+    of Object.entries(
+      params
     )
   ) {
 
-    map.set(
+    if (
+      value === undefined
+    ) {
+      continue;
+    }
+
+
+    url.searchParams.set(
       key,
       value
     );
 
   }
 
-}
 
-
-// ============================================================
-// DEDUPE
-// ============================================================
-
-function dedupeObjects(
-
-  items: any[],
-
-  keyFn:
-    (item: any) =>
-      string
-
-) {
-
-  const map =
-    new Map<string, any>();
-
-
-  for (
-    const item
-    of items
-  ) {
-
-    const key =
-      keyFn(
-        item
-      );
-
-
-    if (
-      !map.has(
-        key
-      )
-    ) {
-
-      map.set(
-        key,
-        item
-      );
-
-    }
-
-  }
-
-
-  return [
-    ...map.values()
-  ];
-
-}
-
-
-function dedupeContexts(
-  items: any[]
-) {
-
-  return dedupeObjects(
-    items,
-    item =>
-      [
-        item.needle,
-        item.source,
-        String(
-          item.context
-        ).slice(
-          0,
-          600
-        )
-      ].join("|")
-  );
+  return url.href;
 
 }
 
 
 // ============================================================
-// CLEAN STRING
+// GET JSON
 // ============================================================
 
-function cleanString(
-  text: string
-) {
-
-  return text
-
-    .replace(
-      /\\u002F/gi,
-      "/"
-    )
-
-    .replace(
-      /\\\//g,
-      "/"
-    )
-
-    .replace(
-      /\\x2f/gi,
-      "/"
-    )
-
-    .replace(
-      /[),;\]}]+$/g,
-      ""
-    )
-
-    .trim();
-
-}
-
-
-// ============================================================
-// SANITIZE CONTEXT
-// ============================================================
-
-function sanitize(
-  text: string
-) {
-
-  return text
-
-    .replace(
-      /\s+/g,
-      " "
-    )
-
-    .slice(
-      0,
-      2600
-    );
-
-}
-
-
-// ============================================================
-// HTTP GET
-// ============================================================
-
-async function fetchText(
+async function getJson(
   url: string
-): Promise<{
-  ok: boolean;
-  status: number;
-  finalUrl: string;
-  contentType: string;
-  text: string;
-  error?: string;
-}> {
+): Promise<any> {
 
   const controller =
     new AbortController();
@@ -1745,7 +816,7 @@ async function fetchText(
     setTimeout(
       () =>
         controller.abort(),
-      TIMEOUT_MS
+      FETCH_TIMEOUT_MS
     );
 
 
@@ -1767,11 +838,14 @@ async function fetchText(
 
           headers: {
 
-            "User-Agent":
-              "Mozilla/5.0 (compatible; TopSignalCloudbetDiagnostic/3.0)",
-
             "Accept":
-              "text/html,application/javascript,text/javascript,*/*"
+              "application/json,text/plain,*/*",
+
+            "User-Agent":
+              "Mozilla/5.0 (compatible; TopSignalCloudbetV4/1.0)",
+
+            "Referer":
+              "https://www.cloudbet.com/en/sports/soccer"
 
           }
 
@@ -1779,8 +853,37 @@ async function fetchText(
       );
 
 
+    const contentType =
+      response.headers.get(
+        "content-type"
+      ) || "";
+
+
     const text =
       await response.text();
+
+
+    let data: any =
+      null;
+
+
+    if (text) {
+
+      try {
+
+        data =
+          JSON.parse(
+            text
+          );
+
+      } catch {
+
+        data =
+          text;
+
+      }
+
+    }
 
 
     return {
@@ -1791,16 +894,9 @@ async function fetchText(
       status:
         response.status,
 
-      finalUrl:
-        response.url ||
-        url,
+      contentType,
 
-      contentType:
-        response.headers.get(
-          "content-type"
-        ) || "",
-
-      text
+      data
 
     };
 
@@ -1815,13 +911,11 @@ async function fetchText(
 
       status: 0,
 
-      finalUrl:
-        url,
-
       contentType:
         "",
 
-      text: "",
+      data:
+        null,
 
       error:
         error?.message ||
@@ -1838,4 +932,902 @@ async function fetchText(
 
   }
 
+}
+
+
+// ============================================================
+// EVENT EXTRACTION
+// ============================================================
+
+function collectEvents(
+  root: any
+) {
+
+  const found =
+    new Map<string, any>();
+
+
+  walk(
+    root,
+    value => {
+
+      if (
+        !value ||
+        typeof value !==
+          "object" ||
+        Array.isArray(
+          value
+        )
+      ) {
+        return;
       }
+
+
+      const id =
+        value.id ??
+        value.eventId ??
+        value.event_id;
+
+
+      if (
+        id === undefined ||
+        id === null
+      ) {
+        return;
+      }
+
+
+      const looksLikeEvent =
+        value.markets !== undefined ||
+        value.competition !== undefined ||
+        value.sport !== undefined ||
+        value.startTime !== undefined ||
+        value.start_time !== undefined ||
+        value.status !== undefined;
+
+
+      if (!looksLikeEvent) {
+        return;
+      }
+
+
+      const key =
+        String(
+          id
+        );
+
+
+      if (
+        found.has(
+          key
+        )
+      ) {
+        return;
+      }
+
+
+      found.set(
+        key,
+        {
+
+          id:
+            key,
+
+          name:
+            extractEventName(
+              value
+            ),
+
+          status:
+            value.status ??
+            null,
+
+          sport:
+            value.sport?.key ??
+            value.sport?.name ??
+            value.sport ??
+            null,
+
+          competition:
+            value.competition?.name ??
+            value.competition?.key ??
+            null,
+
+          raw:
+            value
+
+        }
+      );
+
+    }
+  );
+
+
+  return [
+    ...found.values()
+  ];
+
+}
+
+
+// ============================================================
+// EVENT NAME
+// ============================================================
+
+function extractEventName(
+  event: any
+) {
+
+  if (
+    typeof event.name ===
+      "string"
+  ) {
+
+    return event.name;
+
+  }
+
+
+  const home =
+    event.home?.name ??
+    event.homeTeam?.name ??
+    event.home_team?.name ??
+    event.home;
+
+
+  const away =
+    event.away?.name ??
+    event.awayTeam?.name ??
+    event.away_team?.name ??
+    event.away;
+
+
+  if (
+    typeof home ===
+      "string" &&
+    typeof away ===
+      "string"
+  ) {
+
+    return (
+      home +
+      " - " +
+      away
+    );
+
+  }
+
+
+  return null;
+
+}
+
+
+// ============================================================
+// TARGET SELECTION FINDER
+// ============================================================
+
+function findTargetSelections(
+  root: any
+) {
+
+  const results: any[] =
+    [];
+
+
+  walk(
+    root,
+    (
+      value,
+      path
+    ) => {
+
+      if (
+        !value ||
+        typeof value !==
+          "object" ||
+        Array.isArray(
+          value
+        )
+      ) {
+        return;
+      }
+
+
+      const outcome =
+        stringLower(
+          value.outcome ??
+          value.name ??
+          value.key ??
+          value.selection
+        );
+
+
+      if (
+        outcome !==
+          "over" &&
+        !outcome.endsWith(
+          ".over"
+        )
+      ) {
+        return;
+      }
+
+
+      const total =
+        readTotal(
+          value
+        );
+
+
+      if (
+        total !==
+          TARGET_TOTAL
+      ) {
+        return;
+      }
+
+
+      const fullText =
+        (
+          path +
+          " " +
+          safeString(
+            value.marketType
+          ) +
+          " " +
+          safeString(
+            value.market
+          ) +
+          " " +
+          safeString(
+            value.marketKey
+          )
+        )
+          .toLowerCase();
+
+
+      const looksFirstHalfTotal =
+        fullText.includes(
+          "total_goals_period_first_half"
+        ) ||
+
+        fullText.includes(
+          "total-goals-period-first-half"
+        ) ||
+
+        fullText.includes(
+          "first_half"
+        ) ||
+
+        fullText.includes(
+          "first-half"
+        );
+
+
+      results.push({
+
+        path,
+
+        outcome:
+          value.outcome ??
+          value.name ??
+          value.key ??
+          null,
+
+        params:
+          value.params ??
+          null,
+
+        total,
+
+        price:
+          readPrice(
+            value
+          ),
+
+        status:
+          value.status ??
+          null,
+
+        market_type:
+          value.marketType ??
+          value.marketKey ??
+          value.market ??
+          null,
+
+        first_half_hint:
+          looksFirstHalfTotal,
+
+        raw:
+          compactSelection(
+            value
+          )
+
+      });
+
+    }
+  );
+
+
+  // ==========================================================
+  // FIRST HALF RESULTS FIRST
+  // ==========================================================
+
+  return results.sort(
+    (a, b) =>
+      Number(
+        b.first_half_hint
+      ) -
+      Number(
+        a.first_half_hint
+      )
+  );
+
+}
+
+
+// ============================================================
+// READ TOTAL
+// ============================================================
+
+function readTotal(
+  value: any
+): number | null {
+
+  const direct =
+    [
+      value.total,
+      value.line,
+      value.handicap
+    ];
+
+
+  for (
+    const x
+    of direct
+  ) {
+
+    const number =
+      toNumber(
+        x
+      );
+
+
+    if (
+      number !== null
+    ) {
+
+      return number;
+
+    }
+
+  }
+
+
+  const params =
+    value.params;
+
+
+  if (
+    typeof params ===
+      "string"
+  ) {
+
+    const match =
+      params.match(
+        /(?:^|[?&])total=([0-9.]+)/i
+      );
+
+
+    if (match) {
+
+      return toNumber(
+        match[1]
+      );
+
+    }
+
+  }
+
+
+  if (
+    params &&
+    typeof params ===
+      "object"
+  ) {
+
+    const number =
+      toNumber(
+        params.total
+      );
+
+
+    if (
+      number !== null
+    ) {
+
+      return number;
+
+    }
+
+  }
+
+
+  return null;
+
+}
+
+
+// ============================================================
+// READ PRICE
+// ============================================================
+
+function readPrice(
+  value: any
+) {
+
+  const candidates =
+    [
+
+      value.price,
+
+      value.odds,
+
+      value.decimalOdds,
+
+      value.decimal_odds,
+
+      value.decimal,
+
+      value.value
+
+    ];
+
+
+  for (
+    const candidate
+    of candidates
+  ) {
+
+    const number =
+      toNumber(
+        candidate
+      );
+
+
+    if (
+      number !== null &&
+      number > 1
+    ) {
+
+      return number;
+
+    }
+
+  }
+
+
+  return null;
+
+}
+
+
+// ============================================================
+// COMPACT SELECTION
+// ============================================================
+
+function compactSelection(
+  value: any
+) {
+
+  return {
+
+    outcome:
+      value.outcome ??
+      null,
+
+    params:
+      value.params ??
+      null,
+
+    price:
+      value.price ??
+      null,
+
+    odds:
+      value.odds ??
+      null,
+
+    status:
+      value.status ??
+      null,
+
+    marketType:
+      value.marketType ??
+      null,
+
+    marketKey:
+      value.marketKey ??
+      null,
+
+    key:
+      value.key ??
+      null
+
+  };
+
+}
+
+
+// ============================================================
+// GENERIC WALK
+// ============================================================
+
+function walk(
+  root: any,
+  callback:
+    (
+      value: any,
+      path: string
+    ) => void
+) {
+
+  const seen =
+    new WeakSet<object>();
+
+
+  function visit(
+    value: any,
+    path: string,
+    depth: number
+  ) {
+
+    if (
+      depth > 15 ||
+      value === null ||
+      value === undefined
+    ) {
+      return;
+    }
+
+
+    if (
+      typeof value !==
+        "object"
+    ) {
+      return;
+    }
+
+
+    if (
+      seen.has(
+        value
+      )
+    ) {
+      return;
+    }
+
+
+    seen.add(
+      value
+    );
+
+
+    callback(
+      value,
+      path
+    );
+
+
+    if (
+      Array.isArray(
+        value
+      )
+    ) {
+
+      for (
+        let i = 0;
+        i <
+        value.length;
+        i++
+      ) {
+
+        visit(
+          value[i],
+          path +
+            "[" +
+            i +
+            "]",
+          depth + 1
+        );
+
+      }
+
+      return;
+
+    }
+
+
+    for (
+      const [
+        key,
+        child
+      ]
+      of Object.entries(
+        value
+      )
+    ) {
+
+      visit(
+        child,
+        path
+          ? path +
+            "." +
+            key
+          : key,
+        depth + 1
+      );
+
+    }
+
+  }
+
+
+  visit(
+    root,
+    "$",
+    0
+  );
+
+}
+
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function toNumber(
+  value: any
+): number | null {
+
+  if (
+    typeof value ===
+      "number" &&
+    Number.isFinite(
+      value
+    )
+  ) {
+
+    return value;
+
+  }
+
+
+  if (
+    typeof value ===
+      "string"
+  ) {
+
+    const number =
+      Number(
+        value
+      );
+
+
+    if (
+      Number.isFinite(
+        number
+      )
+    ) {
+
+      return number;
+
+    }
+
+  }
+
+
+  return null;
+
+}
+
+
+function stringLower(
+  value: any
+) {
+
+  return typeof value ===
+    "string"
+    ? value
+        .trim()
+        .toLowerCase()
+    : "";
+
+}
+
+
+function safeString(
+  value: any
+) {
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+
+    return "";
+
+  }
+
+
+  if (
+    typeof value ===
+      "string"
+  ) {
+
+    return value;
+
+  }
+
+
+  try {
+
+    return JSON.stringify(
+      value
+    );
+
+  } catch {
+
+    return "";
+
+  }
+
+}
+
+
+// ============================================================
+// RESPONSE PREVIEW
+// ============================================================
+
+function preview(
+  value: any
+) {
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+
+    return null;
+
+  }
+
+
+  try {
+
+    return JSON.stringify(
+      value
+    ).slice(
+      0,
+      1200
+    );
+
+  } catch {
+
+    return String(
+      value
+    ).slice(
+      0,
+      1200
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// BODY TYPE
+// ============================================================
+
+function typeOfBody(
+  value: any
+) {
+
+  if (
+    Array.isArray(
+      value
+    )
+  ) {
+
+    return "array";
+
+  }
+
+
+  if (
+    value === null
+  ) {
+
+    return "null";
+
+  }
+
+
+  return typeof value;
+
+}
+
+
+// ============================================================
+// SHAPE DESCRIPTION
+// ============================================================
+
+function describeShape(
+  value: any
+) {
+
+  if (
+    Array.isArray(
+      value
+    )
+  ) {
+
+    return {
+
+      type:
+        "array",
+
+      length:
+        value.length,
+
+      first_item_keys:
+        value[0] &&
+        typeof value[0] ===
+          "object"
+          ? Object.keys(
+              value[0]
+            ).slice(
+              0,
+              50
+            )
+          : []
+
+    };
+
+  }
+
+
+  if (
+    value &&
+    typeof value ===
+      "object"
+  ) {
+
+    return {
+
+      type:
+        "object",
+
+      keys:
+        Object.keys(
+          value
+        ).slice(
+          0,
+          100
+        )
+
+    };
+
+  }
+
+
+  return {
+
+    type:
+      typeof value
+
+  };
+
+}
