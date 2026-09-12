@@ -1,3846 +1,3277 @@
-import { debugBetsafe } from "./odds/betsafe";
-import { debugCloudbet } from "./odds/cloudbet";
+// ==UserScript==
+// @name         TOP SIGNAL — BASE V7.12 BET SCORE GATE FIX
+// @namespace    top-signal
+// @version      1.0.28
+// @description  BET skips score gate + 1H O0.5 + stake 0.10 USDT + Place Bet highlight.
+// @match        https://cloud0007.com/*
+// @match        https://www.cloud0007.com/*
+// @match        https://*.cloud0007.com/*
+// @match        https://cloudbet.com/*
+// @match        https://www.cloudbet.com/*
+// @match        https://*.cloudbet.com/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
 
-// ============================================================
-// TOP SIGNAL V2.0.5 — ACTIVE BET LIFECYCLE
-//
-// TRACKER -> MATCHER -> DASHBOARD
-// -> CHECK ODDS / BET NOW HANDOFF
-//
-// V2.0.5:
-// - TARGET polling: 10s
-// - DAILY polling: 30s
-// - no overlapping browser refresh requests
-// - temporary target error keeps last rendered targets
-// - D1 live_odds + bet_status + daily_matches
-// - secure CONFIDENT_MATCH targets only
-// - Europe/Sofia daily log
-// - V27 fail-closed for CHECK/BET
-// - action window 10'–42'
-// - PLACED + PENDING bets stay visible until WIN/LOSS
-//
-// IMPORTANT:
-// - final bet submit is NOT performed by this Worker
-// - browser/Monkey logic is unchanged
-// ============================================================
+(() => {
+  'use strict';
 
-const VERSION = "V2.0.8 TRACKER ODDS PRESERVED";
-const APP_NAME = "top-signal";
-const TIME_ZONE = "Europe/Sofia";
+  const VERSION = 'BASE V7.12';
 
-const ACTION_MINUTE_FROM = 10;
-const ACTION_MINUTE_TO = 42;
+  // ============================================================
+  // BET CONTROL
+  // ============================================================
+  //
+  // false:
+  // - намира 1H O0.5
+  // - избира O0.5
+  // - попълва stake 0.10 USDT
+  // - НЕ натиска финалния Place Bet
+  // - връща към dashboard след 5 секунди
+  //
+  // true:
+  // - намира 1H O0.5
+  // - избира O0.5
+  // - попълва stake 0.10 USDT
+  // - чака РЪЧЕН trusted click върху Place Bet / Confirm Bet
+  // - след него записва BET PLACED и връща dashboard
+  //
+  const BET_PLACE = false;
 
-type Obj = Record<string, any>;
+  const BET_STAKE_USDT = 0.10;
 
-interface Env {
-  DB: D1Database;
-  TRACKER: Fetcher;
-  MATCHER: Fetcher;
-  // Optional. If not bound, Worker falls back to the public V27 endpoint.
-  V27?: Fetcher;
-}
+  const DRY_RETURN_MS = 5000;
 
-let tablesReady: Promise<void> | null = null;
+  // ============================================================
+
+  const PANEL_ID = 'top-signal-panel-v712';
+
+  const TOP_SIGNAL =
+    'https://top-signal.kalchogr.workers.dev';
+
+  const DASHBOARD =
+    TOP_SIGNAL + '/';
+
+  const ODDS_API =
+    TOP_SIGNAL + '/api/odds';
+
+  const BET_STATUS_API =
+    TOP_SIGNAL + '/api/bet-status';
+
+  const CLICK_INTERVAL = 3000;
+  const REFRESH_AFTER = 20000;
+
+  const SCORE_CACHE_KEY =
+    'topSignalScoreV712';
+
+  const EVENT_CACHE_KEY =
+    'topSignalEventV712';
+
+  const ACTION_CACHE_KEY =
+    'topSignalActionV712';
+
+  const BET_READY_KEY =
+    'topSignalBetReadyV712';
+
+  const WINDOW_PREFIX =
+    'TOP_SIGNAL::';
+
+  const MAX_LAUNCH_AGE_MS =
+    30 * 60 * 1000;
+
+  const POS_X =
+    'topSignalPanelX712';
+
+  const POS_Y =
+    'topSignalPanelY712';
+
+  let returning = false;
+  let refreshing = false;
+  let finished = false;
+  let saving = false;
+
+  let oneHStageStart = null;
+  let last1HClick = 0;
+  let clickCount = 0;
+
+  let oddsSelected = false;
+  let betClickSaving = false;
+
+  let stakePrepared = false;
+  let dryReturnStarted = false;
 
 
-// ============================================================
-// MAIN
-// ============================================================
+  // ============================================================
+  // HELPERS
+  // ============================================================
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+  function clean(value) {
+    return String(value ?? '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders()
-      });
+
+  function visible(el) {
+    if (
+      !el ||
+      !(el instanceof Element)
+    ) {
+      return false;
+    }
+
+    const style =
+      getComputedStyle(el);
+
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      Number(style.opacity) === 0
+    ) {
+      return false;
+    }
+
+    const r =
+      el.getBoundingClientRect();
+
+    return (
+      r.width > 0 &&
+      r.height > 0
+    );
+  }
+
+
+  function area(el) {
+    if (!el) {
+      return Infinity;
+    }
+
+    const r =
+      el.getBoundingClientRect();
+
+    return r.width * r.height;
+  }
+
+
+  function validOdds(value) {
+    const n =
+      Number(value);
+
+    return (
+      Number.isFinite(n) &&
+      n >= 1.01 &&
+      n <= 50
+    );
+  }
+
+
+  // ============================================================
+  // ROBUST LAUNCH HANDOFF
+  // ============================================================
+
+  function safeJsonParse(value) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+
+  function readHashParams() {
+    try {
+      return new URLSearchParams(
+        String(location.hash || '')
+          .replace(/^#/, '')
+      );
+    } catch {
+      return new URLSearchParams();
+    }
+  }
+
+
+  function normalizeLaunch(value) {
+    if (
+      !value ||
+      typeof value !== 'object'
+    ) {
+      return null;
+    }
+
+    const action =
+      clean(value.action)
+        .toLowerCase();
+
+    const eventId =
+      clean(
+        value.eventId ??
+        value.event
+      );
+
+    const createdAt =
+      Number(
+        value.createdAt ??
+        Date.now()
+      );
+
+    if (
+      action !== 'check' &&
+      action !== 'bet'
+    ) {
+      return null;
+    }
+
+    if (!eventId) {
+      return null;
+    }
+
+    if (
+      !Number.isFinite(createdAt)
+    ) {
+      return null;
+    }
+
+    if (
+      Date.now() -
+      createdAt >
+      MAX_LAUNCH_AGE_MS
+    ) {
+      return null;
+    }
+
+    return {
+      action,
+      eventId,
+      createdAt
+    };
+  }
+
+
+  function writeWindowLaunch(
+    launch
+  ) {
+    const normalized =
+      normalizeLaunch(
+        launch
+      );
+
+    if (!normalized) {
+      return;
     }
 
     try {
-      if (!tablesReady) {
-        tablesReady = ensureTables(env);
-      }
-
-      await tablesReady;
-    } catch (error: any) {
-      tablesReady = null;
-      return json({
-        success: false,
-        worker: APP_NAME,
-        version: VERSION,
-        error: "DB_INIT_FAILED: " + (error?.message ?? String(error))
-      }, 500);
-    }
-
-    // ========================================================
-    // DEBUG BETSAFE — READ ONLY
-    // ========================================================
-
-    if (
-      url.pathname === "/api/debug/betsafe" &&
-      request.method === "GET"
-    ) {
-      try {
-        const result = await debugBetsafe();
-
-        return json(
-          result,
-          result?.success === false ? 502 : 200
+      window.name =
+        WINDOW_PREFIX +
+        JSON.stringify(
+          normalized
         );
-
-      } catch (error: any) {
-        return json({
-          success: false,
-          source: "BETSAFE",
-          error:
-            error?.message ??
-            String(error)
-        }, 500);
-      }
-    }
-
-    // ========================================================
-    // DEBUG CLOUDBET — READ ONLY
-    // ========================================================
-
-    if (
-      url.pathname === "/api/debug/cloudbet" &&
-      request.method === "GET"
-    ) {
-      try {
-        const result = await debugCloudbet();
-
-        return json(
-          result,
-          result?.success === false ? 502 : 200
-        );
-
-      } catch (error: any) {
-        return json({
-          success: false,
-          source: "CLOUDBET",
-          error:
-            error?.message ??
-            String(error)
-        }, 500);
-      }
-    }
-
-    // STATUS
-    if (url.pathname === "/api/status") {
-      return json({
-        success: true,
-        worker: APP_NAME,
-        version: VERSION,
-        mode: "MANUAL_TARGET_CONTROL",
-        betting: "FINAL_SUBMIT_DISABLED",
-        storage: "D1",
-        daily_log: true,
-        anti_overlap: true,
-        active_bet_lifecycle: true,
-        placed_pending_persistence: true,
-        timezone: TIME_ZONE,
-        live_state: "V27_CURRENT_MINUTE_SCORE",
-        action_window: {
-          from: ACTION_MINUTE_FROM,
-          to: ACTION_MINUTE_TO
-        },
-        bindings: {
-          DB: !!env.DB,
-          TRACKER: !!env.TRACKER,
-          MATCHER: !!env.MATCHER,
-          V27: !!env.V27
-        },
-        polling: {
-          targets_ms: 10000,
-          daily_ms: 30000
-        },
-        flow:
-          "TRACKER -> MATCHER -> TOP SIGNAL -> BET PLACED -> TRACKER WIN/LOSS -> ARCHIVE"
-      });
-    }
-
-    // DEBUG TRACKER
-    if (url.pathname === "/api/debug/tracker") {
-      try {
-        const data = await fetchServiceJSON(env.TRACKER, "/entries");
-        const signals = extractHunterSignals(data);
-        const records = extractTrackerRecords(data);
-
-        return json({
-          success: true,
-          signals_found: signals.length,
-          tracker_records: records.length,
-          signals,
-          records
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // DEBUG MATCHER
-    if (url.pathname === "/api/debug/matcher") {
-      try {
-        const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
-        const signals = extractHunterSignals(tracker);
-        const matcher = await callMatcher(env, signals);
-
-        return json({
-          success: true,
-          tracker_signals: signals.length,
-          matcher_version: matcher?.version ?? null,
-          matcher_stats: matcher?.stats ?? null,
-          hunter_results: matcher?.hunter_results ?? []
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // PRIMARY TARGET
-    if (url.pathname === "/api/target" && request.method === "GET") {
-      try {
-        const result = await buildTargets(env);
-        const target = result.targets[0] ?? null;
-
-        return json({
-          success: true,
-          found: !!target,
-          target,
-          stats: {
-            tracker_signals: result.trackerSignals,
-            matcher_hunter_results: result.matcherHunterResults,
-            secure_targets: result.secureTargets,
-            active_targets: result.targets.length,
-            placed_pending: result.placedPending,
-            placed: result.targets.filter(x => x.betPlaced).length,
-            live_feed_ok: result.liveFeedOk,
-            live_matches: result.liveMatches
-          },
-          timestamp: new Date().toISOString()
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          found: false,
-          target: null,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // ALL TARGETS
-    if (url.pathname === "/api/targets" && request.method === "GET") {
-      try {
-        const result = await buildTargets(env);
-
-        return json({
-          success: true,
-          version: VERSION,
-          count: result.targets.length,
-          tracker_signals: result.trackerSignals,
-          matcher_hunter_results: result.matcherHunterResults,
-          secure_targets: result.secureTargets,
-          placed_pending: result.placedPending,
-          placed: result.targets.filter(x => x.betPlaced).length,
-          live_feed_ok: result.liveFeedOk,
-          live_matches: result.liveMatches,
-          targets: result.targets
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          targets: [],
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // DAILY
-    if (url.pathname === "/api/daily" && request.method === "GET") {
-      try {
-        await syncDailyFromTracker(env);
-        const matches = await getDailyMatches(env);
-
-        return json({
-          success: true,
-          version: VERSION,
-          date: sofiaDate(),
-          timezone: TIME_ZONE,
-          summary: buildDailySummary(matches),
-          matches
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          matches: [],
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // SAVE FRONTEND ODDS
-    if (url.pathname === "/api/odds" && request.method === "POST") {
-      try {
-        const body = await request.json<Obj>();
-        const eventId = safe(body?.eventId);
-        const overOdds = numberOrNull(body?.overOdds);
-        const underOdds = numberOrNull(body?.underOdds);
-
-        if (!eventId || overOdds === null || overOdds <= 1 || overOdds > 50) {
-          return json({
-            success: false,
-            error: "INVALID_ODDS_PAYLOAD"
-          }, 400);
-        }
-
-        const now = new Date().toISOString();
-
-        await env.DB.prepare(`
-          INSERT INTO live_odds (
-            event_id, match_name, minute, score, hunter_score,
-            market, selection, over_odds, under_odds,
-            source, created_at, updated_at
-          )
-          VALUES (
-            ?1, NULL, NULL, NULL, NULL,
-            '1H Total Goals', 'Over 0.5', ?2, ?3,
-            'CLOUDBET_FRONTEND', ?4, ?4
-          )
-          ON CONFLICT(event_id) DO UPDATE SET
-            over_odds = excluded.over_odds,
-            under_odds = excluded.under_odds,
-            source = excluded.source,
-            updated_at = excluded.updated_at
-        `).bind(eventId, overOdds, underOdds, now).run();
-
-        await env.DB.prepare(`
-          UPDATE daily_matches
-          SET found_odds = ?2, updated_at = ?3
-          WHERE event_id = ?1
-        `).bind(eventId, overOdds, now).run();
-
-        return json({
-          success: true,
-          action: "ODDS_SAVED",
-          data: await getStoredEvent(env, eventId)
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // GET ODDS
-    if (url.pathname === "/api/odds" && request.method === "GET") {
-      try {
-        const eventId = safe(url.searchParams.get("eventId"));
-
-        if (eventId) {
-          return json({
-            success: true,
-            data: await getStoredEvent(env, eventId)
-          });
-        }
-
-        const row = await env.DB.prepare(`
-          SELECT * FROM live_odds
-          ORDER BY updated_at DESC
-          LIMIT 1
-        `).first();
-
-        return json({
-          success: true,
-          data: row ?? null
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // SAVE BET STATUS
-    if (url.pathname === "/api/bet-status" && request.method === "POST") {
-      try {
-        const body = await request.json<Obj>();
-        const eventId = safe(body?.eventId);
-        const status = safe(body?.status).toUpperCase();
-
-        if (
-          !eventId ||
-          (status !== "PLACED" && status !== "BET_PLACED")
-        ) {
-          return json({
-            success: false,
-            error: "INVALID_BET_STATUS_PAYLOAD"
-          }, 400);
-        }
-
-        const market = safe(body?.market) || "1st Half Total Goals";
-        const selection = safe(body?.selection) || "O 0.5";
-        const stake = numberOrNull(body?.stake);
-        const odds = numberOrNull(body?.odds);
-        const source = safe(body?.source) || "CLOUDBET_FRONTEND";
-        const placedAt = safe(body?.placedAt) || new Date().toISOString();
-        const now = new Date().toISOString();
-        const stored = await getStoredEvent(env, eventId);
-
-        await env.DB.prepare(`
-          INSERT INTO bet_status (
-            event_id, match_name, status, market, selection,
-            stake, odds, source, placed_at, created_at, updated_at
-          )
-          VALUES (
-            ?1, ?2, 'PLACED', ?3, ?4,
-            ?5, ?6, ?7, ?8, ?9, ?9
-          )
-          ON CONFLICT(event_id) DO UPDATE SET
-            match_name = COALESCE(excluded.match_name, bet_status.match_name),
-            status = 'PLACED',
-            market = excluded.market,
-            selection = excluded.selection,
-            stake = excluded.stake,
-            odds = COALESCE(excluded.odds, bet_status.odds),
-            source = excluded.source,
-            placed_at = excluded.placed_at,
-            updated_at = excluded.updated_at
-        `).bind(
-          eventId,
-          stored?.match_name ?? null,
-          market,
-          selection,
-          stake,
-          odds,
-          source,
-          placedAt,
-          now
-        ).run();
-
-        await updateDailyPlaced(
-          env,
-          eventId,
-          odds,
-          stake,
-          placedAt
-        );
-
-        return json({
-          success: true,
-          action: "BET_PLACED_SAVED",
-          eventId
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    // GET BET STATUS
-    if (url.pathname === "/api/bet-status" && request.method === "GET") {
-      try {
-        const eventId = safe(url.searchParams.get("eventId"));
-
-        if (!eventId) {
-          return json({
-            success: false,
-            error: "EVENT_ID_REQUIRED"
-          }, 400);
-        }
-
-        const row = await getBetStatus(env, eventId);
-
-        return json({
-          success: true,
-          data: row
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          error: error?.message ?? String(error)
-        }, 500);
-      }
-    }
-
-    if (url.pathname === "/" || url.pathname === "/dashboard") {
-      return new Response(renderHtml(), {
-        headers: {
-          "content-type": "text/html; charset=UTF-8",
-          "cache-control": "no-store"
-        }
-      });
-    }
-
-    return json({
-      success: false,
-      error: "NOT_FOUND"
-    }, 404);
-  }
-};
-
-
-// ============================================================
-// TABLES
-// ============================================================
-
-async function ensureTables(env: Env) {
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS live_odds (
-      event_id TEXT PRIMARY KEY,
-      match_name TEXT,
-      minute REAL,
-      score TEXT,
-      hunter_score REAL,
-      market TEXT,
-      selection TEXT,
-      over_odds REAL,
-      under_odds REAL,
-      source TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS bet_status (
-      event_id TEXT PRIMARY KEY,
-      match_name TEXT,
-      status TEXT NOT NULL,
-      market TEXT,
-      selection TEXT,
-      stake REAL,
-      odds REAL,
-      source TEXT,
-      placed_at TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS daily_matches (
-      event_id TEXT PRIMARY KEY,
-      signal_id TEXT,
-      match_id TEXT,
-      match_name TEXT NOT NULL,
-      entry_minute REAL,
-      hunter_score REAL,
-      found_odds REAL,
-      bet_status TEXT NOT NULL DEFAULT 'NOT_PLACED',
-      bet_odds REAL,
-      bet_stake REAL,
-      tracker_status TEXT DEFAULT 'PENDING',
-      tracker_result TEXT DEFAULT 'PENDING',
-      result_status TEXT DEFAULT 'PENDING',
-      day_key TEXT NOT NULL,
-      entry_time TEXT,
-      placed_at TEXT,
-      first_seen_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      finished_at TEXT
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_daily_matches_day
-    ON daily_matches(day_key)
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_daily_matches_match_id
-    ON daily_matches(match_id)
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_daily_matches_signal_id
-    ON daily_matches(signal_id)
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_daily_matches_active_placed
-    ON daily_matches(day_key, bet_status, result_status)
-  `).run();
-}
-
-
-// ============================================================
-// TARGET BUILD
-// ============================================================
-
-async function buildTargets(env: Env) {
-  const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
-
-  // Keep daily result state fresh on the same request that refreshes
-  // the active target list. This allows a PLACED card to disappear
-  // immediately after Tracker resolves it as WIN/LOSS.
-  await syncDailyFromTrackerData(env, tracker);
-
-  const signals = extractHunterSignals(tracker);
-  const v27 = await fetchV27Snapshot(env);
-
-  let hunterResults: Obj[] = [];
-
-  if (signals.length) {
-    const matcher = await callMatcher(env, signals);
-
-    hunterResults =
-      Array.isArray(matcher?.hunter_results)
-        ? matcher.hunter_results
-        : [];
-  }
-
-  const targets: Obj[] = [];
-  const seenEventIds = new Set<string>();
-
-  // ==========================================================
-  // CURRENT SECURE HUNTER TARGETS
-  // ==========================================================
-
-  for (const item of hunterResults) {
-    const classification = safe(
-      item?.classification ??
-      item?.match_classification ??
-      item?.result?.classification
-    ).toUpperCase();
-
-    const secure =
-      item?.secure_match === true ||
-      item?.secure === true ||
-      classification === "CONFIDENT_MATCH";
-
-    if (
-      !secure ||
-      (classification && classification !== "CONFIDENT_MATCH")
-    ) {
-      continue;
-    }
-
-    const signal =
-      item?.signal && typeof item.signal === "object"
-        ? item.signal
-        : item?.hunter ?? item?.tracker ?? {};
-
-    const cloudbet =
-      item?.cloudbet ??
-      item?.match ??
-      item?.matched ??
-      item?.event ??
-      {};
-
-    const eventId = safe(
-      cloudbet?.id ??
-      cloudbet?.eventId ??
-      cloudbet?.event_id ??
-      item?.cloudbet_event_id ??
-      item?.eventId
-    );
-
-    if (!eventId) continue;
-
-    const matchName = safe(
-      signal?.match_name ??
-      signal?.match ??
-      item?.signal_match ??
-      cloudbet?.name ??
-      cloudbet?.match
-    ) || "Hunter target";
-
-    const minute = numberOrNull(
-      signal?.entry_minute ??
-      signal?.minute ??
-      item?.entry_minute
-    );
-
-    const hunterScore = numberOrNull(
-      signal?.hunter_score ??
-      signal?.score ??
-      item?.hunter_score
-    );
-
-    const signalId = safe(
-      signal?.id ??
-      item?.signal_id
-    );
-
-    const matchId = safe(
-      signal?.match_id ??
-      item?.match_id
-    );
-
-    // Authoritative source: the Tracker /entries payload itself.
-    // Matcher is used to lock the Cloudbet event, but does not need
-    // to echo every financial field from the signal.
-    const trackerSignal =
-      signals.find((s: Obj) => {
-        const sId =
-          safe(s?.id);
-
-        const sMatchId =
-          safe(s?.match_id);
-
-        const sName =
-          safe(
-            s?.match_name ??
-            s?.match
-          );
-
-        return (
-          (
-            signalId &&
-            sId &&
-            sId === signalId
-          ) ||
-          (
-            matchId &&
-            sMatchId &&
-            sMatchId === matchId
-          ) ||
-          (
-            matchName &&
-            sName &&
-            sName === matchName
-          )
-        );
-      }) ??
-      null;
-
-    const entryTime = safe(
-      signal?.entry_time ??
-      signal?.created_at
-    );
-
-    // ========================================================
-    // SIGNAL ODDS FIRST
-    // ========================================================
-    // Tracker already stores the exact Cloudbet 1H O0.5 odds
-    // at ENTRY. Use that value immediately instead of waiting
-    // for the old browser /api/odds capture flow.
-    const signalEntryOdds =
-      numberOrNull(
-        trackerSignal?.entry_odds ??
-        trackerSignal?.entryOdds ??
-        trackerSignal?.odds ??
-        signal?.entry_odds ??
-        signal?.entryOdds ??
-        item?.entry_odds ??
-        item?.entryOdds ??
-        signal?.cloudbet?.entry_odds ??
-        signal?.cloudbet?.entryOdds ??
-        cloudbet?.entry_odds ??
-        cloudbet?.entryOdds
+    } catch {}
+
+    try {
+      sessionStorage.setItem(
+        ACTION_CACHE_KEY,
+        normalized.action
       );
 
-    const live = findV27Match(
-      v27.matches,
-      matchId,
-      matchName
-    );
-
-    const liveState =
-      normalizeV27LiveState(live);
-
-    const currentMinute =
-      numberOrNull(liveState.minute);
-
-    const inActionWindow =
-      currentMinute !== null &&
-      currentMinute >= ACTION_MINUTE_FROM &&
-      currentMinute <= ACTION_MINUTE_TO;
-
-    // FAIL CLOSED:
-    // If V27 is unavailable, the match is missing, not 1H, not 0:0,
-    // or outside 10'–42', CHECK/BET must NOT be allowed.
-    const canAct =
-      v27.ok &&
-      liveState.found &&
-      liveState.firstHalf &&
-      liveState.zeroZero &&
-      inActionWindow;
-
-    await saveTarget(env, {
-      eventId,
-      matchName,
-      minute,
-      hunterScore
-    });
-
-    await saveDailyTarget(env, {
-      eventId,
-      signalId,
-      matchId,
-      matchName,
-      minute,
-      hunterScore,
-      entryTime
-    });
-
-    const oddsRow =
-      await getStoredEvent(env, eventId);
-
-    const betRow =
-      await getBetStatus(env, eventId);
-
-    const dailyRow =
-      await getDailyMatchByEventId(env, eventId);
-
-    const betPlaced =
-      safe(betRow?.status).toUpperCase() === "PLACED" ||
-      safe(dailyRow?.bet_status).toUpperCase() === "PLACED";
-
-    const resultStatus =
-      safe(dailyRow?.result_status).toUpperCase() ||
-      "PENDING";
-
-    // A settled placed bet belongs only in the archive.
-    if (
-      betPlaced &&
-      (resultStatus === "WIN" || resultStatus === "LOSS")
-    ) {
-      continue;
-    }
-
-    targets.push({
-      eventId,
-      matchName,
-      cloudbetMatch: safe(
-        cloudbet?.name ??
-        cloudbet?.match
-      ),
-
-      minute,
-      hunterScore,
-
-      oddsSource:
-        (
-          numberOrNull(
-            trackerSignal?.entry_odds
-          ) !== null &&
-          numberOrNull(
-            trackerSignal?.entry_odds
-          ) > 1
-        )
-          ? "TRACKER_DIRECT_ENTRY_ODDS"
-          : (
-              signalEntryOdds !== null &&
-              signalEntryOdds > 1
-            )
-              ? "MATCHER_SIGNAL_ENTRY_ODDS"
-              : (
-                  numberOrNull(
-                    oddsRow?.over_odds
-                  ) !== null &&
-                  numberOrNull(
-                    oddsRow?.over_odds
-                  ) > 1
-                    ? "LIVE_ODDS_FALLBACK"
-                    : "NONE"
-                ),
-
-      classification:
-        classification ||
-        "CONFIDENT_MATCH",
-
-      secureMatch: true,
-
-      overOdds:
-        numberOrNull(
-          betPlaced
-            ? (
-                betRow?.odds ??
-                dailyRow?.bet_odds ??
-                signalEntryOdds ??
-                oddsRow?.over_odds
-              )
-            : (
-                signalEntryOdds ??
-                oddsRow?.over_odds
-              )
-        ),
-
-      underOdds:
-        numberOrNull(
-          oddsRow?.under_odds
-        ),
-
-      oddsUpdatedAt:
-        oddsRow?.updated_at ??
-        signal?.updated_at ??
-        signal?.entry_time ??
-        null,
-
-      betPlaced,
-      betStatus:
-        betPlaced
-          ? "PLACED"
-          : (betRow?.status ?? null),
-
-      betPlacedAt:
-        betRow?.placed_at ??
-        dailyRow?.placed_at ??
-        null,
-
-      betStake:
-        numberOrNull(
-          betRow?.stake ??
-          dailyRow?.bet_stake
-        ),
-
-      betOdds:
-        numberOrNull(
-          betRow?.odds ??
-          dailyRow?.bet_odds
-        ),
-
-      resultStatus,
-      trackerStatus:
-        dailyRow?.tracker_status ??
-        null,
-
-      trackerResult:
-        dailyRow?.tracker_result ??
-        null,
-
-      persistentPlaced:
-        betPlaced &&
-        resultStatus === "PENDING",
-
-      liveFeedOk: v27.ok,
-      liveFound: liveState.found,
-      liveMatchId: liveState.id,
-      liveMinute: liveState.minute,
-      liveMinuteDisplay: liveState.minuteDisplay,
-      livePeriod: liveState.period,
-      liveHomeScore: liveState.homeScore,
-      liveAwayScore: liveState.awayScore,
-      liveZeroZero: liveState.zeroZero,
-      liveFirstHalf: liveState.firstHalf,
-      liveInWindow: inActionWindow,
-
-      // Once placed, the card may remain visible but no second bet is allowed.
-      canAct:
-        betPlaced
-          ? false
-          : canAct,
-
-      liveReason:
-        liveReason(
-          v27.ok,
-          liveState,
-          inActionWindow,
-          betPlaced
-        )
-    });
-
-    seenEventIds.add(eventId);
-  }
-
-  // ==========================================================
-  // PERSISTENT PLACED + PENDING TARGETS FROM D1
-  // ==========================================================
-  //
-  // These rows keep the card visible even after the Tracker/Matcher
-  // no longer returns it as an actionable Hunter target.
-  // They disappear only after result_status becomes WIN or LOSS.
-  // ==========================================================
-
-  const placedPendingRows =
-    await getPlacedPendingMatches(env);
-
-  for (const row of placedPendingRows) {
-    const eventId =
-      safe(row?.event_id);
-
-    if (!eventId) {
-      continue;
-    }
-
-    // If the live Matcher path already produced the same event,
-    // keep that richer version and avoid duplicates.
-    if (seenEventIds.has(eventId)) {
-      continue;
-    }
-
-    const matchName =
-      safe(row?.match_name) ||
-      "Placed Hunter bet";
-
-    const matchId =
-      safe(row?.match_id);
-
-    const live =
-      findV27Match(
-        v27.matches,
-        matchId,
-        matchName
+      sessionStorage.setItem(
+        EVENT_CACHE_KEY,
+        normalized.eventId
       );
-
-    const liveState =
-      normalizeV27LiveState(live);
-
-    const oddsRow =
-      await getStoredEvent(env, eventId);
-
-    const betRow =
-      await getBetStatus(env, eventId);
-
-    const currentMinute =
-      numberOrNull(liveState.minute);
-
-    const inActionWindow =
-      currentMinute !== null &&
-      currentMinute >= ACTION_MINUTE_FROM &&
-      currentMinute <= ACTION_MINUTE_TO;
-
-    const persistedOdds =
-      numberOrNull(
-        betRow?.odds ??
-        row?.bet_odds ??
-        row?.found_odds ??
-        oddsRow?.over_odds
-      );
-
-    targets.push({
-      eventId,
-      matchName,
-
-      cloudbetMatch:
-        safe(betRow?.match_name) ||
-        safe(oddsRow?.match_name) ||
-        matchName,
-
-      minute:
-        numberOrNull(
-          row?.entry_minute ??
-          oddsRow?.minute
-        ),
-
-      hunterScore:
-        numberOrNull(
-          row?.hunter_score ??
-          oddsRow?.hunter_score
-        ),
-
-      classification:
-        "PLACED_PERSISTED",
-
-      secureMatch: true,
-
-      overOdds:
-        persistedOdds,
-
-      underOdds:
-        numberOrNull(
-          oddsRow?.under_odds
-        ),
-
-      oddsUpdatedAt:
-        oddsRow?.updated_at ??
-        row?.updated_at ??
-        null,
-
-      betPlaced: true,
-      betStatus: "PLACED",
-
-      betPlacedAt:
-        betRow?.placed_at ??
-        row?.placed_at ??
-        null,
-
-      betStake:
-        numberOrNull(
-          betRow?.stake ??
-          row?.bet_stake
-        ),
-
-      betOdds:
-        persistedOdds,
-
-      resultStatus:
-        safe(row?.result_status).toUpperCase() ||
-        "PENDING",
-
-      trackerStatus:
-        row?.tracker_status ??
-        null,
-
-      trackerResult:
-        row?.tracker_result ??
-        null,
-
-      persistentPlaced: true,
-
-      liveFeedOk: v27.ok,
-      liveFound: liveState.found,
-      liveMatchId: liveState.id,
-      liveMinute: liveState.minute,
-      liveMinuteDisplay: liveState.minuteDisplay,
-      livePeriod: liveState.period,
-      liveHomeScore: liveState.homeScore,
-      liveAwayScore: liveState.awayScore,
-      liveZeroZero: liveState.zeroZero,
-      liveFirstHalf: liveState.firstHalf,
-      liveInWindow: inActionWindow,
-
-      // Never allow a second bet from a persisted placed card.
-      canAct: false,
-
-      liveReason:
-        liveReason(
-          v27.ok,
-          liveState,
-          inActionWindow,
-          true
-        )
-    });
-
-    seenEventIds.add(eventId);
+    } catch {}
   }
 
-  targets.sort((a, b) => {
-    // Keep active placed bets at the top.
-    if (
-      a?.betPlaced === true &&
-      b?.betPlaced !== true
-    ) {
-      return -1;
-    }
 
-    if (
-      b?.betPlaced === true &&
-      a?.betPlaced !== true
-    ) {
-      return 1;
-    }
-
-    const ao =
-      numberOrNull(a?.overOdds);
-
-    const bo =
-      numberOrNull(b?.overOdds);
-
-    if (ao !== null && bo !== null) {
-      return bo - ao;
-    }
-
-    if (ao !== null) return -1;
-    if (bo !== null) return 1;
-
-    return (
-      (numberOrNull(b?.hunterScore) ?? 0) -
-      (numberOrNull(a?.hunterScore) ?? 0)
-    );
-  });
-
-  const secureTargets =
-    targets.filter(
-      x => x?.betPlaced !== true
-    ).length;
-
-  const placedPending =
-    targets.filter(
-      x =>
-        x?.betPlaced === true &&
-        safe(x?.resultStatus)
-          .toUpperCase() === "PENDING"
-    ).length;
-
-  return {
-    trackerSignals:
-      signals.length,
-
-    matcherHunterResults:
-      hunterResults.length,
-
-    secureTargets,
-    placedPending,
-
-    liveFeedOk:
-      v27.ok,
-
-    liveMatches:
-      v27.matches.length,
-
-    targets
-  };
-}
-
-
-function liveReason(
-  liveFeedOk: boolean,
-  liveState: any,
-  inActionWindow: boolean,
-  betPlaced: boolean
-): string {
-  if (betPlaced) {
-    if (!liveFeedOk) {
-      return "BET_PLACED_WAIT_RESULT_V27_UNAVAILABLE";
-    }
-
-    if (!liveState?.found) {
-      return "BET_PLACED_WAIT_RESULT";
-    }
-
-    return "BET_PLACED_WAIT_RESULT";
-  }
-
-  if (!liveFeedOk) {
-    return "LIVE_FEED_UNAVAILABLE";
-  }
-
-  if (!liveState?.found) {
-    return "MATCH_NOT_IN_V27_LIVE";
-  }
-
-  if (!liveState?.firstHalf) {
-    return "NOT_FIRST_HALF";
-  }
-
-  if (!liveState?.zeroZero) {
-    return "NOT_ZERO_ZERO";
-  }
-
-  if (!inActionWindow) {
-    return "OUTSIDE_10_42_WINDOW";
-  }
-
-  return "LIVE_OK";
-}
-
-
-async function saveTarget(
-  env: Env,
-  target: Obj
-) {
-  const now =
-    new Date().toISOString();
-
-  await env.DB.prepare(`
-    INSERT INTO live_odds (
-      event_id, match_name, minute, score, hunter_score,
-      market, selection, over_odds, under_odds,
-      source, created_at, updated_at
-    )
-    VALUES (
-      ?1, ?2, ?3, NULL, ?4,
-      '1H Total Goals', 'Over 0.5', NULL, NULL,
-      'TOP_SIGNAL', ?5, ?5
-    )
-    ON CONFLICT(event_id) DO UPDATE SET
-      match_name = COALESCE(excluded.match_name, live_odds.match_name),
-      minute = COALESCE(excluded.minute, live_odds.minute),
-      hunter_score = COALESCE(excluded.hunter_score, live_odds.hunter_score)
-  `).bind(
-    target.eventId,
-    target.matchName,
-    target.minute,
-    target.hunterScore,
-    now
-  ).run();
-}
-
-
-async function getStoredEvent(
-  env: Env,
-  eventId: string
-): Promise<any> {
-  return await env.DB.prepare(`
-    SELECT *
-    FROM live_odds
-    WHERE event_id = ?1
-    LIMIT 1
-  `)
-  .bind(eventId)
-  .first();
-}
-
-
-async function getBetStatus(
-  env: Env,
-  eventId: string
-): Promise<any> {
-  return await env.DB.prepare(`
-    SELECT *
-    FROM bet_status
-    WHERE event_id = ?1
-    LIMIT 1
-  `)
-  .bind(eventId)
-  .first();
-}
-
-
-async function getDailyMatchByEventId(
-  env: Env,
-  eventId: string
-): Promise<any> {
-  return await env.DB.prepare(`
-    SELECT *
-    FROM daily_matches
-    WHERE event_id = ?1
-    LIMIT 1
-  `)
-  .bind(eventId)
-  .first();
-}
-
-
-async function getPlacedPendingMatches(
-  env: Env
-): Promise<Obj[]> {
-  const result =
-    await env.DB.prepare(`
-      SELECT *
-      FROM daily_matches
-      WHERE
-        day_key = ?1
-        AND bet_status = 'PLACED'
-        AND COALESCE(result_status, 'PENDING') = 'PENDING'
-      ORDER BY
-        COALESCE(placed_at, entry_time, first_seen_at) DESC
-    `)
-    .bind(sofiaDate())
-    .all();
-
-  return Array.isArray(result?.results)
-    ? result.results as Obj[]
-    : [];
-}
-
-
-// ============================================================
-// CURRENT V27 LIVE STATE
-// ============================================================
-
-const V27_PUBLIC_URL =
-  "https://goal-watch-proxy.kalchogr.workers.dev/";
-
-async function fetchV27Snapshot(
-  env: Env
-): Promise<{ ok: boolean; matches: Obj[]; error?: string }> {
-  try {
-    let data: any;
-
-    if (env.V27) {
-      const response =
-        await env.V27.fetch(
-          new Request(
-            "https://v27.internal/",
-            {
-              method: "GET",
-              headers: {
-                "accept": "application/json",
-                "cache-control": "no-store"
-              }
-            }
-          )
+  function readWindowLaunch() {
+    try {
+      const raw =
+        String(
+          window.name ||
+          ''
         );
-
-      const text =
-        await response.text();
-
-      if (!response.ok) {
-        throw new Error(
-          "V27 BINDING HTTP " +
-          response.status +
-          ": " +
-          text.slice(0, 300)
-        );
-      }
-
-      data =
-        JSON.parse(text);
-
-    } else {
-      const response =
-        await fetch(
-          V27_PUBLIC_URL +
-          "?top_signal_live=" +
-          Date.now(),
-          {
-            method: "GET",
-            headers: {
-              "accept": "application/json",
-              "cache-control": "no-store"
-            }
-          }
-        );
-
-      const text =
-        await response.text();
-
-      if (!response.ok) {
-        throw new Error(
-          "V27 PUBLIC HTTP " +
-          response.status +
-          ": " +
-          text.slice(0, 300)
-        );
-      }
-
-      data =
-        JSON.parse(text);
-    }
-
-    const matches =
-      Array.isArray(data?.matches)
-        ? data.matches
-        : Array.isArray(data?.feed?.matches)
-          ? data.feed.matches
-          : Array.isArray(data?.data?.matches)
-            ? data.data.matches
-            : [];
-
-    return {
-      ok: true,
-      matches:
-        matches.filter(
-          (x: any) =>
-            x &&
-            typeof x === "object"
-        )
-    };
-
-  } catch (error: any) {
-    console.warn(
-      "V27 LIVE STATE ERROR",
-      error
-    );
-
-    return {
-      ok: false,
-      matches: [],
-      error:
-        error?.message ??
-        String(error)
-    };
-  }
-}
-
-
-function findV27Match(
-  matches: Obj[],
-  matchId: string,
-  matchName: string
-): Obj | null {
-  if (!matches.length) {
-    return null;
-  }
-
-  const id =
-    safe(matchId);
-
-  if (id) {
-    const exact =
-      matches.find(
-        m =>
-          safe(
-            m?.id ??
-            m?.match_id
-          ) === id
-      );
-
-    if (exact) {
-      return exact;
-    }
-  }
-
-  const wanted =
-    normalizeName(matchName);
-
-  if (!wanted) {
-    return null;
-  }
-
-  const exactName =
-    matches.find(
-      m =>
-        normalizeName(
-          m?.match ??
-          m?.match_name ??
-          (
-            safe(
-              m?.home?.name ??
-              m?.home
-            ) +
-            " - " +
-            safe(
-              m?.away?.name ??
-              m?.away
-            )
-          )
-        ) === wanted
-    );
-
-  return exactName ?? null;
-}
-
-
-function normalizeV27LiveState(
-  m: Obj | null
-) {
-  if (!m) {
-    return {
-      found: false,
-      id: null,
-      minute: null,
-      minuteDisplay: null,
-      period: null,
-      homeScore: null,
-      awayScore: null,
-      zeroZero: false,
-      firstHalf: false
-    };
-  }
-
-  const score =
-    m?.score &&
-    typeof m.score === "object"
-      ? m.score
-      : {};
-
-  const minute =
-    numberOrNull(
-      m?.minute
-    );
-
-  const minuteDisplay =
-    safe(
-      m?.minute_display ??
-      m?.minuteDisplay
-    ) || (
-      minute !== null
-        ? String(minute) + "'"
-        : null
-    );
-
-  const period =
-    safe(
-      m?.period ??
-      m?.statusShort ??
-      m?.phase
-    );
-
-  const homeScore =
-    numberOrNull(
-      score?.home ??
-      m?.home_score ??
-      m?.score_home
-    );
-
-  const awayScore =
-    numberOrNull(
-      score?.away ??
-      m?.away_score ??
-      m?.score_away
-    );
-
-  const zeroZero =
-    homeScore === 0 &&
-    awayScore === 0;
-
-  const p =
-    period
-      .toUpperCase()
-      .replace(/\s+/g, " ")
-      .trim();
-
-  const firstHalf =
-    p === "1H" ||
-    p === "FIRST" ||
-    p === "FIRST HALF" ||
-    p === "1ST HALF" ||
-    p.includes("1H");
-
-  return {
-    found: true,
-
-    id:
-      safe(
-        m?.id ??
-        m?.match_id
-      ) || null,
-
-    minute,
-    minuteDisplay,
-
-    period:
-      period || null,
-
-    homeScore,
-    awayScore,
-    zeroZero,
-    firstHalf
-  };
-}
-
-
-// ============================================================
-// MATCHER
-// ============================================================
-
-async function callMatcher(
-  env: Env,
-  signals: Obj[]
-) {
-  if (!signals.length) {
-    return {
-      success: true,
-      hunter_results: [],
-      stats: {
-        hunter_signals: 0,
-        hunter_secure_matches: 0
-      }
-    };
-  }
-
-  const cleanSignals =
-    signals.map(s => {
-      const copy: Obj =
-        { ...s };
 
       if (
-        typeof copy.signal === "string"
+        !raw.startsWith(
+          WINDOW_PREFIX
+        )
       ) {
-        delete copy.signal;
+        return null;
       }
 
-      copy.type =
-        "HUNTER_ENTRY";
-
-      copy.action =
-        copy.action ??
-        "ENTRY";
-
-      copy.status =
-        copy.status ??
-        "TRACKING";
-
-      return copy;
-    });
-
-  const query =
-    encodeURIComponent(
-      JSON.stringify(cleanSignals)
-    );
-
-  return await fetchServiceJSON(
-    env.MATCHER,
-    "/match?signals=" + query
-  );
-}
-
-
-// ============================================================
-// TRACKER SIGNAL EXTRACTION
-// ============================================================
-
-function extractHunterSignals(
-  data: any
-): Obj[] {
-  let raw: any[] = [];
-
-  if (Array.isArray(data)) {
-    raw = data;
-
-  } else if (
-    Array.isArray(data?.signals)
-  ) {
-    raw = data.signals;
-
-  } else if (
-    Array.isArray(data?.entries)
-  ) {
-    raw = data.entries;
-
-  } else if (
-    Array.isArray(data?.hunter_entries)
-  ) {
-    raw = data.hunter_entries;
-
-  } else if (
-    Array.isArray(data?.data)
-  ) {
-    raw = data.data;
+      return normalizeLaunch(
+        safeJsonParse(
+          raw.slice(
+            WINDOW_PREFIX.length
+          )
+        )
+      );
+    } catch {
+      return null;
+    }
   }
 
-  const out: Obj[] = [];
-  const seen =
-    new Set<string>();
 
-  for (const item of raw) {
-    if (
-      !item ||
-      typeof item !== "object"
-    ) {
-      continue;
-    }
-
-    const marker = [
-      item?.type,
-      typeof item?.signal === "string"
-        ? item.signal
-        : "",
-      item?.action
-    ]
-      .map(safe)
-      .join(" ")
-      .toUpperCase();
-
-    const status =
-      safe(item?.status)
-        .toUpperCase();
-
-    const isHunter =
-      marker.includes("HUNTER_ENTRY") ||
-      marker.includes("HUNTER") ||
-      (
-        safe(item?.action)
-          .toUpperCase() === "ENTRY" &&
-        status === "TRACKING"
-      );
-
-    if (!isHunter) {
-      continue;
-    }
-
-    const normalized =
-      normalizeHunterSignal(item);
-
-    if (!normalized) {
-      continue;
-    }
-
-    const key =
-      safe(normalized.id) ||
-      (
-        safe(normalized.match_id) +
-        "|" +
-        safe(normalized.entry_time) +
-        "|" +
-        safe(normalized.match_name)
-      );
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-    out.push(normalized);
-  }
-
-  return out;
-}
-
-
-function normalizeHunterSignal(
-  x: Obj
-): Obj | null {
-  const matchName =
-    safe(
-      x?.match_name ??
-      x?.match
-    );
-
-  let home =
-    safe(
-      typeof x?.home === "object"
-        ? x?.home?.name
-        : x?.home
-    );
-
-  let away =
-    safe(
-      typeof x?.away === "object"
-        ? x?.away?.name
-        : x?.away
-    );
-
-  if (
-    (!home || !away) &&
-    matchName
-  ) {
-    const parts =
-      matchName.split(
-        /\s+-\s+|\s+v\s+|\s+vs\.?\s+/i
-      );
-
-    if (parts.length >= 2) {
-      home =
-        home ||
-        safe(parts[0]);
-
-      away =
-        away ||
-        safe(
-          parts
-            .slice(1)
-            .join(" - ")
+  function captureLaunch() {
+    try {
+      const url =
+        new URL(
+          location.href
         );
-    }
-  }
 
-  if (
-    !matchName &&
-    (!home || !away)
-  ) {
+      const hash =
+        readHashParams();
+
+      const action =
+        clean(
+          url.searchParams.get(
+            'ts-action'
+          ) ||
+          hash.get(
+            'ts-action'
+          )
+        ).toLowerCase();
+
+      const eventId =
+        clean(
+          url.searchParams.get(
+            'ts-event'
+          ) ||
+          hash.get(
+            'ts-event'
+          )
+        );
+
+      if (
+        (
+          action === 'check' ||
+          action === 'bet'
+        ) &&
+        eventId
+      ) {
+        const launch = {
+          action,
+          eventId,
+          createdAt:
+            Date.now()
+        };
+
+        writeWindowLaunch(
+          launch
+        );
+
+        return launch;
+      }
+    } catch {}
+
+    const fromWindow =
+      readWindowLaunch();
+
+    if (fromWindow) {
+      try {
+        sessionStorage.setItem(
+          ACTION_CACHE_KEY,
+          fromWindow.action
+        );
+
+        sessionStorage.setItem(
+          EVENT_CACHE_KEY,
+          fromWindow.eventId
+        );
+      } catch {}
+
+      return fromWindow;
+    }
+
+    try {
+      const action =
+        clean(
+          sessionStorage.getItem(
+            ACTION_CACHE_KEY
+          )
+        ).toLowerCase();
+
+      const eventId =
+        clean(
+          sessionStorage.getItem(
+            EVENT_CACHE_KEY
+          )
+        );
+
+      if (
+        (
+          action === 'check' ||
+          action === 'bet'
+        ) &&
+        eventId
+      ) {
+        const launch = {
+          action,
+          eventId,
+          createdAt:
+            Date.now()
+        };
+
+        writeWindowLaunch(
+          launch
+        );
+
+        return launch;
+      }
+    } catch {}
+
     return null;
   }
 
-  return {
-    id:
-      x?.id ??
-      null,
 
-    type:
-      "HUNTER_ENTRY",
+  let launchState =
+    captureLaunch();
 
-    action:
-      safe(x?.action) ||
-      "ENTRY",
 
-    status:
-      safe(x?.status) ||
-      "TRACKING",
+  function getAction() {
+    const fresh =
+      captureLaunch();
 
-    match_id:
-      safe(x?.match_id),
+    if (fresh) {
+      launchState =
+        fresh;
+    }
 
-    match_name:
-      matchName ||
-      (home + " - " + away),
+    return (
+      launchState?.action ||
+      'passive'
+    );
+  }
 
-    match:
-      matchName ||
-      (home + " - " + away),
 
-    league:
-      safe(x?.league),
+  // ============================================================
+  // EVENT ID
+  // ============================================================
 
-    entry_time:
-      safe(
-        x?.entry_time ??
-        x?.created_at
-      ),
+  function getEventId() {
+    const fresh =
+      captureLaunch();
 
-    entry_minute:
-      numberOrNull(
-        x?.entry_minute ??
-        x?.minute
-      ),
+    if (fresh) {
+      launchState =
+        fresh;
 
-    hunter_score:
-      numberOrNull(
-        x?.hunter_score ??
-        x?.goal_signal?.score
-      ),
+      return fresh.eventId;
+    }
 
-    // Preserve Tracker-captured Cloudbet odds.
-    // V2.0.7 dropped this field during normalization.
-    entry_odds:
-      numberOrNull(
-        x?.entry_odds ??
-        x?.entryOdds ??
-        x?.odds ??
-        x?.cloudbet?.entry_odds ??
-        x?.cloudbet?.entryOdds
-      ),
+    if (
+      launchState?.eventId
+    ) {
+      return clean(
+        launchState.eventId
+      );
+    }
 
-    odds_available:
-      (
-        x?.odds_available === true ||
-        numberOrNull(
-          x?.entry_odds ??
-          x?.entryOdds ??
-          x?.odds ??
-          x?.cloudbet?.entry_odds ??
-          x?.cloudbet?.entryOdds
-        ) !== null
-      ),
+    const fromWindow =
+      readWindowLaunch();
 
-    cloudbet_event_id:
-      safe(
-        x?.cloudbet_event_id ??
-        x?.cloudbet?.event_id ??
-        x?.cloudbet?.eventId ??
-        x?.cloudbet?.id
-      ),
+    if (
+      fromWindow?.eventId
+    ) {
+      launchState =
+        fromWindow;
 
-    goal_pressure:
-      numberOrNull(
-        x?.goal_pressure
-      ),
+      return clean(
+        fromWindow.eventId
+      );
+    }
 
-    danger_index:
-      numberOrNull(
-        x?.danger_index
-      ),
+    try {
+      const cached =
+        sessionStorage.getItem(
+          EVENT_CACHE_KEY
+        );
 
-    attack_score:
-      numberOrNull(
-        x?.attack_score
-      ),
+      if (cached) {
+        return clean(
+          cached
+        );
+      }
 
-    home,
-    away,
+      const match =
+        location.href.match(
+          /(?:event|events|sportsbook|live)[^\d]*(\d{6,})/i
+        );
 
-    score:
-      x?.score ?? {
+      if (match) {
+        return clean(
+          match[1]
+        );
+      }
+
+    } catch {}
+
+    return '';
+  }
+
+
+  // ============================================================
+  // SCORE
+  // ============================================================
+
+  function parseScore(text) {
+    text =
+      clean(text);
+
+    let match =
+      text.match(
+        /Current\s*goals\s*:?\s*(\d+)\s*\(\s*(\d+)\s*[-:–—]\s*(\d+)\s*\)/i
+      );
+
+    if (match) {
+      return {
+        total:
+          Number(match[1]),
+
         home:
-          numberOrNull(
-            x?.entry_home_score
-          ) ?? 0,
+          Number(match[2]),
 
         away:
-          numberOrNull(
-            x?.entry_away_score
-          ) ?? 0
-      }
-  };
-}
+          Number(match[3]),
 
+        cached:
+          false
+      };
+    }
 
-// ============================================================
-// DAILY LOG
-// ============================================================
-
-async function saveDailyTarget(
-  env: Env,
-  target: Obj
-) {
-  const now =
-    new Date().toISOString();
-
-  const dayKey =
-    sofiaDate(
-      target.entryTime ||
-      now
-    );
-
-  const bet =
-    await getBetStatus(
-      env,
-      target.eventId
-    );
-
-  await env.DB.prepare(`
-    INSERT INTO daily_matches (
-      event_id, signal_id, match_id, match_name,
-      entry_minute, hunter_score, found_odds,
-      bet_status, bet_odds, bet_stake,
-      tracker_status, tracker_result, result_status,
-      day_key, entry_time, placed_at,
-      first_seen_at, updated_at, finished_at
-    )
-    VALUES (
-      ?1, ?2, ?3, ?4,
-      ?5, ?6, NULL,
-      ?7, ?8, ?9,
-      'TRACKING', 'PENDING', 'PENDING',
-      ?10, ?11, ?12,
-      ?13, ?13, NULL
-    )
-    ON CONFLICT(event_id) DO UPDATE SET
-      signal_id = COALESCE(excluded.signal_id, daily_matches.signal_id),
-      match_id = COALESCE(excluded.match_id, daily_matches.match_id),
-      match_name = COALESCE(excluded.match_name, daily_matches.match_name),
-      entry_minute = COALESCE(excluded.entry_minute, daily_matches.entry_minute),
-      hunter_score = COALESCE(excluded.hunter_score, daily_matches.hunter_score),
-      updated_at = excluded.updated_at
-  `).bind(
-    target.eventId,
-    target.signalId || null,
-    target.matchId || null,
-    target.matchName,
-    target.minute,
-    target.hunterScore,
-
-    safe(bet?.status)
-      .toUpperCase() === "PLACED"
-        ? "PLACED"
-        : "NOT_PLACED",
-
-    numberOrNull(bet?.odds),
-    numberOrNull(bet?.stake),
-
-    dayKey,
-    target.entryTime || null,
-    bet?.placed_at ?? null,
-    now
-  ).run();
-}
-
-
-async function updateDailyPlaced(
-  env: Env,
-  eventId: string,
-  odds: number | null,
-  stake: number | null,
-  placedAt: string
-) {
-  const now =
-    new Date().toISOString();
-
-  await env.DB.prepare(`
-    UPDATE daily_matches
-    SET
-      bet_status = 'PLACED',
-      bet_odds = COALESCE(?2, bet_odds, found_odds),
-      bet_stake = COALESCE(?3, bet_stake),
-      placed_at = ?4,
-      updated_at = ?5
-    WHERE event_id = ?1
-  `).bind(
-    eventId,
-    odds,
-    stake,
-    placedAt,
-    now
-  ).run();
-}
-
-
-async function syncDailyFromTracker(
-  env: Env
-) {
-  const tracker =
-    await fetchServiceJSON(
-      env.TRACKER,
-      "/entries"
-    );
-
-  await syncDailyFromTrackerData(
-    env,
-    tracker
-  );
-}
-
-
-async function syncDailyFromTrackerData(
-  env: Env,
-  tracker: any
-) {
-  const records =
-    extractTrackerRecords(tracker);
-
-  if (!records.length) {
-    return;
-  }
-
-  const today =
-    sofiaDate();
-
-  const rows =
-    await env.DB.prepare(`
-      SELECT
-        event_id,
-        signal_id,
-        match_id,
-        match_name
-      FROM daily_matches
-      WHERE day_key = ?1
-    `)
-    .bind(today)
-    .all();
-
-  const daily =
-    Array.isArray(rows?.results)
-      ? rows.results
-      : [];
-
-  for (const row of daily) {
-    const record =
-      findTrackerRecordForDaily(
-        row,
-        records
+    match =
+      text.match(
+        /Current\s*goals\s*:?\s*\(\s*(\d+)\s*[-:–—]\s*(\d+)\s*\)/i
       );
 
-    if (!record) {
-      continue;
+    if (match) {
+      const home =
+        Number(match[1]);
+
+      const away =
+        Number(match[2]);
+
+      return {
+        total:
+          home + away,
+
+        home,
+        away,
+        cached:
+          false
+      };
     }
 
-    const normalized =
-      normalizeTrackerResult(
-        record
-      );
-
-    if (!normalized) {
-      continue;
-    }
-
-    const now =
-      new Date().toISOString();
-
-    await env.DB.prepare(`
-      UPDATE daily_matches
-      SET
-        tracker_status = ?2,
-        tracker_result = ?3,
-        result_status = ?4,
-        updated_at = ?5,
-        finished_at = CASE
-          WHEN ?4 IN ('WIN','LOSS')
-          THEN COALESCE(finished_at, ?5)
-          ELSE finished_at
-        END
-      WHERE event_id = ?1
-    `).bind(
-      row.event_id,
-      normalized.trackerStatus,
-      normalized.trackerResult,
-      normalized.resultStatus,
-      now
-    ).run();
-  }
-}
-
-
-function extractTrackerRecords(
-  data: any
-): Obj[] {
-  const candidates: any[][] = [];
-
-  if (Array.isArray(data)) {
-    candidates.push(data);
-  }
-
-  if (Array.isArray(data?.signals)) {
-    candidates.push(data.signals);
-  }
-
-  if (Array.isArray(data?.entries)) {
-    candidates.push(data.entries);
-  }
-
-  if (Array.isArray(data?.hunter_entries)) {
-    candidates.push(data.hunter_entries);
-  }
-
-  if (Array.isArray(data?.data)) {
-    candidates.push(data.data);
-  }
-
-  const out: Obj[] = [];
-  const seen =
-    new Set<string>();
-
-  for (const arr of candidates) {
-    for (const value of arr) {
-      if (
-        !value ||
-        typeof value !== "object"
-      ) {
-        continue;
-      }
-
-      const key =
-        safe(value?.id) ||
-        (
-          safe(value?.match_id) +
-          "|" +
-          safe(
-            value?.match_name ??
-            value?.match
-          ) +
-          "|" +
-          safe(value?.status) +
-          "|" +
-          safe(value?.result)
-        );
-
-      if (seen.has(key)) {
-        continue;
-      }
-
-      seen.add(key);
-      out.push(value);
-    }
-  }
-
-  return out;
-}
-
-
-function findTrackerRecordForDaily(
-  row: any,
-  records: Obj[]
-): Obj | null {
-  const signalId =
-    safe(row?.signal_id);
-
-  const matchId =
-    safe(row?.match_id);
-
-  const matchName =
-    normalizeName(
-      row?.match_name
-    );
-
-  let best: Obj | null =
-    null;
-
-  for (const r of records) {
-    if (
-      signalId &&
-      safe(r?.id) === signalId
-    ) {
-      return r;
-    }
-
-    if (
-      matchId &&
-      safe(r?.match_id) === matchId
-    ) {
-      best = r;
-      continue;
-    }
-
-    const rName =
-      normalizeName(
-        r?.match_name ??
-        r?.match
-      );
-
-    if (
-      !best &&
-      matchName &&
-      rName &&
-      matchName === rName
-    ) {
-      best = r;
-    }
-  }
-
-  return best;
-}
-
-
-function normalizeTrackerResult(
-  record: Obj
-) {
-  const status =
-    safe(record?.status)
-      .toUpperCase();
-
-  const result =
-    safe(record?.result)
-      .toUpperCase();
-
-  const action =
-    safe(record?.action)
-      .toUpperCase();
-
-  const type =
-    safe(record?.type)
-      .toUpperCase();
-
-  const text = [
-    status,
-    result,
-    action,
-    type
-  ]
-    .join(" ")
-    .replace(/_/g, " ");
-
-  if (
-    text.includes("NO GOAL") ||
-    text.includes("NO-GOAL")
-  ) {
-    return {
-      trackerStatus:
-        status || "FINISHED",
-
-      trackerResult:
-        result || "NO GOAL",
-
-      resultStatus:
-        "LOSS"
-    };
-  }
-
-  if (
-    text.includes("GOAL HIT") ||
-    /\bGOAL\b/.test(text)
-  ) {
-    return {
-      trackerStatus:
-        status || "FINISHED",
-
-      trackerResult:
-        result || "GOAL HIT",
-
-      resultStatus:
-        "WIN"
-    };
-  }
-
-  if (
-    status === "TRACKING" ||
-    text.includes("ENTRY") ||
-    text.includes("PENDING")
-  ) {
-    return {
-      trackerStatus:
-        status || "TRACKING",
-
-      trackerResult:
-        result || "PENDING",
-
-      resultStatus:
-        "PENDING"
-    };
-  }
-
-  return null;
-}
-
-
-async function getDailyMatches(
-  env: Env
-): Promise<Obj[]> {
-  const result =
-    await env.DB.prepare(`
-      SELECT *
-      FROM daily_matches
-      WHERE day_key = ?1
-      ORDER BY
-        COALESCE(entry_time, first_seen_at) DESC,
-        first_seen_at DESC
-    `)
-    .bind(sofiaDate())
-    .all();
-
-  return Array.isArray(result?.results)
-    ? result.results as Obj[]
-    : [];
-}
-
-
-function buildDailySummary(
-  matches: Obj[]
-) {
-  const today =
-    matches.length;
-
-  const placedRows =
-    matches.filter(
-      x =>
-        safe(x?.bet_status)
-          .toUpperCase() === "PLACED"
-    );
-
-  const wins =
-    placedRows.filter(
-      x =>
-        safe(x?.result_status)
-          .toUpperCase() === "WIN"
-    ).length;
-
-  const losses =
-    placedRows.filter(
-      x =>
-        safe(x?.result_status)
-          .toUpperCase() === "LOSS"
-    ).length;
-
-  const settled =
-    wins + losses;
-
-  return {
-    today,
-
-    placed:
-      placedRows.length,
-
-    wins,
-    losses,
-
-    notPlaced:
-      today -
-      placedRows.length,
-
-    pending:
-      placedRows.filter(
-        x =>
-          safe(x?.result_status)
-            .toUpperCase() === "PENDING"
-      ).length,
-
-    successRate:
-      settled > 0
-        ? (wins / settled) * 100
-        : null
-  };
-}
-
-
-// ============================================================
-// SERVICE FETCH
-// ============================================================
-
-async function fetchServiceJSON(
-  service: Fetcher,
-  path: string
-): Promise<any> {
-  const response =
-    await service.fetch(
-      new Request(
-        "https://internal" + path,
-        {
-          method: "GET",
-          headers: {
-            "accept":
-              "application/json",
-
-            "cache-control":
-              "no-store"
-          }
-        }
-      )
-    );
-
-  const text =
-    await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      "HTTP " +
-      response.status +
-      ": " +
-      text.slice(0, 500)
-    );
-  }
-
-  try {
-    return JSON.parse(text);
-
-  } catch {
-    throw new Error(
-      "INVALID_JSON: " +
-      text.slice(0, 500)
-    );
-  }
-}
-
-
-// ============================================================
-// HELPERS
-// ============================================================
-
-function sofiaDate(
-  value?: string
-): string {
-  const date =
-    value
-      ? new Date(value)
-      : new Date();
-
-  try {
-    const parts =
-      new Intl.DateTimeFormat(
-        "en-CA",
-        {
-          timeZone:
-            TIME_ZONE,
-
-          year:
-            "numeric",
-
-          month:
-            "2-digit",
-
-          day:
-            "2-digit"
-        }
-      )
-      .formatToParts(date);
-
-    const map: Obj = {};
-
-    for (const p of parts) {
-      if (
-        p.type !== "literal"
-      ) {
-        map[p.type] =
-          p.value;
-      }
-    }
-
-    return (
-      `${map.year}-${map.month}-${map.day}`
-    );
-
-  } catch {
-    return date
-      .toISOString()
-      .slice(0, 10);
-  }
-}
-
-
-function normalizeName(
-  value: any
-): string {
-  return safe(value)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(
-      /[\u0300-\u036f]/g,
-      ""
-    )
-    .replace(
-      /[^a-z0-9]+/g,
-      " "
-    )
-    .trim()
-    .replace(
-      /\s+/g,
-      " "
-    );
-}
-
-
-function safe(
-  value: any
-): string {
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return "";
-  }
-
-  return String(value)
-    .trim();
-}
-
-
-function numberOrNull(
-  value: any
-): number | null {
-  if (
-    value === null ||
-    value === undefined ||
-    value === ""
-  ) {
     return null;
   }
 
-  const n =
-    Number(value);
 
-  return Number.isFinite(n)
-    ? n
-    : null;
-}
-
-
-function corsHeaders() {
-  return {
-    "access-control-allow-origin":
-      "*",
-
-    "access-control-allow-methods":
-      "GET,POST,OPTIONS",
-
-    "access-control-allow-headers":
-      "content-type"
-  };
-}
-
-
-function json(
-  data: any,
-  status = 200
-): Response {
-  return new Response(
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
-    {
-      status,
-      headers: {
-        "content-type":
-          "application/json; charset=UTF-8",
-
-        "cache-control":
-          "no-store",
-
-        ...corsHeaders()
-      }
+  function readLiveScore() {
+    if (!document.body) {
+      return null;
     }
-  );
-}
 
-
-// ============================================================
-// DASHBOARD
-// ============================================================
-
-function renderHtml(): string {
-  return `<!DOCTYPE html>
-<html lang="bg">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Top Signal Control</title>
-
-<style>
-*{box-sizing:border-box}
-body{
-  margin:0;
-  background:#0b0e13;
-  color:#fff;
-  font-family:Arial,Helvetica,sans-serif
-}
-.app{
-  max-width:760px;
-  margin:0 auto;
-  padding:10px
-}
-.title{
-  font-size:20px;
-  font-weight:900
-}
-.subtitle{
-  margin-top:3px;
-  color:#8d96a5;
-  font-size:9px
-}
-.summary{
-  margin-top:10px;
-  display:grid;
-  grid-template-columns:repeat(4,1fr);
-  gap:5px
-}
-.sum{
-  background:#151a22;
-  border:1px solid #252c38;
-  border-radius:9px;
-  padding:7px 3px;
-  text-align:center
-}
-.sum .v{
-  font-size:17px;
-  font-weight:900
-}
-.sum .l{
-  margin-top:2px;
-  font-size:7px;
-  color:#8d96a5
-}
-.stats{
-  margin-top:7px;
-  color:#7d8797;
-  font-size:9px;
-  line-height:1.4
-}
-.err{color:#fca5a5}
-.card{
-  margin-top:8px;
-  padding:9px;
-  background:#151a22;
-  border:1px solid #252c38;
-  border-radius:11px
-}
-.card.placed{
-  border-color:#16a34a;
-  background:#101d16
-}
-.placedBanner{
-  margin-bottom:6px;
-  padding:5px 7px;
-  border-radius:6px;
-  background:#14532d;
-  color:#bbf7d0;
-  font-size:9px;
-  font-weight:900;
-  text-align:center
-}
-.match{
-  font-size:14px;
-  font-weight:900;
-  line-height:1.25
-}
-.event{
-  margin-top:2px;
-  color:#646f80;
-  font-size:7px
-}
-.meta{
-  margin-top:4px;
-  display:flex;
-  gap:8px;
-  color:#adb5c2;
-  font-size:9px
-}
-.liveLine{
-  margin-top:7px;
-  display:grid;
-  grid-template-columns:auto auto 1fr;
-  gap:6px;
-  align-items:center;
-  padding:7px 8px;
-  background:#0f141c;
-  border:1px solid #283241;
-  border-radius:8px;
-  font-size:10px;
-  font-weight:900
-}
-.liveLine.ok{
-  border-color:#166534;
-  background:#0c1711
-}
-.liveLine.bad{
-  border-color:#7f1d1d;
-  background:#1d1010
-}
-.liveLine.unknown{
-  border-color:#854d0e;
-  background:#1c160b
-}
-.liveLine.placed{
-  border-color:#166534;
-  background:#0c1711
-}
-.liveMinute{color:#67e8f9}
-.liveScore{
-  font-size:16px;
-  color:#fff
-}
-.livePeriod{
-  color:#9ca3af;
-  text-align:right
-}
-.invalidBanner{
-  margin-top:6px;
-  padding:5px 7px;
-  border-radius:6px;
-  background:#450a0a;
-  color:#fecaca;
-  font-size:8px;
-  font-weight:900;
-  text-align:center
-}
-.unknownBanner{
-  margin-top:6px;
-  padding:5px 7px;
-  border-radius:6px;
-  background:#422006;
-  color:#fde68a;
-  font-size:8px;
-  font-weight:900;
-  text-align:center
-}
-.placedWaitBanner{
-  margin-top:6px;
-  padding:5px 7px;
-  border-radius:6px;
-  background:#052e16;
-  color:#bbf7d0;
-  font-size:8px;
-  font-weight:900;
-  text-align:center
-}
-.btn[disabled]{
-  cursor:not-allowed;
-  opacity:.48
-}
-.marketLine{
-  margin-top:7px;
-  display:flex;
-  align-items:center;
-  justify-content:space-between
-}
-.marketName{
-  color:#a7b0bd;
-  font-size:10px;
-  font-weight:800
-}
-.odds{
-  font-size:20px;
-  font-weight:900;
-  text-align:right
-}
-.state{
-  font-size:8px;
-  text-align:right
-}
-.ready{color:#86efac}
-.waiting{color:#fbbf24}
-.actions{
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:6px;
-  margin-top:7px
-}
-.btn{
-  border:0;
-  border-radius:8px;
-  padding:8px 6px;
-  font-size:9px;
-  font-weight:900;
-  cursor:pointer
-}
-.check{
-  background:#2563eb;
-  color:#fff
-}
-.bet{
-  background:#16a34a;
-  color:#fff
-}
-.bet[disabled]{
-  background:#26303c;
-  color:#788393
-}
-.empty{
-  margin-top:9px;
-  padding:16px 10px;
-  background:#151a22;
-  border:1px solid #252c38;
-  border-radius:11px;
-  text-align:center;
-  color:#9aa4b3;
-  font-size:10px;
-  line-height:1.5
-}
-.daily{
-  margin-top:14px;
-  background:#151a22;
-  border:1px solid #252c38;
-  border-radius:11px;
-  overflow:hidden
-}
-.dailyHead{
-  width:100%;
-  padding:11px;
-  border:0;
-  background:#151a22;
-  color:#fff;
-  display:flex;
-  justify-content:space-between;
-  font-size:11px;
-  font-weight:900
-}
-.dailyBody{
-  display:none;
-  padding:0 9px 9px;
-  border-top:1px solid #252c38
-}
-.daily.open .dailyBody{
-  display:block
-}
-.dailySummary{
-  margin-top:8px;
-  display:grid;
-  grid-template-columns:repeat(2,1fr);
-  gap:4px
-}
-.ds{
-  background:#0f1319;
-  border-radius:7px;
-  padding:6px 7px;
-  font-size:9px;
-  display:flex;
-  justify-content:space-between
-}
-.dailyRow{
-  padding:8px 2px;
-  border-top:1px solid #242a34
-}
-.dailyMatch{
-  font-size:10px;
-  font-weight:900
-}
-.dailyStatus{
-  margin-top:3px;
-  display:flex;
-  flex-wrap:wrap;
-  gap:5px;
-  font-size:8px;
-  color:#929baa
-}
-.pill{
-  padding:2px 5px;
-  border-radius:5px;
-  background:#202632
-}
-.win{
-  color:#4ade80;
-  font-weight:900
-}
-.loss{
-  color:#f87171;
-  font-weight:900
-}
-.pending{
-  color:#fbbf24;
-  font-weight:900
-}
-.footer{
-  margin-top:14px;
-  text-align:center;
-  color:#596273;
-  font-size:7px
-}
-
-.simpleBetInfo{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:14px;
-  margin-top:16px;
-  margin-bottom:14px;
-}
-.simpleHunter{
-  font-size:16px;
-  font-weight:900;
-  color:#f4f4f5;
-}
-.simpleOdds{
-  font-size:30px;
-  line-height:1;
-  font-weight:1000;
-  color:#fff;
-  letter-spacing:-1px;
-}
-.simpleActions{
-  display:block !important;
-  grid-template-columns:none !important;
-}
-.simpleBetButton{
-  width:100% !important;
-  min-height:58px;
-  font-size:18px !important;
-  font-weight:1000 !important;
-  border-radius:14px !important;
-}
-.card.placed .simpleBetButton{
-  opacity:1 !important;
-}
-
-</style>
-</head>
-
-<body>
-<div class="app">
-
-<div class="title">⚡ TOP SIGNAL MANUAL</div>
-
-<div class="subtitle">
-V2.0.8 TRACKER ODDS PRESERVED · TRACKER → MATCHER → V27 LIVE
-</div>
-
-<div class="summary">
-  <div class="sum">
-    <div id="sumTargets" class="v">0</div>
-    <div class="l">ACTIVE</div>
-  </div>
-
-  <div class="sum">
-    <div id="sumReady" class="v">0</div>
-    <div class="l">ODDS READY</div>
-  </div>
-
-  <div class="sum">
-    <div id="sumPlaced" class="v">0</div>
-    <div class="l">BET PLACED</div>
-  </div>
-
-  <div class="sum">
-    <div id="sumBest" class="v">—</div>
-    <div class="l">BEST O0.5</div>
-  </div>
-</div>
-
-<div id="stats" class="stats">
-Loading...
-</div>
-
-<div id="list"></div>
-
-<div id="daily" class="daily">
-  <button
-    id="dailyHead"
-    class="dailyHead"
-    type="button"
-  >
-    <span>
-      📊 ДНЕШНИ МАЧОВЕ ·
-      <span id="dailyCount">0</span>
-    </span>
-
-    <span id="dailyArrow">
-      ▸
-    </span>
-  </button>
-
-  <div class="dailyBody">
-    <div
-      id="dailySummary"
-      class="dailySummary"
-    ></div>
-
-    <div id="dailyList"></div>
-  </div>
-</div>
-
-<div class="footer">
-DAILY MATCH LOG · EUROPE/SOFIA · SUCCESS = WIN / (WIN + LOSS)
-</div>
-
-</div>
-
-<script>
-const CLOUDBET_ORIGIN =
-  'https://www.cloud0007.com';
-
-const TARGET_REFRESH_MS =
-  10000;
-
-const DAILY_REFRESH_MS =
-  30000;
-
-let targetRefreshRunning =
-  false;
-
-let dailyRefreshRunning =
-  false;
-
-let latestTargets = [];
-let latestDaily = [];
-let dailyOpen = false;
-
-
-function esc(v){
-  return String(v ?? '')
-    .replace(
-      /[&<>"']/g,
-      c => ({
-        '&':'&amp;',
-        '<':'&lt;',
-        '>':'&gt;',
-        '"':'&quot;',
-        "'":'&#39;'
-      }[c])
-    );
-}
-
-
-function num(v){
-  const x =
-    Number(v);
-
-  return Number.isFinite(x)
-    ? x
-    : null;
-}
-
-
-function eventUrl(
-  target,
-  action
-){
-  const id =
-    String(
-      target?.eventId ??
-      ''
-    ).trim();
-
-  const u =
-    new URL(
-      CLOUDBET_ORIGIN +
-      '/en/sports/soccer/live/' +
-      encodeURIComponent(id)
-    );
-
-  u.searchParams.set(
-    'markets-tab',
-    'goals'
-  );
-
-  u.searchParams.set(
-    'ts-action',
-    action
-  );
-
-  u.searchParams.set(
-    'ts-event',
-    id
-  );
-
-  u.searchParams.set(
-    'ts-launch',
-    Date.now().toString()
-  );
-
-  u.hash =
-    'ts-action=' +
-    encodeURIComponent(action) +
-    '&ts-event=' +
-    encodeURIComponent(id);
-
-  return u.href;
-}
-
-
-function go(
-  target,
-  action
-){
-  if (!target?.eventId) {
-    return;
-  }
-
-  if (
-    action === 'bet' &&
-    target?.betPlaced
-  ) {
-    return;
-  }
-
-  const id =
-    String(
-      target.eventId
-    ).trim();
-
-  try {
-    window.name =
-      'TOP_SIGNAL::' +
-      JSON.stringify({
-        action,
-        eventId: id,
-        createdAt:
-          Date.now()
-      });
-
-  } catch (e) {
-    console.warn(
-      'TOP SIGNAL window.name save failed',
-      e
-    );
-  }
-
-  location.href =
-    eventUrl(
-      target,
-      action
-    );
-}
-
-
-function card(t){
-  const odds =
-    num(
-      t?.betPlaced
-        ? (
-            t?.betOdds ??
-            t?.overOdds
-          )
-        : t?.overOdds
-    );
-
-  // Valid decimal odds only.
-  // 0 / 0.00 / null must never become READY or BET NOW.
-  const ready =
-    odds !== null &&
-    odds > 1;
-
-  const placed =
-    t?.betPlaced === true;
-
-  const liveValid =
-    t?.canAct === true;
-
-  const actionLocked =
-    placed ||
-    !liveValid;
-
-  const hunterScore =
-    num(
-      t?.hunterScore
-    );
-
-  return (
-    '<div class="card ' +
-    (placed ? 'placed' : '') +
-    '">' +
-
-      '<div class="match">⚽ ' +
-        esc(
-          t?.matchName ||
-          'Hunter target'
-        ) +
-      '</div>' +
-
-      '<div class="simpleBetInfo">' +
-
-        '<div class="simpleHunter">' +
-          '🔥 HUNTER ' +
-          esc(
-            hunterScore !== null
-              ? hunterScore
-              : '—'
-          ) +
-        '</div>' +
-
-        '<div class="simpleOdds">' +
-          (
-            ready
-              ? '@' + odds.toFixed(2)
-              : '@—'
-          ) +
-        '</div>' +
-
-      '</div>' +
-
-      '<div class="actions simpleActions">' +
-
-        '<button ' +
-          'class="btn bet simpleBetButton" ' +
-          'data-action="bet" ' +
-          'data-id="' +
-          esc(t?.eventId) +
-          '" ' +
-          (
-            (
-              placed ||
-              !ready ||
-              actionLocked
-            )
-              ? 'disabled'
-              : ''
-          ) +
-        '>' +
-
-          (
-            placed
-              ? '✅ BET PLACED'
-              : actionLocked
-                ? 'BET LOCKED'
-                : !ready
-                  ? 'WAIT ODDS'
-                  : 'BET NOW'
-          ) +
-
-        '</button>' +
-
-      '</div>' +
-
-    '</div>'
-  );
-}
-
-function dailyRow(m){
-  const placed =
-    String(
-      m?.bet_status ??
-      ''
-    ).toUpperCase() ===
-    'PLACED';
-
-  const result =
-    String(
-      m?.result_status ??
-      'PENDING'
-    ).toUpperCase();
-
-  const odds =
-    num(
-      placed
-        ? (
-            m?.bet_odds ??
-            m?.found_odds
-          )
-        : m?.found_odds
-    );
-
-  let resultHtml =
-    '—';
-
-  if (placed) {
-    if (result === 'WIN') {
-      resultHtml =
-        '<span class="win">✅ ПЕЧЕЛИ</span>';
-
-    } else if (
-      result === 'LOSS'
-    ) {
-      resultHtml =
-        '<span class="loss">❌ НЕ ПЕЧЕЛИ</span>';
-
-    } else {
-      resultHtml =
-        '<span class="pending">⏳ PENDING</span>';
-    }
-  }
-
-  return (
-    '<div class="dailyRow">' +
-
-      '<div class="dailyMatch">' +
-        esc(
-          m?.match_name ||
-          'Unknown match'
-        ) +
-      '</div>' +
-
-      '<div class="dailyStatus">' +
-
-        '<span>' +
-          (
-            odds !== null
-              ? '@' +
-                odds.toFixed(2)
-              : '@—'
-          ) +
-        '</span>' +
-
-        '<span class="pill">' +
-          (
-            placed
-              ? 'ЗАЛОЖЕН'
-              : 'НЕЗАЛОЖЕН'
-          ) +
-        '</span>' +
-
-        '<span>' +
-          resultHtml +
-        '</span>' +
-
-      '</div>' +
-
-    '</div>'
-  );
-}
-
-
-function renderDailySummary(s){
-  const rate =
-    s?.successRate === null ||
-    s?.successRate === undefined
-      ? '—'
-      : Number(
-          s.successRate
-        ).toFixed(1) +
-        '%';
-
-  return (
-    '<div class="ds">' +
-      '<span>ДНЕС</span>' +
-      '<strong>' +
-        esc(
-          s?.today ??
-          0
-        ) +
-      '</strong>' +
-    '</div>' +
-
-    '<div class="ds">' +
-      '<span>ЗАЛОЖЕНИ</span>' +
-      '<strong>' +
-        esc(
-          s?.placed ??
-          0
-        ) +
-      '</strong>' +
-    '</div>' +
-
-    '<div class="ds">' +
-      '<span>ПЕЧЕЛИ</span>' +
-      '<strong class="win">' +
-        esc(
-          s?.wins ??
-          0
-        ) +
-      '</strong>' +
-    '</div>' +
-
-    '<div class="ds">' +
-      '<span>НЕ ПЕЧЕЛИ</span>' +
-      '<strong class="loss">' +
-        esc(
-          s?.losses ??
-          0
-        ) +
-      '</strong>' +
-    '</div>' +
-
-    '<div class="ds">' +
-      '<span>НЕЗАЛОЖЕНИ</span>' +
-      '<strong>' +
-        esc(
-          s?.notPlaced ??
-          0
-        ) +
-      '</strong>' +
-    '</div>' +
-
-    '<div class="ds">' +
-      '<span>УСПЕХ</span>' +
-      '<strong>' +
-        esc(rate) +
-      '</strong>' +
-    '</div>'
-  );
-}
-
-
-// ==========================================================
-// ACTIVE TARGET REFRESH
-// ==========================================================
-
-async function refreshTargets(){
-  const r =
-    await fetch(
-      '/api/targets?ts=' +
-      Date.now(),
-      {
-        cache:
-          'no-store'
-      }
-    );
-
-  const d =
-    await r.json();
-
-  if (
-    !r.ok ||
-    !d?.success
-  ) {
-    throw new Error(
-      d?.error ||
-      (
-        'HTTP ' +
-        r.status
+    return (
+      parseScore(
+        document.body.innerText
+      ) ||
+      parseScore(
+        document.body.textContent
       )
     );
   }
 
-  latestTargets =
-    Array.isArray(d.targets)
-      ? d.targets
-      : [];
 
-  const ready =
-    latestTargets.filter(
-      x => {
-        const o =
-          num(x?.overOdds);
+  function saveZeroScore(score) {
+    if (
+      score?.home === 0 &&
+      score?.away === 0
+    ) {
+      sessionStorage.setItem(
+        SCORE_CACHE_KEY,
+        JSON.stringify({
+          home: 0,
+          away: 0,
+          total: 0,
+          savedAt: Date.now()
+        })
+      );
+    }
+  }
 
-        return (
-          x?.betPlaced !== true &&
-          o !== null &&
-          o > 1
+
+  function readCachedScore() {
+    try {
+      const raw =
+        sessionStorage.getItem(
+          SCORE_CACHE_KEY
+        );
+
+      if (!raw) {
+        return null;
+      }
+
+      const data =
+        JSON.parse(raw);
+
+      if (
+        data?.home === 0 &&
+        data?.away === 0
+      ) {
+        return {
+          home: 0,
+          away: 0,
+          total: 0,
+          cached: true
+        };
+      }
+
+    } catch {}
+
+    return null;
+  }
+
+
+  // ============================================================
+  // SESSION
+  // ============================================================
+
+  function clearSession() {
+    sessionStorage.removeItem(
+      SCORE_CACHE_KEY
+    );
+
+    sessionStorage.removeItem(
+      EVENT_CACHE_KEY
+    );
+
+    sessionStorage.removeItem(
+      ACTION_CACHE_KEY
+    );
+
+    sessionStorage.removeItem(
+      BET_READY_KEY
+    );
+
+    try {
+      if (
+        String(window.name || '')
+          .startsWith(
+            WINDOW_PREFIX
+          )
+      ) {
+        window.name = '';
+      }
+    } catch {}
+
+    launchState = null;
+  }
+
+
+  function setBetReady() {
+    sessionStorage.setItem(
+      BET_READY_KEY,
+      '1'
+    );
+  }
+
+
+  function isBetReady() {
+    return (
+      sessionStorage.getItem(
+        BET_READY_KEY
+      ) === '1'
+    );
+  }
+
+
+  // ============================================================
+  // SMALL PANEL
+  // ============================================================
+
+  function createPanel() {
+    let panel =
+      document.getElementById(
+        PANEL_ID
+      );
+
+    if (panel) {
+      return panel;
+    }
+
+    const host =
+      document.body ||
+      document.documentElement;
+
+    if (!host) {
+      return null;
+    }
+
+    panel =
+      document.createElement(
+        'div'
+      );
+
+    panel.id =
+      PANEL_ID;
+
+    panel.innerHTML = `
+      <div
+        id="tsHeader"
+        style="
+          cursor:move;
+          font-size:11px;
+          font-weight:900;
+          padding-bottom:5px;
+          border-bottom:1px solid #334155;
+        "
+      >
+        ⚡ TOP SIGNAL
+      </div>
+
+      <div
+        id="tsMode"
+        style="
+          margin-top:5px;
+          font-size:8px;
+          color:#94a3b8;
+        "
+      >
+        ${VERSION}
+      </div>
+
+      <div
+        id="tsStatus"
+        style="
+          margin-top:6px;
+          font-size:11px;
+          font-weight:900;
+          color:#4ade80;
+        "
+      >
+        ● ACTIVE
+      </div>
+
+      <div
+        id="tsScore"
+        style="
+          margin-top:5px;
+          font-size:10px;
+          font-weight:800;
+        "
+      >
+        SCORE —
+      </div>
+
+      <div
+        id="tsMarket"
+        style="
+          margin-top:4px;
+          font-size:10px;
+          font-weight:800;
+        "
+      >
+        TOTAL —
+      </div>
+
+      <div
+        id="ts1H"
+        style="
+          margin-top:4px;
+          font-size:10px;
+          font-weight:800;
+        "
+      >
+        1H —
+      </div>
+
+      <div
+        id="tsOdds"
+        style="
+          margin-top:5px;
+          font-size:17px;
+          font-weight:900;
+          color:#facc15;
+        "
+      >
+        @ —
+      </div>
+
+      <div
+        id="tsInfo"
+        style="
+          margin-top:4px;
+          font-size:8px;
+          line-height:1.25;
+          color:#cbd5e1;
+        "
+      >
+        WAIT
+      </div>
+    `;
+
+    Object.assign(
+      panel.style,
+      {
+        position:
+          'fixed',
+
+        left:
+          localStorage.getItem(
+            POS_X
+          ) || '8px',
+
+        top:
+          localStorage.getItem(
+            POS_Y
+          ) || '70px',
+
+        width:
+          '145px',
+
+        padding:
+          '8px',
+
+        background:
+          'rgba(15,23,42,.94)',
+
+        color:
+          '#fff',
+
+        border:
+          '1px solid #475569',
+
+        borderRadius:
+          '9px',
+
+        boxShadow:
+          '0 5px 18px rgba(0,0,0,.45)',
+
+        fontFamily:
+          'Arial,sans-serif',
+
+        zIndex:
+          '2147483647',
+
+        pointerEvents:
+          'auto',
+
+        userSelect:
+          'none',
+
+        touchAction:
+          'none'
+      }
+    );
+
+    host.appendChild(
+      panel
+    );
+
+    enableDrag(
+      panel
+    );
+
+    return panel;
+  }
+
+
+  function keepPanelAlive() {
+    const panel =
+      document.getElementById(
+        PANEL_ID
+      ) ||
+      createPanel();
+
+    if (!panel) {
+      return;
+    }
+
+    panel.style.setProperty(
+      'display',
+      'block',
+      'important'
+    );
+
+    panel.style.setProperty(
+      'visibility',
+      'visible',
+      'important'
+    );
+
+    panel.style.setProperty(
+      'opacity',
+      '1',
+      'important'
+    );
+
+    panel.style.setProperty(
+      'z-index',
+      '2147483647',
+      'important'
+    );
+  }
+
+
+  function enableDrag(panel) {
+    const header =
+      panel.querySelector(
+        '#tsHeader'
+      );
+
+    let dragging =
+      false;
+
+    let sx = 0;
+    let sy = 0;
+
+    let px = 0;
+    let py = 0;
+
+    header.addEventListener(
+      'pointerdown',
+      e => {
+        dragging =
+          true;
+
+        sx =
+          e.clientX;
+
+        sy =
+          e.clientY;
+
+        const r =
+          panel.getBoundingClientRect();
+
+        px =
+          r.left;
+
+        py =
+          r.top;
+
+        try {
+          header.setPointerCapture(
+            e.pointerId
+          );
+        } catch {}
+      }
+    );
+
+    header.addEventListener(
+      'pointermove',
+      e => {
+        if (!dragging) {
+          return;
+        }
+
+        const x =
+          px +
+          e.clientX -
+          sx;
+
+        const y =
+          py +
+          e.clientY -
+          sy;
+
+        panel.style.left =
+          x + 'px';
+
+        panel.style.top =
+          y + 'px';
+
+        localStorage.setItem(
+          POS_X,
+          x + 'px'
+        );
+
+        localStorage.setItem(
+          POS_Y,
+          y + 'px'
         );
       }
     );
 
-  const placed =
-    latestTargets.filter(
-      x =>
-        x?.betPlaced === true
+    const stop =
+      () => {
+        dragging =
+          false;
+      };
+
+    header.addEventListener(
+      'pointerup',
+      stop
     );
 
-  const best =
-    ready
-      .map(
-        x =>
-          num(
-            x?.overOdds
-          )
-      )
+    header.addEventListener(
+      'pointercancel',
+      stop
+    );
+  }
+
+
+  // ============================================================
+  // EXACT ELEMENTS
+  // ============================================================
+
+  function exactElements(
+    root,
+    wanted
+  ) {
+    if (!root) {
+      return [];
+    }
+
+    return [
+      ...root.querySelectorAll('*')
+    ]
       .filter(
-        x =>
-          x !== null &&
-          x > 1
+        el =>
+          visible(el) &&
+          clean(
+            el.textContent
+          ) === wanted
       )
       .sort(
-        (a,b) =>
-          b - a
-      )[0] ??
-    null;
-
-  document
-    .getElementById(
-      'sumTargets'
-    )
-    .textContent =
-      String(
-        latestTargets.length
+        (a, b) =>
+          area(a) -
+          area(b)
       );
-
-  document
-    .getElementById(
-      'sumReady'
-    )
-    .textContent =
-      String(
-        ready.length
-      );
-
-  document
-    .getElementById(
-      'sumPlaced'
-    )
-    .textContent =
-      String(
-        placed.length
-      );
-
-  document
-    .getElementById(
-      'sumBest'
-    )
-    .textContent =
-      best === null
-        ? '—'
-        : best.toFixed(2);
-
-  document
-    .getElementById(
-      'stats'
-    )
-    .textContent =
-      'Tracker ' +
-      (d.tracker_signals ?? 0) +
-
-      ' · Matcher ' +
-      (d.matcher_hunter_results ?? 0) +
-
-      ' · Secure ' +
-      (d.secure_targets ?? 0) +
-
-      ' · Placed/Pending ' +
-      (d.placed_pending ?? 0) +
-
-      ' · V27 ' +
-      (
-        d.live_feed_ok
-          ? 'LIVE ✅'
-          : 'ERROR ⚠'
-      ) +
-
-      ' · live matches ' +
-      (d.live_matches ?? '—') +
-
-      ' · active 10s · daily 30s';
-
-  document
-    .getElementById(
-      'list'
-    )
-    .innerHTML =
-      latestTargets.length
-        ? latestTargets
-            .map(card)
-            .join('')
-        : (
-            '<div class="empty">' +
-            'Няма активен Hunter target или чакащ BET PLACED.<br>' +
-            'Чакаме нов сигнал.' +
-            '</div>'
-          );
-}
+  }
 
 
-// ==========================================================
-// DAILY REFRESH
-// ==========================================================
+  // ============================================================
+  // PERIOD
+  // ============================================================
 
-async function refreshDaily(){
-  const r =
-    await fetch(
-      '/api/daily?ts=' +
-      Date.now(),
-      {
-        cache:
-          'no-store'
-      }
-    );
-
-  const d =
-    await r.json();
-
-  if (
-    !r.ok ||
-    !d?.success
+  function findPeriod(
+    root,
+    wanted
   ) {
-    throw new Error(
-      d?.error ||
-      (
-        'DAILY HTTP ' +
-        r.status
+    const hits =
+      exactElements(
+        root,
+        wanted
+      );
+
+    if (!hits.length) {
+      return null;
+    }
+
+    let best =
+      hits[0];
+
+    let node =
+      hits[0];
+
+    for (
+      let i = 0;
+      i < 7 &&
+      node;
+      i++,
+      node =
+        node.parentElement
+    ) {
+      if (
+        !root.contains(
+          node
+        )
+      ) {
+        break;
+      }
+
+      if (!visible(node)) {
+        continue;
+      }
+
+      const text =
+        clean(
+          node.textContent
+        );
+
+      const r =
+        node.getBoundingClientRect();
+
+      if (
+        text === wanted &&
+        r.width >= 20 &&
+        r.width <= 130 &&
+        r.height >= 15 &&
+        r.height <= 80
+      ) {
+        best =
+          node;
+      }
+
+      if (
+        text !== wanted
+      ) {
+        break;
+      }
+    }
+
+    return best;
+  }
+
+
+  // ============================================================
+  // TOTAL GOALS CARD
+  // ============================================================
+
+  function findCurrentGoalsLabels() {
+    if (!document.body) {
+      return [];
+    }
+
+    return [
+      ...document.querySelectorAll(
+        'body *'
       )
-    );
-  }
+    ]
+      .filter(
+        el => {
+          if (!visible(el)) {
+            return false;
+          }
 
-  latestDaily =
-    Array.isArray(d.matches)
-      ? d.matches
-      : [];
+          const text =
+            clean(
+              el.textContent
+            );
 
-  document
-    .getElementById(
-      'dailyCount'
-    )
-    .textContent =
-      String(
-        latestDaily.length
-      );
-
-  document
-    .getElementById(
-      'dailySummary'
-    )
-    .innerHTML =
-      renderDailySummary(
-        d.summary ||
-        {}
-      );
-
-  document
-    .getElementById(
-      'dailyList'
-    )
-    .innerHTML =
-      latestDaily.length
-        ? latestDaily
-            .map(dailyRow)
-            .join('')
-        : (
-            '<div class="empty">' +
-            'Още няма мачове за днес.' +
-            '</div>'
+          return (
+            /^Current\s*goals/i.test(
+              text
+            ) &&
+            text.length <= 80
           );
-}
-
-
-// ==========================================================
-// SAFE REFRESH — ANTI-OVERLAP
-// ==========================================================
-
-async function safeRefreshTargets(){
-  if (
-    targetRefreshRunning
-  ) {
-    console.log(
-      'TARGET refresh skipped — previous request still running'
-    );
-
-    return;
-  }
-
-  targetRefreshRunning =
-    true;
-
-  try {
-    await refreshTargets();
-
-  } catch (e) {
-    console.warn(
-      'TARGET REFRESH ERROR',
-      e
-    );
-
-    const stats =
-      document.getElementById(
-        'stats'
+        }
+      )
+      .sort(
+        (a, b) =>
+          a.getBoundingClientRect().top -
+          b.getBoundingClientRect().top
       );
-
-    if (stats) {
-      stats.innerHTML =
-        '<span class="err">' +
-        'TEMP CONNECTION ERROR · keeping last targets · ' +
-        esc(
-          e?.message ||
-          e
-        ) +
-        '</span>';
-    }
-
-  } finally {
-    targetRefreshRunning =
-      false;
   }
-}
 
 
-async function safeRefreshDaily(){
-  if (
-    dailyRefreshRunning
+  function cardFromCurrentGoals(
+    label
   ) {
-    console.log(
-      'DAILY refresh skipped — previous request still running'
-    );
+    let node =
+      label;
 
-    return;
-  }
+    for (
+      let depth = 0;
+      depth < 12 &&
+      node;
+      depth++,
+      node =
+        node.parentElement
+    ) {
+      if (!visible(node)) {
+        continue;
+      }
 
-  dailyRefreshRunning =
-    true;
+      const r =
+        node.getBoundingClientRect();
 
-  try {
-    await refreshDaily();
+      if (
+        r.width < 250 ||
+        r.height < 100
+      ) {
+        continue;
+      }
 
-  } catch (e) {
-    console.warn(
-      'DAILY REFRESH ERROR',
-      e
-    );
-
-  } finally {
-    dailyRefreshRunning =
-      false;
-  }
-}
-
-
-// DAILY TOGGLE
-document
-  .getElementById(
-    'dailyHead'
-  )
-  .addEventListener(
-    'click',
-    () => {
-      dailyOpen =
-        !dailyOpen;
-
-      const el =
-        document.getElementById(
-          'daily'
+      const ft =
+        findPeriod(
+          node,
+          'FT'
         );
 
-      const arrow =
-        document.getElementById(
-          'dailyArrow'
+      const h1 =
+        findPeriod(
+          node,
+          '1H'
         );
 
-      if (dailyOpen) {
-        el.classList.add(
-          'open'
+      const h2 =
+        findPeriod(
+          node,
+          '2H'
         );
 
-        arrow.textContent =
-          '▾';
-
-      } else {
-        el.classList.remove(
-          'open'
-        );
-
-        arrow.textContent =
-          '▸';
+      if (
+        ft &&
+        h1 &&
+        h2
+      ) {
+        return node;
       }
     }
+
+    return null;
+  }
+
+
+  function find1HTotalCard() {
+    if (!document.body) {
+      return null;
+    }
+
+    const titles =
+      exactElements(
+        document.body,
+        '1st Half Total Goals'
+      );
+
+    for (
+      const title
+      of titles
+    ) {
+      let node =
+        title;
+
+      for (
+        let depth = 0;
+        depth < 12 &&
+        node;
+        depth++,
+        node =
+          node.parentElement
+      ) {
+        if (!visible(node)) {
+          continue;
+        }
+
+        const text =
+          clean(
+            node.textContent
+          );
+
+        const r =
+          node.getBoundingClientRect();
+
+        if (
+          r.width < 250 ||
+          r.height < 80
+        ) {
+          continue;
+        }
+
+        if (
+          /Alternative\s+lines/i.test(
+            text
+          )
+        ) {
+          continue;
+        }
+
+        const ft =
+          findPeriod(
+            node,
+            'FT'
+          );
+
+        const h1 =
+          findPeriod(
+            node,
+            '1H'
+          );
+
+        const h2 =
+          findPeriod(
+            node,
+            '2H'
+          );
+
+        if (
+          ft &&
+          h1 &&
+          h2
+        ) {
+          return node;
+        }
+      }
+    }
+
+    return null;
+  }
+
+
+  function findMainTotalCard() {
+    const oneHCard =
+      find1HTotalCard();
+
+    if (oneHCard) {
+      return oneHCard;
+    }
+
+    const labels =
+      findCurrentGoalsLabels();
+
+    const cards =
+      [];
+
+    for (
+      const label
+      of labels
+    ) {
+      const card =
+        cardFromCurrentGoals(
+          label
+        );
+
+      if (
+        card &&
+        !cards.includes(card)
+      ) {
+        cards.push(card);
+      }
+    }
+
+    if (!cards.length) {
+      return null;
+    }
+
+    cards.sort(
+      (a, b) =>
+        a.getBoundingClientRect().top -
+        b.getBoundingClientRect().top
+    );
+
+    return cards[0];
+  }
+
+
+  // ============================================================
+  // ACTIVE PERIOD
+  // ============================================================
+
+  function signature(el) {
+    if (!el) {
+      return '';
+    }
+
+    const s =
+      getComputedStyle(el);
+
+    return [
+      s.backgroundColor,
+      s.borderTopColor,
+      s.borderRightColor,
+      s.borderBottomColor,
+      s.borderLeftColor,
+      s.color,
+      s.boxShadow,
+      s.outlineColor
+    ].join('|');
+  }
+
+
+  function cardIs1H(card) {
+    if (!card) {
+      return false;
+    }
+
+    return (
+      exactElements(
+        card,
+        '1st Half Total Goals'
+      ).length > 0
+    );
+  }
+
+
+  function activePeriod(card) {
+    if (
+      cardIs1H(card)
+    ) {
+      return '1H';
+    }
+
+    const ft =
+      findPeriod(
+        card,
+        'FT'
+      );
+
+    const h1 =
+      findPeriod(
+        card,
+        '1H'
+      );
+
+    const h2 =
+      findPeriod(
+        card,
+        '2H'
+      );
+
+    if (
+      !ft ||
+      !h1 ||
+      !h2
+    ) {
+      return null;
+    }
+
+    const a =
+      signature(ft);
+
+    const b =
+      signature(h1);
+
+    const c =
+      signature(h2);
+
+    if (
+      b === c &&
+      a !== b
+    ) {
+      return 'FT';
+    }
+
+    if (
+      a === c &&
+      b !== a
+    ) {
+      return '1H';
+    }
+
+    if (
+      a === b &&
+      c !== a
+    ) {
+      return '2H';
+    }
+
+    return 'UNKNOWN';
+  }
+
+
+  function isDisabled(el) {
+    if (!el) {
+      return true;
+    }
+
+    let node =
+      el;
+
+    for (
+      let i = 0;
+      i < 6 &&
+      node;
+      i++,
+      node =
+        node.parentElement
+    ) {
+      const text =
+        clean(
+          node.textContent
+        );
+
+      const aria =
+        clean(
+          node.getAttribute?.(
+            'aria-disabled'
+          )
+        ).toLowerCase();
+
+      const disabledAttr =
+        node.hasAttribute?.(
+          'disabled'
+        );
+
+      const disabledProp =
+        node.disabled === true;
+
+      const cls =
+        clean(
+          node.className
+        ).toLowerCase();
+
+      if (
+        aria === 'true' ||
+        disabledAttr ||
+        disabledProp ||
+        /(^|\s)disabled(\s|$)/i.test(
+          cls
+        )
+      ) {
+        return true;
+      }
+
+      if (
+        text !== '1H'
+      ) {
+        break;
+      }
+    }
+
+    return false;
+  }
+
+
+  // ============================================================
+  // CLICK
+  // ============================================================
+
+  function fireClick(target) {
+    if (
+      !target ||
+      !visible(target)
+    ) {
+      return false;
+    }
+
+    try {
+      target.scrollIntoView({
+        block:
+          'center',
+
+        inline:
+          'center',
+
+        behavior:
+          'auto'
+      });
+    } catch {}
+
+    const r =
+      target.getBoundingClientRect();
+
+    const x =
+      r.left +
+      r.width / 2;
+
+    const y =
+      r.top +
+      r.height / 2;
+
+    const common = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      button: 0
+    };
+
+    try {
+      target.dispatchEvent(
+        new PointerEvent(
+          'pointerdown',
+          {
+            ...common,
+            pointerId: 1,
+            pointerType: 'touch',
+            isPrimary: true,
+            buttons: 1
+          }
+        )
+      );
+    } catch {}
+
+    try {
+      target.dispatchEvent(
+        new MouseEvent(
+          'mousedown',
+          {
+            ...common,
+            buttons: 1
+          }
+        )
+      );
+    } catch {}
+
+    try {
+      target.dispatchEvent(
+        new PointerEvent(
+          'pointerup',
+          {
+            ...common,
+            pointerId: 1,
+            pointerType: 'touch',
+            isPrimary: true,
+            buttons: 0
+          }
+        )
+      );
+    } catch {}
+
+    try {
+      target.dispatchEvent(
+        new MouseEvent(
+          'mouseup',
+          {
+            ...common,
+            buttons: 0
+          }
+        )
+      );
+    } catch {}
+
+    try {
+      HTMLElement.prototype.click.call(
+        target
+      );
+    } catch {
+      try {
+        target.click();
+      } catch {}
+    }
+
+    return true;
+  }
+
+
+  // ============================================================
+  // SPECIAL 1H CLICK
+  // ============================================================
+
+  function find1HClickTarget(
+    card,
+    h1
+  ) {
+    let best =
+      h1;
+
+    let node =
+      h1;
+
+    for (
+      let i = 0;
+      i < 7 &&
+      node;
+      i++,
+      node =
+        node.parentElement
+    ) {
+      if (
+        !card.contains(node)
+      ) {
+        break;
+      }
+
+      if (!visible(node)) {
+        continue;
+      }
+
+      const text =
+        clean(
+          node.textContent
+        );
+
+      if (
+        text !== '1H'
+      ) {
+        break;
+      }
+
+      best =
+        node;
+
+      const tag =
+        String(
+          node.tagName ||
+          ''
+        ).toLowerCase();
+
+      const role =
+        clean(
+          node.getAttribute?.(
+            'role'
+          )
+        ).toLowerCase();
+
+      const tabindex =
+        node.getAttribute?.(
+          'tabindex'
+        );
+
+      const style =
+        getComputedStyle(
+          node
+        );
+
+      if (
+        tag === 'button' ||
+        role === 'button' ||
+        role === 'tab' ||
+        tabindex !== null ||
+        style.cursor === 'pointer'
+      ) {
+        return node;
+      }
+    }
+
+    return best;
+  }
+
+
+  function click1H(
+    card,
+    h1
+  ) {
+    if (
+      !h1 ||
+      isDisabled(h1)
+    ) {
+      return false;
+    }
+
+    const target =
+      find1HClickTarget(
+        card,
+        h1
+      );
+
+    fireClick(
+      target
+    );
+
+    if (
+      target !== h1
+    ) {
+      setTimeout(
+        () => {
+          if (
+            activePeriod(
+              card
+            ) !== '1H'
+          ) {
+            fireClick(
+              h1
+            );
+          }
+        },
+        300
+      );
+    }
+
+    return true;
+  }
+
+
+  // ============================================================
+  // EXACT 0.5
+  // ============================================================
+
+  function find05Market(card) {
+    if (!card) {
+      return null;
+    }
+
+    const lines =
+      exactElements(
+        card,
+        '0.5'
+      );
+
+    for (
+      const line
+      of lines
+    ) {
+      let row =
+        line;
+
+      for (
+        let depth = 0;
+        depth < 8 &&
+        row;
+        depth++,
+        row =
+          row.parentElement
+      ) {
+        if (
+          !card.contains(row)
+        ) {
+          break;
+        }
+
+        if (!visible(row)) {
+          continue;
+        }
+
+        const r =
+          row.getBoundingClientRect();
+
+        if (
+          r.height < 25 ||
+          r.height > 140
+        ) {
+          continue;
+        }
+
+        const values =
+          [
+            ...row.querySelectorAll('*')
+          ]
+            .filter(
+              el =>
+                visible(el) &&
+                el.children.length === 0
+            )
+            .map(
+              el => {
+                const text =
+                  clean(
+                    el.textContent
+                  );
+
+                const value =
+                  Number(
+                    text.replace(
+                      ',',
+                      '.'
+                    )
+                  );
+
+                const rect =
+                  el.getBoundingClientRect();
+
+                return {
+                  el,
+                  value,
+                  left:
+                    rect.left
+                };
+              }
+            )
+            .filter(
+              x =>
+                validOdds(
+                  x.value
+                ) &&
+                x.value !== 0.5
+            )
+            .sort(
+              (a, b) =>
+                a.left -
+                b.left
+            );
+
+        if (
+          values.length >= 2
+        ) {
+          return {
+            line: 0.5,
+
+            over:
+              Number(
+                values[0].value
+              ),
+
+            under:
+              Number(
+                values[1].value
+              ),
+
+            overEl:
+              values[0].el,
+
+            underEl:
+              values[1].el
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+
+  // ============================================================
+  // STAKE INPUT
+  // ============================================================
+
+  function findStakeInput() {
+    const inputs =
+      [
+        ...document.querySelectorAll(
+          'input'
+        )
+      ]
+        .filter(
+          el => {
+            if (!visible(el)) {
+              return false;
+            }
+
+            const placeholder =
+              clean(
+                el.getAttribute(
+                  'placeholder'
+                )
+              ).toLowerCase();
+
+            const aria =
+              clean(
+                el.getAttribute(
+                  'aria-label'
+                )
+              ).toLowerCase();
+
+            const name =
+              clean(
+                el.getAttribute(
+                  'name'
+                )
+              ).toLowerCase();
+
+            const inputMode =
+              clean(
+                el.getAttribute(
+                  'inputmode'
+                )
+              ).toLowerCase();
+
+            const type =
+              clean(
+                el.getAttribute(
+                  'type'
+                )
+              ).toLowerCase();
+
+            return (
+              placeholder.includes(
+                'stake'
+              ) ||
+              placeholder.includes(
+                'amount'
+              ) ||
+              aria.includes(
+                'stake'
+              ) ||
+              aria.includes(
+                'amount'
+              ) ||
+              name.includes(
+                'stake'
+              ) ||
+              name.includes(
+                'amount'
+              ) ||
+              inputMode === 'decimal' ||
+              inputMode === 'numeric' ||
+              type === 'number'
+            );
+          }
+        )
+        .sort(
+          (a, b) =>
+            area(a) -
+            area(b)
+        );
+
+    return (
+      inputs[0] ||
+      null
+    );
+  }
+
+
+  function setNativeInputValue(
+    input,
+    value
+  ) {
+    const prototype =
+      Object.getPrototypeOf(
+        input
+      );
+
+    const descriptor =
+      Object.getOwnPropertyDescriptor(
+        prototype,
+        'value'
+      ) ||
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        'value'
+      );
+
+    if (
+      descriptor?.set
+    ) {
+      descriptor.set.call(
+        input,
+        value
+      );
+    } else {
+      input.value =
+        value;
+    }
+  }
+
+
+  function setStakeAmount() {
+    const input =
+      findStakeInput();
+
+    if (!input) {
+      return false;
+    }
+
+    const value =
+      BET_STAKE_USDT.toFixed(
+        2
+      );
+
+    try {
+      input.focus();
+
+      setNativeInputValue(
+        input,
+        value
+      );
+
+      input.dispatchEvent(
+        new InputEvent(
+          'input',
+          {
+            bubbles:
+              true,
+
+            composed:
+              true,
+
+            inputType:
+              'insertText',
+
+            data:
+              value
+          }
+        )
+      );
+
+      input.dispatchEvent(
+        new Event(
+          'change',
+          {
+            bubbles:
+              true,
+
+            composed:
+              true
+          }
+        )
+      );
+
+      input.blur();
+
+      return true;
+
+    } catch {
+      return false;
+    }
+  }
+
+
+  // ============================================================
+  // SEND ODDS
+  // ============================================================
+
+  async function sendOdds(
+    market
+  ) {
+    const eventId =
+      getEventId();
+
+    const overOdds =
+      Number(
+        market?.over
+      );
+
+    const underOdds =
+      Number(
+        market?.under
+      );
+
+    if (
+      !eventId ||
+      !validOdds(
+        overOdds
+      )
+    ) {
+      throw new Error(
+        'INVALID_ODDS'
+      );
+    }
+
+    const response =
+      await fetch(
+        ODDS_API,
+        {
+          method:
+            'POST',
+
+          headers: {
+            'content-type':
+              'application/json'
+          },
+
+          body:
+            JSON.stringify({
+              eventId,
+
+              market:
+                '1H Total Goals',
+
+              line:
+                0.5,
+
+              selection:
+                'OVER',
+
+              overOdds,
+
+              underOdds:
+                validOdds(
+                  underOdds
+                )
+                  ? underOdds
+                  : null,
+
+              odds:
+                overOdds,
+
+              ready:
+                true,
+
+              source:
+                'CLOUDBET_BROWSER_V7.12',
+
+              timestamp:
+                Date.now()
+            })
+        }
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        'ODDS API ' +
+        response.status
+      );
+    }
+
+    return true;
+  }
+
+
+  // ============================================================
+  // SAVE BET STATUS
+  // ============================================================
+
+  async function saveBetPlaced() {
+    const eventId =
+      getEventId();
+
+    if (!eventId) {
+      throw new Error(
+        'EVENT_ID_MISSING'
+      );
+    }
+
+    const response =
+      await fetch(
+        BET_STATUS_API,
+        {
+          method:
+            'POST',
+
+          headers: {
+            'content-type':
+              'application/json'
+          },
+
+          body:
+            JSON.stringify({
+              eventId,
+
+              status:
+                'PLACED',
+
+              market:
+                '1st Half Total Goals',
+
+              selection:
+                'O 0.5',
+
+              stake:
+                BET_STAKE_USDT,
+
+              source:
+                'CLOUDBET_FRONTEND_V7.12',
+
+              placedAt:
+                new Date().toISOString(),
+
+              timestamp:
+                Date.now()
+            })
+        }
+      );
+
+    if (!response.ok) {
+      throw new Error(
+        'BET STATUS API ' +
+        response.status
+      );
+    }
+
+    return true;
+  }
+
+
+  // ============================================================
+  // MANUAL PLACE BET DETECTOR
+  //
+  // IMPORTANT:
+  // - BET_PLACE=false -> no final click is accepted/saved.
+  // - BET_PLACE=true  -> waits for a real user trusted click.
+  // - This script does NOT auto-click the final Place Bet button.
+  // ============================================================
+
+  function findClickableFromEventTarget(
+    target
+  ) {
+    if (
+      !target ||
+      !(target instanceof Element)
+    ) {
+      return null;
+    }
+
+    return (
+      target.closest(
+        'button,[role="button"],[type="submit"],a'
+      ) ||
+      target
+    );
+  }
+
+
+  function isPlaceBetButton(el) {
+    if (!el) {
+      return false;
+    }
+
+    const text =
+      clean(
+        el.innerText ||
+        el.textContent ||
+        el.getAttribute?.(
+          'aria-label'
+        ) ||
+        ''
+      );
+
+    if (
+      !text ||
+      text.length > 100
+    ) {
+      return false;
+    }
+
+    return (
+      /^place\s+bet$/i.test(text) ||
+      /^confirm\s+bet$/i.test(text) ||
+      /^place\s+wager$/i.test(text) ||
+      /^submit\s+bet$/i.test(text)
+    );
+  }
+
+
+  function findPlaceBetButton() {
+    if (!document.body) {
+      return null;
+    }
+
+    const candidates = [
+      ...document.querySelectorAll(
+        'button,[role="button"],[type="submit"],a'
+      )
+    ]
+      .filter(
+        el =>
+          visible(el) &&
+          isPlaceBetButton(el)
+      )
+      .sort(
+        (a, b) =>
+          area(a) -
+          area(b)
+      );
+
+    return (
+      candidates[0] ||
+      null
+    );
+  }
+
+
+  function highlightPlaceBetButton() {
+    const button =
+      findPlaceBetButton();
+
+    if (!button) {
+      return false;
+    }
+
+    try {
+      button.scrollIntoView({
+        block:
+          'center',
+
+        inline:
+          'center',
+
+        behavior:
+          'smooth'
+      });
+    } catch {}
+
+    try {
+      button.style.setProperty(
+        'outline',
+        '4px solid #facc15',
+        'important'
+      );
+
+      button.style.setProperty(
+        'outline-offset',
+        '4px',
+        'important'
+      );
+
+      button.style.setProperty(
+        'box-shadow',
+        '0 0 0 6px rgba(250,204,21,.25), 0 0 22px rgba(250,204,21,.85)',
+        'important'
+      );
+
+      button.style.setProperty(
+        'position',
+        button.style.position || 'relative',
+        'important'
+      );
+
+      button.dataset.topSignalReady =
+        '1';
+
+    } catch {}
+
+    return true;
+  }
+
+
+  async function onManualPlaceBetClick(
+    event
+  ) {
+    if (
+      finished ||
+      returning ||
+      betClickSaving
+    ) {
+      return;
+    }
+
+    if (!BET_PLACE) {
+      return;
+    }
+
+    if (
+      getAction() !== 'bet'
+    ) {
+      return;
+    }
+
+    if (
+      event.isTrusted !== true
+    ) {
+      return;
+    }
+
+    if (
+      !isBetReady()
+    ) {
+      return;
+    }
+
+    const button =
+      findClickableFromEventTarget(
+        event.target
+      );
+
+    if (
+      !isPlaceBetButton(
+        button
+      )
+    ) {
+      return;
+    }
+
+    const disabled =
+      button.disabled === true ||
+      button.hasAttribute?.(
+        'disabled'
+      ) ||
+      clean(
+        button.getAttribute?.(
+          'aria-disabled'
+        )
+      ).toLowerCase() === 'true';
+
+    if (disabled) {
+      return;
+    }
+
+    betClickSaving =
+      true;
+
+    const statusEl =
+      document.getElementById(
+        'tsStatus'
+      );
+
+    const oddsEl =
+      document.getElementById(
+        'tsOdds'
+      );
+
+    const infoEl =
+      document.getElementById(
+        'tsInfo'
+      );
+
+    if (statusEl) {
+      statusEl.textContent =
+        '✅ BET PLACED';
+
+      statusEl.style.color =
+        '#4ade80';
+    }
+
+    if (oddsEl) {
+      oddsEl.textContent =
+        'ЗАЛОЖЕН ✅';
+
+      oddsEl.style.color =
+        '#4ade80';
+    }
+
+    if (infoEl) {
+      infoEl.textContent =
+        'SAVING...';
+
+      infoEl.style.color =
+        '#4ade80';
+    }
+
+    try {
+      await saveBetPlaced();
+
+      finished =
+        true;
+
+      if (infoEl) {
+        infoEl.textContent =
+          'BET PLACED ✅';
+      }
+
+      setTimeout(
+        () => {
+          clearSession();
+
+          location.href =
+            DASHBOARD;
+        },
+        600
+      );
+
+    } catch (error) {
+      betClickSaving =
+        false;
+
+      if (statusEl) {
+        statusEl.textContent =
+          '❌ SAVE ERROR';
+
+        statusEl.style.color =
+          '#f87171';
+      }
+
+      if (infoEl) {
+        infoEl.textContent =
+          String(
+            error?.message ||
+            error
+          );
+
+        infoEl.style.color =
+          '#f87171';
+      }
+    }
+  }
+
+
+  document.addEventListener(
+    'click',
+    onManualPlaceBetClick,
+    true
   );
 
 
-// BUTTONS
-document.addEventListener(
-  'click',
-  e => {
-    const b =
-      e.target.closest(
-        '[data-action]'
-      );
+  // ============================================================
+  // RETURN
+  // ============================================================
 
-    if (!b) {
+  function returnToDashboard(
+    delay = 1500
+  ) {
+    if (returning) {
       return;
     }
 
-    const id =
-      b.getAttribute(
-        'data-id'
-      );
+    if (
+      getAction() === 'bet'
+    ) {
+      return;
+    }
+
+    returning =
+      true;
+
+    setTimeout(
+      () => {
+        clearSession();
+
+        location.href =
+          DASHBOARD;
+      },
+      delay
+    );
+  }
+
+
+  function scheduleDryReturn() {
+    if (
+      dryReturnStarted ||
+      BET_PLACE
+    ) {
+      return;
+    }
+
+    dryReturnStarted =
+      true;
+
+    setTimeout(
+      () => {
+        clearSession();
+
+        location.href =
+          DASHBOARD;
+      },
+      DRY_RETURN_MS
+    );
+  }
+
+
+  // ============================================================
+  // REFRESH
+  // ============================================================
+
+  function refreshPage(
+    infoEl
+  ) {
+    if (refreshing) {
+      return;
+    }
+
+    refreshing =
+      true;
+
+    if (infoEl) {
+      infoEl.textContent =
+        'REFRESH 🔄';
+    }
+
+    setTimeout(
+      () => {
+        location.reload();
+      },
+      400
+    );
+  }
+
+
+  // ============================================================
+  // UPDATE
+  // ============================================================
+
+  async function update() {
+    if (
+      finished ||
+      returning ||
+      refreshing
+    ) {
+      return;
+    }
 
     const action =
-      b.getAttribute(
-        'data-action'
+      getAction();
+
+    const modeEl =
+      document.getElementById(
+        'tsMode'
       );
 
-    const target =
-      latestTargets.find(
-        x =>
-          String(
-            x?.eventId
-          ) ===
-          String(id)
+    const statusEl =
+      document.getElementById(
+        'tsStatus'
       );
 
-    if (!target) {
+    const scoreEl =
+      document.getElementById(
+        'tsScore'
+      );
+
+    const marketEl =
+      document.getElementById(
+        'tsMarket'
+      );
+
+    const h1El =
+      document.getElementById(
+        'ts1H'
+      );
+
+    const oddsEl =
+      document.getElementById(
+        'tsOdds'
+      );
+
+    const infoEl =
+      document.getElementById(
+        'tsInfo'
+      );
+
+    if (!modeEl) {
       return;
     }
+
+    modeEl.textContent =
+      VERSION +
+      ' · ' +
+      action.toUpperCase() +
+      (
+        action === 'bet'
+          ? (
+              BET_PLACE
+                ? ' · CONFIRM MANUAL'
+                : ' · DRY'
+            )
+          : ''
+      );
+
+
+    if (
+      action !== 'check' &&
+      action !== 'bet'
+    ) {
+      statusEl.textContent =
+        '⚪ PASSIVE';
+
+      statusEl.style.color =
+        '#94a3b8';
+
+      infoEl.textContent =
+        'NO TOP SIGNAL ACTION';
+
+      return;
+    }
+
+
+    // ==========================================================
+    // SCORE
+    // ==========================================================
+    //
+    // CHECK mode:
+    //   score remains a hard safety gate.
+    //
+    // BET mode:
+    //   score is informational only. Top Signal / Tracker / V27
+    //   already validated the live state before opening Cloudbet,
+    //   so a missing Cloudbet score must NOT block market search.
+    // ==========================================================
+
+    const liveScore =
+      readLiveScore();
+
+    if (liveScore) {
+      if (
+        liveScore.home !== 0 ||
+        liveScore.away !== 0
+      ) {
+        if (
+          action === 'check'
+        ) {
+          statusEl.textContent =
+            '❌ STOP';
+
+          statusEl.style.color =
+            '#f87171';
+
+          scoreEl.textContent =
+            `${liveScore.home}-${liveScore.away}`;
+
+          infoEl.textContent =
+            'NOT 0:0';
+
+          returnToDashboard(
+            1200
+          );
+
+          return;
+        }
+
+        // BET mode: show warning, but do not stop the flow.
+        scoreEl.textContent =
+          `${liveScore.home}-${liveScore.away} ⚠`;
+
+        scoreEl.style.color =
+          '#facc15';
+
+      } else {
+        saveZeroScore(
+          liveScore
+        );
+
+        scoreEl.textContent =
+          '0-0';
+
+        scoreEl.style.color =
+          '#4ade80';
+      }
+    } else {
+      const cachedScore =
+        readCachedScore();
+
+      if (
+        action === 'check'
+      ) {
+        if (!cachedScore) {
+          scoreEl.textContent =
+            'SCORE —';
+
+          infoEl.textContent =
+            'WAIT SCORE';
+
+          return;
+        }
+
+        scoreEl.textContent =
+          '0-0 CACHED';
+
+        scoreEl.style.color =
+          '#4ade80';
+
+      } else {
+        // BET mode: no score in Cloudbet DOM is NOT a blocker.
+        if (cachedScore) {
+          scoreEl.textContent =
+            '0-0 CACHED';
+
+          scoreEl.style.color =
+            '#4ade80';
+        } else {
+          scoreEl.textContent =
+            'SCORE BYPASS ✅';
+
+          scoreEl.style.color =
+            '#4ade80';
+        }
+      }
+    }
+
+
+    // ==========================================================
+    // TOTAL CARD
+    // ==========================================================
+
+    const card =
+      findMainTotalCard();
+
+    if (!card) {
+      marketEl.textContent =
+        'TOTAL ❌';
+
+      marketEl.style.color =
+        '#f87171';
+
+      infoEl.textContent =
+        action === 'bet'
+          ? 'WAIT TOTAL · BET MODE STAYS'
+          : 'WAIT TOTAL';
+
+      oneHStageStart =
+        null;
+
+      return;
+    }
+
+
+    marketEl.textContent =
+      'TOTAL ✅';
+
+    marketEl.style.color =
+      '#4ade80';
+
+
+    // ==========================================================
+    // 1H
+    // ==========================================================
+
+    const h1 =
+      findPeriod(
+        card,
+        '1H'
+      );
+
+    const active =
+      activePeriod(
+        card
+      );
+
+
+    if (
+      active !== '1H'
+    ) {
+      if (!h1) {
+        h1El.textContent =
+          '1H ❌';
+
+        infoEl.textContent =
+          action === 'bet'
+            ? 'WAIT 1H · BET MODE STAYS'
+            : 'WAIT 1H';
+
+        oneHStageStart =
+          null;
+
+        return;
+      }
+
+
+      if (
+        oneHStageStart === null
+      ) {
+        oneHStageStart =
+          Date.now();
+
+        last1HClick =
+          0;
+
+        clickCount =
+          0;
+      }
+
+
+      const elapsed =
+        Date.now() -
+        oneHStageStart;
+
+
+      const left =
+        Math.max(
+          0,
+          20 -
+          Math.floor(
+            elapsed / 1000
+          )
+        );
+
+
+      if (
+        !isDisabled(
+          h1
+        ) &&
+        Date.now() -
+        last1HClick >=
+        CLICK_INTERVAL
+      ) {
+        last1HClick =
+          Date.now();
+
+        clickCount++;
+
+        click1H(
+          card,
+          h1
+        );
+      }
+
+
+      h1El.textContent =
+        '1H TRY ' +
+        clickCount;
+
+      h1El.style.color =
+        '#facc15';
+
+      infoEl.textContent =
+        `REFRESH ${left}s`;
+
+
+      if (
+        elapsed >=
+        REFRESH_AFTER
+      ) {
+        refreshPage(
+          infoEl
+        );
+      }
+
+      return;
+    }
+
+
+    oneHStageStart =
+      null;
+
+
+    h1El.textContent =
+      '1H ✅';
+
+    h1El.style.color =
+      '#4ade80';
+
+
+    // ==========================================================
+    // 0.5
+    // ==========================================================
+
+    const market =
+      find05Market(
+        card
+      );
+
+
+    if (
+      !market ||
+      !validOdds(
+        market.over
+      )
+    ) {
+      oddsEl.textContent =
+        '@ —';
+
+      infoEl.textContent =
+        action === 'bet'
+          ? 'WAIT O0.5 · BET MODE STAYS'
+          : 'WAIT O0.5';
+
+      return;
+    }
+
+
+    const overOdds =
+      Number(
+        market.over
+      );
+
+
+    oddsEl.textContent =
+      '@ ' +
+      overOdds.toFixed(2);
+
+    oddsEl.style.color =
+      '#4ade80';
+
+
+    // ==========================================================
+    // CHECK
+    // ==========================================================
 
     if (
       action === 'check'
     ) {
-      if (
-        !b.disabled &&
-        target?.betPlaced !== true &&
-        target?.canAct === true
-      ) {
-        go(
-          target,
-          'check'
+      if (saving) {
+        return;
+      }
+
+      saving =
+        true;
+
+      statusEl.textContent =
+        '0.5 FOUND ✅';
+
+      infoEl.textContent =
+        'SAVING...';
+
+      try {
+        await sendOdds(
+          market
         );
+
+        finished =
+          true;
+
+        statusEl.textContent =
+          'SAVED ✅';
+
+        infoEl.textContent =
+          'RETURN';
+
+        returning =
+          true;
+
+        setTimeout(
+          () => {
+            clearSession();
+
+            location.href =
+              DASHBOARD;
+          },
+          900
+        );
+
+      } catch (error) {
+        saving =
+          false;
+
+        statusEl.textContent =
+          'SAVE ERROR';
+
+        statusEl.style.color =
+          '#f87171';
+
+        infoEl.textContent =
+          String(
+            error?.message ||
+            error
+          );
       }
 
       return;
     }
 
+
+    // ==========================================================
+    // BET
+    // ==========================================================
+
     if (
-      action === 'bet' &&
-      !b.disabled &&
-      !target?.betPlaced &&
-      target?.canAct === true
+      action === 'bet'
     ) {
-      go(
-        target,
-        'bet'
-      );
+      // Keep fresh odds stored.
+      if (!saving) {
+        saving =
+          true;
+
+        try {
+          await sendOdds(
+            market
+          );
+        } catch {}
+
+        saving =
+          false;
+      }
+
+
+      // Select O0.5.
+      if (
+        !oddsSelected &&
+        !isBetReady()
+      ) {
+        const selected =
+          fireClick(
+            market.overEl
+          );
+
+        if (selected) {
+          oddsSelected =
+            true;
+
+          setTimeout(
+            () => {
+              setBetReady();
+            },
+            800
+          );
+        }
+      }
+
+
+      if (
+        !isBetReady()
+      ) {
+        statusEl.textContent =
+          'SELECT O0.5';
+
+        statusEl.style.color =
+          '#facc15';
+
+        infoEl.textContent =
+          'OPEN BETSLIP...';
+
+        return;
+      }
+
+
+      // Prepare 0.10 USDT stake.
+      if (!stakePrepared) {
+        const ok =
+          setStakeAmount();
+
+        if (!ok) {
+          statusEl.textContent =
+            '🟡 BET READY';
+
+          statusEl.style.color =
+            '#facc15';
+
+          infoEl.textContent =
+            'WAIT STAKE INPUT...';
+
+          return;
+        }
+
+        stakePrepared =
+          true;
+      }
+
+
+      statusEl.textContent =
+        '🟡 BET READY';
+
+      statusEl.style.color =
+        '#facc15';
+
+      marketEl.textContent =
+        '1H O0.5 ✅';
+
+      h1El.textContent =
+        '1H ✅';
+
+      oddsEl.textContent =
+        '@ ' +
+        overOdds.toFixed(
+          2
+        );
+
+
+      // ========================================================
+      // DRY MODE
+      // ========================================================
+
+      if (!BET_PLACE) {
+        infoEl.textContent =
+          BET_STAKE_USDT.toFixed(2) +
+          ' USDT · PLACE BET DISABLED · RETURN 5s';
+
+        scheduleDryReturn();
+
+        return;
+      }
+
+
+      // ========================================================
+      // MANUAL CONFIRM MODE
+      // ========================================================
+
+      const placeBetFound =
+        highlightPlaceBetButton();
+
+      if (placeBetFound) {
+        statusEl.textContent =
+          '🟡 READY TO CLICK';
+
+        statusEl.style.color =
+          '#facc15';
+
+        infoEl.textContent =
+          BET_STAKE_USDT.toFixed(2) +
+          ' USDT · PLACE BET Е МАРКИРАН';
+      } else {
+        statusEl.textContent =
+          '🟡 BET READY';
+
+        statusEl.style.color =
+          '#facc15';
+
+        infoEl.textContent =
+          BET_STAKE_USDT.toFixed(2) +
+          ' USDT · WAIT PLACE BET BUTTON...';
+      }
+
+      return;
     }
   }
-);
 
 
-// ==========================================================
-// START
-// ==========================================================
+  // ============================================================
+  // START
+  // ============================================================
 
-safeRefreshTargets();
-safeRefreshDaily();
+  function start() {
+    createPanel();
 
-setInterval(
-  safeRefreshTargets,
-  TARGET_REFRESH_MS
-);
+    launchState =
+      captureLaunch() ||
+      launchState;
 
-setInterval(
-  safeRefreshDaily,
-  DAILY_REFRESH_MS
-);
+    getEventId();
+    getAction();
 
-</script>
-</body>
-</html>`;
-}
+    let running =
+      false;
+
+    setInterval(
+      async () => {
+        keepPanelAlive();
+
+        if (running) {
+          return;
+        }
+
+        running =
+          true;
+
+        try {
+          await update();
+
+        } catch (error) {
+          console.error(
+            '[TOP V7.12]',
+            error
+          );
+
+        } finally {
+          running =
+            false;
+        }
+      },
+      500
+    );
+  }
+
+
+  if (
+    document.readyState ===
+    'loading'
+  ) {
+    document.addEventListener(
+      'DOMContentLoaded',
+      start,
+      {
+        once: true
+      }
+    );
+  } else {
+    start();
+  }
+
+})();
