@@ -1,4 +1,3 @@
-
 import { debugBetsafe } from "./odds/betsafe";
 import { debugCloudbet } from "./odds/cloudbet";
 
@@ -25,7 +24,7 @@ import { debugCloudbet } from "./odds/cloudbet";
 // - browser/Monkey logic is unchanged
 // ============================================================
 
-const VERSION = "V2.0.7 SIGNAL ODDS FIRST";
+const VERSION = "V2.0.8 TRACKER ODDS PRESERVED";
 const APP_NAME = "top-signal";
 const TIME_ZONE = "Europe/Sofia";
 
@@ -683,6 +682,43 @@ async function buildTargets(env: Env) {
       item?.match_id
     );
 
+    // Authoritative source: the Tracker /entries payload itself.
+    // Matcher is used to lock the Cloudbet event, but does not need
+    // to echo every financial field from the signal.
+    const trackerSignal =
+      signals.find((s: Obj) => {
+        const sId =
+          safe(s?.id);
+
+        const sMatchId =
+          safe(s?.match_id);
+
+        const sName =
+          safe(
+            s?.match_name ??
+            s?.match
+          );
+
+        return (
+          (
+            signalId &&
+            sId &&
+            sId === signalId
+          ) ||
+          (
+            matchId &&
+            sMatchId &&
+            sMatchId === matchId
+          ) ||
+          (
+            matchName &&
+            sName &&
+            sName === matchName
+          )
+        );
+      }) ??
+      null;
+
     const entryTime = safe(
       signal?.entry_time ??
       signal?.created_at
@@ -696,6 +732,9 @@ async function buildTargets(env: Env) {
     // for the old browser /api/odds capture flow.
     const signalEntryOdds =
       numberOrNull(
+        trackerSignal?.entry_odds ??
+        trackerSignal?.entryOdds ??
+        trackerSignal?.odds ??
         signal?.entry_odds ??
         signal?.entryOdds ??
         item?.entry_odds ??
@@ -788,17 +827,29 @@ async function buildTargets(env: Env) {
 
       oddsSource:
         (
-          signalEntryOdds !== null &&
-          signalEntryOdds > 1
+          numberOrNull(
+            trackerSignal?.entry_odds
+          ) !== null &&
+          numberOrNull(
+            trackerSignal?.entry_odds
+          ) > 1
         )
-          ? "TRACKER_SIGNAL_ENTRY_ODDS"
+          ? "TRACKER_DIRECT_ENTRY_ODDS"
           : (
-              numberOrNull(
-                oddsRow?.over_odds
-              ) !== null
-                ? "LIVE_ODDS_FALLBACK"
-                : "NONE"
-            ),
+              signalEntryOdds !== null &&
+              signalEntryOdds > 1
+            )
+              ? "MATCHER_SIGNAL_ENTRY_ODDS"
+              : (
+                  numberOrNull(
+                    oddsRow?.over_odds
+                  ) !== null &&
+                  numberOrNull(
+                    oddsRow?.over_odds
+                  ) > 1
+                    ? "LIVE_ODDS_FALLBACK"
+                    : "NONE"
+                ),
 
       classification:
         classification ||
@@ -1796,6 +1847,37 @@ function normalizeHunterSignal(
       numberOrNull(
         x?.hunter_score ??
         x?.goal_signal?.score
+      ),
+
+    // Preserve Tracker-captured Cloudbet odds.
+    // V2.0.7 dropped this field during normalization.
+    entry_odds:
+      numberOrNull(
+        x?.entry_odds ??
+        x?.entryOdds ??
+        x?.odds ??
+        x?.cloudbet?.entry_odds ??
+        x?.cloudbet?.entryOdds
+      ),
+
+    odds_available:
+      (
+        x?.odds_available === true ||
+        numberOrNull(
+          x?.entry_odds ??
+          x?.entryOdds ??
+          x?.odds ??
+          x?.cloudbet?.entry_odds ??
+          x?.cloudbet?.entryOdds
+        ) !== null
+      ),
+
+    cloudbet_event_id:
+      safe(
+        x?.cloudbet_event_id ??
+        x?.cloudbet?.event_id ??
+        x?.cloudbet?.eventId ??
+        x?.cloudbet?.id
       ),
 
     goal_pressure:
@@ -2864,7 +2946,7 @@ body{
 <div class="title">⚡ TOP SIGNAL MANUAL</div>
 
 <div class="subtitle">
-V2.0.7 SIGNAL ODDS FIRST · TRACKER → MATCHER → V27 LIVE
+V2.0.8 TRACKER ODDS PRESERVED · TRACKER → MATCHER → V27 LIVE
 </div>
 
 <div class="summary">
