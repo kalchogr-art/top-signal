@@ -2,12 +2,12 @@ import { debugBetsafe } from "./odds/betsafe";
 import { debugCloudbet } from "./odds/cloudbet";
 
 // ============================================================
-// TOP SIGNAL V2.0.1 — DAILY LOG + ANTI-OVERLAP
+// TOP SIGNAL V2.0.5 — ACTIVE BET LIFECYCLE
 //
 // TRACKER -> MATCHER -> DASHBOARD
 // -> CHECK ODDS / BET NOW HANDOFF
 //
-// V2.0.1:
+// V2.0.5:
 // - TARGET polling: 10s
 // - DAILY polling: 30s
 // - no overlapping browser refresh requests
@@ -15,15 +15,21 @@ import { debugCloudbet } from "./odds/cloudbet";
 // - D1 live_odds + bet_status + daily_matches
 // - secure CONFIDENT_MATCH targets only
 // - Europe/Sofia daily log
+// - V27 fail-closed for CHECK/BET
+// - action window 10'–42'
+// - PLACED + PENDING bets stay visible until WIN/LOSS
 //
 // IMPORTANT:
 // - final bet submit is NOT performed by this Worker
 // - browser/Monkey logic is unchanged
 // ============================================================
 
-const VERSION = "V2.0.4 LIVE V27 STATE";
+const VERSION = "V2.0.5 ACTIVE BET LIFECYCLE";
 const APP_NAME = "top-signal";
 const TIME_ZONE = "Europe/Sofia";
+
+const ACTION_MINUTE_FROM = 10;
+const ACTION_MINUTE_TO = 42;
 
 type Obj = Record<string, any>;
 
@@ -134,8 +140,14 @@ export default {
         storage: "D1",
         daily_log: true,
         anti_overlap: true,
+        active_bet_lifecycle: true,
+        placed_pending_persistence: true,
         timezone: TIME_ZONE,
         live_state: "V27_CURRENT_MINUTE_SCORE",
+        action_window: {
+          from: ACTION_MINUTE_FROM,
+          to: ACTION_MINUTE_TO
+        },
         bindings: {
           DB: !!env.DB,
           TRACKER: !!env.TRACKER,
@@ -146,7 +158,8 @@ export default {
           targets_ms: 10000,
           daily_ms: 30000
         },
-        flow: "TRACKER -> MATCHER -> TOP SIGNAL -> DAILY LOG"
+        flow:
+          "TRACKER -> MATCHER -> TOP SIGNAL -> BET PLACED -> TRACKER WIN/LOSS -> ARCHIVE"
       });
     }
 
@@ -207,7 +220,9 @@ export default {
           stats: {
             tracker_signals: result.trackerSignals,
             matcher_hunter_results: result.matcherHunterResults,
-            secure_targets: result.targets.length,
+            secure_targets: result.secureTargets,
+            active_targets: result.targets.length,
+            placed_pending: result.placedPending,
             placed: result.targets.filter(x => x.betPlaced).length,
             live_feed_ok: result.liveFeedOk,
             live_matches: result.liveMatches
@@ -235,6 +250,8 @@ export default {
           count: result.targets.length,
           tracker_signals: result.trackerSignals,
           matcher_hunter_results: result.matcherHunterResults,
+          secure_targets: result.secureTargets,
+          placed_pending: result.placedPending,
           placed: result.targets.filter(x => x.betPlaced).length,
           live_feed_ok: result.liveFeedOk,
           live_matches: result.liveMatches,
@@ -553,6 +570,11 @@ async function ensureTables(env: Env) {
     CREATE INDEX IF NOT EXISTS idx_daily_matches_signal_id
     ON daily_matches(signal_id)
   `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_daily_matches_active_placed
+    ON daily_matches(day_key, bet_status, result_status)
+  `).run();
 }
 
 
@@ -562,26 +584,32 @@ async function ensureTables(env: Env) {
 
 async function buildTargets(env: Env) {
   const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
-  const signals = extractHunterSignals(tracker);
 
+  // Keep daily result state fresh on the same request that refreshes
+  // the active target list. This allows a PLACED card to disappear
+  // immediately after Tracker resolves it as WIN/LOSS.
+  await syncDailyFromTrackerData(env, tracker);
+
+  const signals = extractHunterSignals(tracker);
   const v27 = await fetchV27Snapshot(env);
 
-  if (!signals.length) {
-    return {
-      trackerSignals: 0,
-      matcherHunterResults: 0,
-      liveFeedOk: v27.ok,
-      liveMatches: v27.matches.length,
-      targets: []
-    };
+  let hunterResults: Obj[] = [];
+
+  if (signals.length) {
+    const matcher = await callMatcher(env, signals);
+
+    hunterResults =
+      Array.isArray(matcher?.hunter_results)
+        ? matcher.hunter_results
+        : [];
   }
 
-  const matcher = await callMatcher(env, signals);
-  const hunterResults = Array.isArray(matcher?.hunter_results)
-    ? matcher.hunter_results
-    : [];
-
   const targets: Obj[] = [];
+  const seenEventIds = new Set<string>();
+
+  // ==========================================================
+  // CURRENT SECURE HUNTER TARGETS
+  // ==========================================================
 
   for (const item of hunterResults) {
     const classification = safe(
@@ -595,7 +623,10 @@ async function buildTargets(env: Env) {
       item?.secure === true ||
       classification === "CONFIDENT_MATCH";
 
-    if (!secure || classification && classification !== "CONFIDENT_MATCH") {
+    if (
+      !secure ||
+      (classification && classification !== "CONFIDENT_MATCH")
+    ) {
       continue;
     }
 
@@ -641,9 +672,20 @@ async function buildTargets(env: Env) {
       item?.hunter_score
     );
 
-    const signalId = safe(signal?.id ?? item?.signal_id);
-    const matchId = safe(signal?.match_id ?? item?.match_id);
-    const entryTime = safe(signal?.entry_time ?? signal?.created_at);
+    const signalId = safe(
+      signal?.id ??
+      item?.signal_id
+    );
+
+    const matchId = safe(
+      signal?.match_id ??
+      item?.match_id
+    );
+
+    const entryTime = safe(
+      signal?.entry_time ??
+      signal?.created_at
+    );
 
     const live = findV27Match(
       v27.matches,
@@ -651,16 +693,26 @@ async function buildTargets(env: Env) {
       matchName
     );
 
-    const liveState = normalizeV27LiveState(live);
+    const liveState =
+      normalizeV27LiveState(live);
 
+    const currentMinute =
+      numberOrNull(liveState.minute);
+
+    const inActionWindow =
+      currentMinute !== null &&
+      currentMinute >= ACTION_MINUTE_FROM &&
+      currentMinute <= ACTION_MINUTE_TO;
+
+    // FAIL CLOSED:
+    // If V27 is unavailable, the match is missing, not 1H, not 0:0,
+    // or outside 10'–42', CHECK/BET must NOT be allowed.
     const canAct =
-      !v27.ok
-        ? true
-        : (
-            liveState.found &&
-            liveState.firstHalf &&
-            liveState.zeroZero
-          );
+      v27.ok &&
+      liveState.found &&
+      liveState.firstHalf &&
+      liveState.zeroZero &&
+      inActionWindow;
 
     await saveTarget(env, {
       eventId,
@@ -679,25 +731,103 @@ async function buildTargets(env: Env) {
       entryTime
     });
 
-    const oddsRow = await getStoredEvent(env, eventId);
-    const betRow = await getBetStatus(env, eventId);
+    const oddsRow =
+      await getStoredEvent(env, eventId);
+
+    const betRow =
+      await getBetStatus(env, eventId);
+
+    const dailyRow =
+      await getDailyMatchByEventId(env, eventId);
+
+    const betPlaced =
+      safe(betRow?.status).toUpperCase() === "PLACED" ||
+      safe(dailyRow?.bet_status).toUpperCase() === "PLACED";
+
+    const resultStatus =
+      safe(dailyRow?.result_status).toUpperCase() ||
+      "PENDING";
+
+    // A settled placed bet belongs only in the archive.
+    if (
+      betPlaced &&
+      (resultStatus === "WIN" || resultStatus === "LOSS")
+    ) {
+      continue;
+    }
 
     targets.push({
       eventId,
       matchName,
-      cloudbetMatch: safe(cloudbet?.name ?? cloudbet?.match),
+      cloudbetMatch: safe(
+        cloudbet?.name ??
+        cloudbet?.match
+      ),
+
       minute,
       hunterScore,
-      classification: classification || "CONFIDENT_MATCH",
+
+      classification:
+        classification ||
+        "CONFIDENT_MATCH",
+
       secureMatch: true,
-      overOdds: numberOrNull(oddsRow?.over_odds),
-      underOdds: numberOrNull(oddsRow?.under_odds),
-      oddsUpdatedAt: oddsRow?.updated_at ?? null,
-      betPlaced: safe(betRow?.status).toUpperCase() === "PLACED",
-      betStatus: betRow?.status ?? null,
-      betPlacedAt: betRow?.placed_at ?? null,
-      betStake: numberOrNull(betRow?.stake),
-      betOdds: numberOrNull(betRow?.odds),
+
+      overOdds:
+        numberOrNull(
+          betPlaced
+            ? (
+                betRow?.odds ??
+                dailyRow?.bet_odds ??
+                oddsRow?.over_odds
+              )
+            : oddsRow?.over_odds
+        ),
+
+      underOdds:
+        numberOrNull(
+          oddsRow?.under_odds
+        ),
+
+      oddsUpdatedAt:
+        oddsRow?.updated_at ??
+        null,
+
+      betPlaced,
+      betStatus:
+        betPlaced
+          ? "PLACED"
+          : (betRow?.status ?? null),
+
+      betPlacedAt:
+        betRow?.placed_at ??
+        dailyRow?.placed_at ??
+        null,
+
+      betStake:
+        numberOrNull(
+          betRow?.stake ??
+          dailyRow?.bet_stake
+        ),
+
+      betOdds:
+        numberOrNull(
+          betRow?.odds ??
+          dailyRow?.bet_odds
+        ),
+
+      resultStatus,
+      trackerStatus:
+        dailyRow?.tracker_status ??
+        null,
+
+      trackerResult:
+        dailyRow?.tracker_result ??
+        null,
+
+      persistentPlaced:
+        betPlaced &&
+        resultStatus === "PENDING",
 
       liveFeedOk: v27.ok,
       liveFound: liveState.found,
@@ -709,45 +839,305 @@ async function buildTargets(env: Env) {
       liveAwayScore: liveState.awayScore,
       liveZeroZero: liveState.zeroZero,
       liveFirstHalf: liveState.firstHalf,
-      canAct,
+      liveInWindow: inActionWindow,
+
+      // Once placed, the card may remain visible but no second bet is allowed.
+      canAct:
+        betPlaced
+          ? false
+          : canAct,
 
       liveReason:
-        !v27.ok
-          ? "LIVE_FEED_UNAVAILABLE"
-          : !liveState.found
-            ? "MATCH_NOT_IN_V27_LIVE"
-            : !liveState.firstHalf
-              ? "NOT_FIRST_HALF"
-              : !liveState.zeroZero
-                ? "NOT_ZERO_ZERO"
-                : "LIVE_OK"
+        liveReason(
+          v27.ok,
+          liveState,
+          inActionWindow,
+          betPlaced
+        )
     });
+
+    seenEventIds.add(eventId);
+  }
+
+  // ==========================================================
+  // PERSISTENT PLACED + PENDING TARGETS FROM D1
+  // ==========================================================
+  //
+  // These rows keep the card visible even after the Tracker/Matcher
+  // no longer returns it as an actionable Hunter target.
+  // They disappear only after result_status becomes WIN or LOSS.
+  // ==========================================================
+
+  const placedPendingRows =
+    await getPlacedPendingMatches(env);
+
+  for (const row of placedPendingRows) {
+    const eventId =
+      safe(row?.event_id);
+
+    if (!eventId) {
+      continue;
+    }
+
+    // If the live Matcher path already produced the same event,
+    // keep that richer version and avoid duplicates.
+    if (seenEventIds.has(eventId)) {
+      continue;
+    }
+
+    const matchName =
+      safe(row?.match_name) ||
+      "Placed Hunter bet";
+
+    const matchId =
+      safe(row?.match_id);
+
+    const live =
+      findV27Match(
+        v27.matches,
+        matchId,
+        matchName
+      );
+
+    const liveState =
+      normalizeV27LiveState(live);
+
+    const oddsRow =
+      await getStoredEvent(env, eventId);
+
+    const betRow =
+      await getBetStatus(env, eventId);
+
+    const currentMinute =
+      numberOrNull(liveState.minute);
+
+    const inActionWindow =
+      currentMinute !== null &&
+      currentMinute >= ACTION_MINUTE_FROM &&
+      currentMinute <= ACTION_MINUTE_TO;
+
+    const persistedOdds =
+      numberOrNull(
+        betRow?.odds ??
+        row?.bet_odds ??
+        row?.found_odds ??
+        oddsRow?.over_odds
+      );
+
+    targets.push({
+      eventId,
+      matchName,
+
+      cloudbetMatch:
+        safe(betRow?.match_name) ||
+        safe(oddsRow?.match_name) ||
+        matchName,
+
+      minute:
+        numberOrNull(
+          row?.entry_minute ??
+          oddsRow?.minute
+        ),
+
+      hunterScore:
+        numberOrNull(
+          row?.hunter_score ??
+          oddsRow?.hunter_score
+        ),
+
+      classification:
+        "PLACED_PERSISTED",
+
+      secureMatch: true,
+
+      overOdds:
+        persistedOdds,
+
+      underOdds:
+        numberOrNull(
+          oddsRow?.under_odds
+        ),
+
+      oddsUpdatedAt:
+        oddsRow?.updated_at ??
+        row?.updated_at ??
+        null,
+
+      betPlaced: true,
+      betStatus: "PLACED",
+
+      betPlacedAt:
+        betRow?.placed_at ??
+        row?.placed_at ??
+        null,
+
+      betStake:
+        numberOrNull(
+          betRow?.stake ??
+          row?.bet_stake
+        ),
+
+      betOdds:
+        persistedOdds,
+
+      resultStatus:
+        safe(row?.result_status).toUpperCase() ||
+        "PENDING",
+
+      trackerStatus:
+        row?.tracker_status ??
+        null,
+
+      trackerResult:
+        row?.tracker_result ??
+        null,
+
+      persistentPlaced: true,
+
+      liveFeedOk: v27.ok,
+      liveFound: liveState.found,
+      liveMatchId: liveState.id,
+      liveMinute: liveState.minute,
+      liveMinuteDisplay: liveState.minuteDisplay,
+      livePeriod: liveState.period,
+      liveHomeScore: liveState.homeScore,
+      liveAwayScore: liveState.awayScore,
+      liveZeroZero: liveState.zeroZero,
+      liveFirstHalf: liveState.firstHalf,
+      liveInWindow: inActionWindow,
+
+      // Never allow a second bet from a persisted placed card.
+      canAct: false,
+
+      liveReason:
+        liveReason(
+          v27.ok,
+          liveState,
+          inActionWindow,
+          true
+        )
+    });
+
+    seenEventIds.add(eventId);
   }
 
   targets.sort((a, b) => {
-    const ao = numberOrNull(a?.overOdds);
-    const bo = numberOrNull(b?.overOdds);
+    // Keep active placed bets at the top.
+    if (
+      a?.betPlaced === true &&
+      b?.betPlaced !== true
+    ) {
+      return -1;
+    }
 
-    if (ao !== null && bo !== null) return bo - ao;
+    if (
+      b?.betPlaced === true &&
+      a?.betPlaced !== true
+    ) {
+      return 1;
+    }
+
+    const ao =
+      numberOrNull(a?.overOdds);
+
+    const bo =
+      numberOrNull(b?.overOdds);
+
+    if (ao !== null && bo !== null) {
+      return bo - ao;
+    }
+
     if (ao !== null) return -1;
     if (bo !== null) return 1;
 
-    return (numberOrNull(b?.hunterScore) ?? 0) -
-           (numberOrNull(a?.hunterScore) ?? 0);
+    return (
+      (numberOrNull(b?.hunterScore) ?? 0) -
+      (numberOrNull(a?.hunterScore) ?? 0)
+    );
   });
 
+  const secureTargets =
+    targets.filter(
+      x => x?.betPlaced !== true
+    ).length;
+
+  const placedPending =
+    targets.filter(
+      x =>
+        x?.betPlaced === true &&
+        safe(x?.resultStatus)
+          .toUpperCase() === "PENDING"
+    ).length;
+
   return {
-    trackerSignals: signals.length,
-    matcherHunterResults: hunterResults.length,
-    liveFeedOk: v27.ok,
-    liveMatches: v27.matches.length,
+    trackerSignals:
+      signals.length,
+
+    matcherHunterResults:
+      hunterResults.length,
+
+    secureTargets,
+    placedPending,
+
+    liveFeedOk:
+      v27.ok,
+
+    liveMatches:
+      v27.matches.length,
+
     targets
   };
 }
 
 
-async function saveTarget(env: Env, target: Obj) {
-  const now = new Date().toISOString();
+function liveReason(
+  liveFeedOk: boolean,
+  liveState: any,
+  inActionWindow: boolean,
+  betPlaced: boolean
+): string {
+  if (betPlaced) {
+    if (!liveFeedOk) {
+      return "BET_PLACED_WAIT_RESULT_V27_UNAVAILABLE";
+    }
+
+    if (!liveState?.found) {
+      return "BET_PLACED_WAIT_RESULT";
+    }
+
+    return "BET_PLACED_WAIT_RESULT";
+  }
+
+  if (!liveFeedOk) {
+    return "LIVE_FEED_UNAVAILABLE";
+  }
+
+  if (!liveState?.found) {
+    return "MATCH_NOT_IN_V27_LIVE";
+  }
+
+  if (!liveState?.firstHalf) {
+    return "NOT_FIRST_HALF";
+  }
+
+  if (!liveState?.zeroZero) {
+    return "NOT_ZERO_ZERO";
+  }
+
+  if (!inActionWindow) {
+    return "OUTSIDE_10_42_WINDOW";
+  }
+
+  return "LIVE_OK";
+}
+
+
+async function saveTarget(
+  env: Env,
+  target: Obj
+) {
+  const now =
+    new Date().toISOString();
 
   await env.DB.prepare(`
     INSERT INTO live_odds (
@@ -774,21 +1164,71 @@ async function saveTarget(env: Env, target: Obj) {
 }
 
 
-async function getStoredEvent(env: Env, eventId: string): Promise<any> {
+async function getStoredEvent(
+  env: Env,
+  eventId: string
+): Promise<any> {
   return await env.DB.prepare(`
-    SELECT * FROM live_odds
+    SELECT *
+    FROM live_odds
     WHERE event_id = ?1
     LIMIT 1
-  `).bind(eventId).first();
+  `)
+  .bind(eventId)
+  .first();
 }
 
 
-async function getBetStatus(env: Env, eventId: string): Promise<any> {
+async function getBetStatus(
+  env: Env,
+  eventId: string
+): Promise<any> {
   return await env.DB.prepare(`
-    SELECT * FROM bet_status
+    SELECT *
+    FROM bet_status
     WHERE event_id = ?1
     LIMIT 1
-  `).bind(eventId).first();
+  `)
+  .bind(eventId)
+  .first();
+}
+
+
+async function getDailyMatchByEventId(
+  env: Env,
+  eventId: string
+): Promise<any> {
+  return await env.DB.prepare(`
+    SELECT *
+    FROM daily_matches
+    WHERE event_id = ?1
+    LIMIT 1
+  `)
+  .bind(eventId)
+  .first();
+}
+
+
+async function getPlacedPendingMatches(
+  env: Env
+): Promise<Obj[]> {
+  const result =
+    await env.DB.prepare(`
+      SELECT *
+      FROM daily_matches
+      WHERE
+        day_key = ?1
+        AND bet_status = 'PLACED'
+        AND COALESCE(result_status, 'PENDING') = 'PENDING'
+      ORDER BY
+        COALESCE(placed_at, entry_time, first_seen_at) DESC
+    `)
+    .bind(sofiaDate())
+    .all();
+
+  return Array.isArray(result?.results)
+    ? result.results as Obj[]
+    : [];
 }
 
 
@@ -806,20 +1246,22 @@ async function fetchV27Snapshot(
     let data: any;
 
     if (env.V27) {
-      const response = await env.V27.fetch(
-        new Request(
-          "https://v27.internal/",
-          {
-            method: "GET",
-            headers: {
-              "accept": "application/json",
-              "cache-control": "no-store"
+      const response =
+        await env.V27.fetch(
+          new Request(
+            "https://v27.internal/",
+            {
+              method: "GET",
+              headers: {
+                "accept": "application/json",
+                "cache-control": "no-store"
+              }
             }
-          }
-        )
-      );
+          )
+        );
 
-      const text = await response.text();
+      const text =
+        await response.text();
 
       if (!response.ok) {
         throw new Error(
@@ -830,22 +1272,26 @@ async function fetchV27Snapshot(
         );
       }
 
-      data = JSON.parse(text);
-    } else {
-      const response = await fetch(
-        V27_PUBLIC_URL +
-        "?top_signal_live=" +
-        Date.now(),
-        {
-          method: "GET",
-          headers: {
-            "accept": "application/json",
-            "cache-control": "no-store"
-          }
-        }
-      );
+      data =
+        JSON.parse(text);
 
-      const text = await response.text();
+    } else {
+      const response =
+        await fetch(
+          V27_PUBLIC_URL +
+          "?top_signal_live=" +
+          Date.now(),
+          {
+            method: "GET",
+            headers: {
+              "accept": "application/json",
+              "cache-control": "no-store"
+            }
+          }
+        );
+
+      const text =
+        await response.text();
 
       if (!response.ok) {
         throw new Error(
@@ -856,7 +1302,8 @@ async function fetchV27Snapshot(
         );
       }
 
-      data = JSON.parse(text);
+      data =
+        JSON.parse(text);
     }
 
     const matches =
@@ -870,12 +1317,14 @@ async function fetchV27Snapshot(
 
     return {
       ok: true,
-      matches: matches.filter(
-        (x: any) =>
-          x &&
-          typeof x === "object"
-      )
+      matches:
+        matches.filter(
+          (x: any) =>
+            x &&
+            typeof x === "object"
+        )
     };
+
   } catch (error: any) {
     console.warn(
       "V27 LIVE STATE ERROR",
@@ -902,16 +1351,18 @@ function findV27Match(
     return null;
   }
 
-  const id = safe(matchId);
+  const id =
+    safe(matchId);
 
   if (id) {
-    const exact = matches.find(
-      m =>
-        safe(
-          m?.id ??
-          m?.match_id
-        ) === id
-    );
+    const exact =
+      matches.find(
+        m =>
+          safe(
+            m?.id ??
+            m?.match_id
+          ) === id
+      );
 
     if (exact) {
       return exact;
@@ -932,9 +1383,15 @@ function findV27Match(
           m?.match ??
           m?.match_name ??
           (
-            safe(m?.home?.name ?? m?.home) +
+            safe(
+              m?.home?.name ??
+              m?.home
+            ) +
             " - " +
-            safe(m?.away?.name ?? m?.away)
+            safe(
+              m?.away?.name ??
+              m?.away
+            )
           )
         ) === wanted
     );
@@ -1021,15 +1478,19 @@ function normalizeV27LiveState(
 
   return {
     found: true,
+
     id:
       safe(
         m?.id ??
         m?.match_id
       ) || null,
+
     minute,
     minuteDisplay,
+
     period:
       period || null,
+
     homeScore,
     awayScore,
     zeroZero,
@@ -1042,7 +1503,10 @@ function normalizeV27LiveState(
 // MATCHER
 // ============================================================
 
-async function callMatcher(env: Env, signals: Obj[]) {
+async function callMatcher(
+  env: Env,
+  signals: Obj[]
+) {
   if (!signals.length) {
     return {
       success: true,
@@ -1054,21 +1518,35 @@ async function callMatcher(env: Env, signals: Obj[]) {
     };
   }
 
-  const cleanSignals = signals.map(s => {
-    const copy: Obj = { ...s };
+  const cleanSignals =
+    signals.map(s => {
+      const copy: Obj =
+        { ...s };
 
-    if (typeof copy.signal === "string") {
-      delete copy.signal;
-    }
+      if (
+        typeof copy.signal === "string"
+      ) {
+        delete copy.signal;
+      }
 
-    copy.type = "HUNTER_ENTRY";
-    copy.action = copy.action ?? "ENTRY";
-    copy.status = copy.status ?? "TRACKING";
+      copy.type =
+        "HUNTER_ENTRY";
 
-    return copy;
-  });
+      copy.action =
+        copy.action ??
+        "ENTRY";
 
-  const query = encodeURIComponent(JSON.stringify(cleanSignals));
+      copy.status =
+        copy.status ??
+        "TRACKING";
+
+      return copy;
+    });
+
+  const query =
+    encodeURIComponent(
+      JSON.stringify(cleanSignals)
+    );
 
   return await fetchServiceJSON(
     env.MATCHER,
@@ -1081,32 +1559,52 @@ async function callMatcher(env: Env, signals: Obj[]) {
 // TRACKER SIGNAL EXTRACTION
 // ============================================================
 
-function extractHunterSignals(data: any): Obj[] {
+function extractHunterSignals(
+  data: any
+): Obj[] {
   let raw: any[] = [];
 
   if (Array.isArray(data)) {
     raw = data;
-  } else if (Array.isArray(data?.signals)) {
+
+  } else if (
+    Array.isArray(data?.signals)
+  ) {
     raw = data.signals;
-  } else if (Array.isArray(data?.entries)) {
+
+  } else if (
+    Array.isArray(data?.entries)
+  ) {
     raw = data.entries;
-  } else if (Array.isArray(data?.hunter_entries)) {
+
+  } else if (
+    Array.isArray(data?.hunter_entries)
+  ) {
     raw = data.hunter_entries;
-  } else if (Array.isArray(data?.data)) {
+
+  } else if (
+    Array.isArray(data?.data)
+  ) {
     raw = data.data;
   }
 
   const out: Obj[] = [];
-  const seen = new Set<string>();
+  const seen =
+    new Set<string>();
 
   for (const item of raw) {
-    if (!item || typeof item !== "object") {
+    if (
+      !item ||
+      typeof item !== "object"
+    ) {
       continue;
     }
 
     const marker = [
       item?.type,
-      typeof item?.signal === "string" ? item.signal : "",
+      typeof item?.signal === "string"
+        ? item.signal
+        : "",
       item?.action
     ]
       .map(safe)
@@ -1121,7 +1619,8 @@ function extractHunterSignals(data: any): Obj[] {
       marker.includes("HUNTER_ENTRY") ||
       marker.includes("HUNTER") ||
       (
-        safe(item?.action).toUpperCase() === "ENTRY" &&
+        safe(item?.action)
+          .toUpperCase() === "ENTRY" &&
         status === "TRACKING"
       );
 
@@ -1158,7 +1657,9 @@ function extractHunterSignals(data: any): Obj[] {
 }
 
 
-function normalizeHunterSignal(x: Obj): Obj | null {
+function normalizeHunterSignal(
+  x: Obj
+): Obj | null {
   const matchName =
     safe(
       x?.match_name ??
@@ -1296,11 +1797,24 @@ function normalizeHunterSignal(x: Obj): Obj | null {
 // DAILY LOG
 // ============================================================
 
-async function saveDailyTarget(env: Env, target: Obj) {
-  const now = new Date().toISOString();
-  const dayKey = sofiaDate(target.entryTime || now);
+async function saveDailyTarget(
+  env: Env,
+  target: Obj
+) {
+  const now =
+    new Date().toISOString();
 
-  const bet = await getBetStatus(env, target.eventId);
+  const dayKey =
+    sofiaDate(
+      target.entryTime ||
+      now
+    );
+
+  const bet =
+    await getBetStatus(
+      env,
+      target.eventId
+    );
 
   await env.DB.prepare(`
     INSERT INTO daily_matches (
@@ -1333,9 +1847,15 @@ async function saveDailyTarget(env: Env, target: Obj) {
     target.matchName,
     target.minute,
     target.hunterScore,
-    safe(bet?.status).toUpperCase() === "PLACED" ? "PLACED" : "NOT_PLACED",
+
+    safe(bet?.status)
+      .toUpperCase() === "PLACED"
+        ? "PLACED"
+        : "NOT_PLACED",
+
     numberOrNull(bet?.odds),
     numberOrNull(bet?.stake),
+
     dayKey,
     target.entryTime || null,
     bet?.placed_at ?? null,
@@ -1351,7 +1871,8 @@ async function updateDailyPlaced(
   stake: number | null,
   placedAt: string
 ) {
-  const now = new Date().toISOString();
+  const now =
+    new Date().toISOString();
 
   await env.DB.prepare(`
     UPDATE daily_matches
@@ -1372,24 +1893,48 @@ async function updateDailyPlaced(
 }
 
 
-async function syncDailyFromTracker(env: Env) {
-  const tracker = await fetchServiceJSON(env.TRACKER, "/entries");
-  await syncDailyFromTrackerData(env, tracker);
+async function syncDailyFromTracker(
+  env: Env
+) {
+  const tracker =
+    await fetchServiceJSON(
+      env.TRACKER,
+      "/entries"
+    );
+
+  await syncDailyFromTrackerData(
+    env,
+    tracker
+  );
 }
 
 
-async function syncDailyFromTrackerData(env: Env, tracker: any) {
-  const records = extractTrackerRecords(tracker);
+async function syncDailyFromTrackerData(
+  env: Env,
+  tracker: any
+) {
+  const records =
+    extractTrackerRecords(tracker);
 
-  if (!records.length) return;
+  if (!records.length) {
+    return;
+  }
 
-  const today = sofiaDate();
+  const today =
+    sofiaDate();
 
-  const rows = await env.DB.prepare(`
-    SELECT event_id, signal_id, match_id, match_name
-    FROM daily_matches
-    WHERE day_key = ?1
-  `).bind(today).all();
+  const rows =
+    await env.DB.prepare(`
+      SELECT
+        event_id,
+        signal_id,
+        match_id,
+        match_name
+      FROM daily_matches
+      WHERE day_key = ?1
+    `)
+    .bind(today)
+    .all();
 
   const daily =
     Array.isArray(rows?.results)
@@ -1403,12 +1948,18 @@ async function syncDailyFromTrackerData(env: Env, tracker: any) {
         records
       );
 
-    if (!record) continue;
+    if (!record) {
+      continue;
+    }
 
     const normalized =
-      normalizeTrackerResult(record);
+      normalizeTrackerResult(
+        record
+      );
 
-    if (!normalized) continue;
+    if (!normalized) {
+      continue;
+    }
 
     const now =
       new Date().toISOString();
@@ -1437,7 +1988,9 @@ async function syncDailyFromTrackerData(env: Env, tracker: any) {
 }
 
 
-function extractTrackerRecords(data: any): Obj[] {
+function extractTrackerRecords(
+  data: any
+): Obj[] {
   const candidates: any[][] = [];
 
   if (Array.isArray(data)) {
@@ -1461,11 +2014,15 @@ function extractTrackerRecords(data: any): Obj[] {
   }
 
   const out: Obj[] = [];
-  const seen = new Set<string>();
+  const seen =
+    new Set<string>();
 
   for (const arr of candidates) {
     for (const value of arr) {
-      if (!value || typeof value !== "object") {
+      if (
+        !value ||
+        typeof value !== "object"
+      ) {
         continue;
       }
 
@@ -1474,7 +2031,10 @@ function extractTrackerRecords(data: any): Obj[] {
         (
           safe(value?.match_id) +
           "|" +
-          safe(value?.match_name ?? value?.match) +
+          safe(
+            value?.match_name ??
+            value?.match
+          ) +
           "|" +
           safe(value?.status) +
           "|" +
@@ -1505,9 +2065,12 @@ function findTrackerRecordForDaily(
     safe(row?.match_id);
 
   const matchName =
-    normalizeName(row?.match_name);
+    normalizeName(
+      row?.match_name
+    );
 
-  let best: Obj | null = null;
+  let best: Obj | null =
+    null;
 
   for (const r of records) {
     if (
@@ -1545,18 +2108,24 @@ function findTrackerRecordForDaily(
 }
 
 
-function normalizeTrackerResult(record: Obj) {
+function normalizeTrackerResult(
+  record: Obj
+) {
   const status =
-    safe(record?.status).toUpperCase();
+    safe(record?.status)
+      .toUpperCase();
 
   const result =
-    safe(record?.result).toUpperCase();
+    safe(record?.result)
+      .toUpperCase();
 
   const action =
-    safe(record?.action).toUpperCase();
+    safe(record?.action)
+      .toUpperCase();
 
   const type =
-    safe(record?.type).toUpperCase();
+    safe(record?.type)
+      .toUpperCase();
 
   const text = [
     status,
@@ -1574,8 +2143,10 @@ function normalizeTrackerResult(record: Obj) {
     return {
       trackerStatus:
         status || "FINISHED",
+
       trackerResult:
         result || "NO GOAL",
+
       resultStatus:
         "LOSS"
     };
@@ -1588,8 +2159,10 @@ function normalizeTrackerResult(record: Obj) {
     return {
       trackerStatus:
         status || "FINISHED",
+
       trackerResult:
         result || "GOAL HIT",
+
       resultStatus:
         "WIN"
     };
@@ -1603,8 +2176,10 @@ function normalizeTrackerResult(record: Obj) {
     return {
       trackerStatus:
         status || "TRACKING",
+
       trackerResult:
         result || "PENDING",
+
       resultStatus:
         "PENDING"
     };
@@ -1614,7 +2189,9 @@ function normalizeTrackerResult(record: Obj) {
 }
 
 
-async function getDailyMatches(env: Env): Promise<Obj[]> {
+async function getDailyMatches(
+  env: Env
+): Promise<Obj[]> {
   const result =
     await env.DB.prepare(`
       SELECT *
@@ -1633,7 +2210,9 @@ async function getDailyMatches(env: Env): Promise<Obj[]> {
 }
 
 
-function buildDailySummary(matches: Obj[]) {
+function buildDailySummary(
+  matches: Obj[]
+) {
   const today =
     matches.length;
 
@@ -1663,11 +2242,16 @@ function buildDailySummary(matches: Obj[]) {
 
   return {
     today,
-    placed: placedRows.length,
+
+    placed:
+      placedRows.length,
+
     wins,
     losses,
+
     notPlaced:
-      today - placedRows.length,
+      today -
+      placedRows.length,
 
     pending:
       placedRows.filter(
@@ -1699,8 +2283,11 @@ async function fetchServiceJSON(
         {
           method: "GET",
           headers: {
-            "accept": "application/json",
-            "cache-control": "no-store"
+            "accept":
+              "application/json",
+
+            "cache-control":
+              "no-store"
           }
         }
       )
@@ -1720,6 +2307,7 @@ async function fetchServiceJSON(
 
   try {
     return JSON.parse(text);
+
   } catch {
     throw new Error(
       "INVALID_JSON: " +
@@ -1733,7 +2321,9 @@ async function fetchServiceJSON(
 // HELPERS
 // ============================================================
 
-function sofiaDate(value?: string): string {
+function sofiaDate(
+  value?: string
+): string {
   const date =
     value
       ? new Date(value)
@@ -1744,22 +2334,36 @@ function sofiaDate(value?: string): string {
       new Intl.DateTimeFormat(
         "en-CA",
         {
-          timeZone: TIME_ZONE,
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit"
+          timeZone:
+            TIME_ZONE,
+
+          year:
+            "numeric",
+
+          month:
+            "2-digit",
+
+          day:
+            "2-digit"
         }
-      ).formatToParts(date);
+      )
+      .formatToParts(date);
 
     const map: Obj = {};
 
     for (const p of parts) {
-      if (p.type !== "literal") {
-        map[p.type] = p.value;
+      if (
+        p.type !== "literal"
+      ) {
+        map[p.type] =
+          p.value;
       }
     }
 
-    return `${map.year}-${map.month}-${map.day}`;
+    return (
+      `${map.year}-${map.month}-${map.day}`
+    );
+
   } catch {
     return date
       .toISOString()
@@ -1768,18 +2372,31 @@ function sofiaDate(value?: string): string {
 }
 
 
-function normalizeName(value: any): string {
+function normalizeName(
+  value: any
+): string {
   return safe(value)
     .toLowerCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .replace(
+      /[^a-z0-9]+/g,
+      " "
+    )
     .trim()
-    .replace(/\s+/g, " ");
+    .replace(
+      /\s+/g,
+      " "
+    );
 }
 
 
-function safe(value: any): string {
+function safe(
+  value: any
+): string {
   if (
     value === null ||
     value === undefined
@@ -1787,11 +2404,14 @@ function safe(value: any): string {
     return "";
   }
 
-  return String(value).trim();
+  return String(value)
+    .trim();
 }
 
 
-function numberOrNull(value: any): number | null {
+function numberOrNull(
+  value: any
+): number | null {
   if (
     value === null ||
     value === undefined ||
@@ -1800,7 +2420,8 @@ function numberOrNull(value: any): number | null {
     return null;
   }
 
-  const n = Number(value);
+  const n =
+    Number(value);
 
   return Number.isFinite(n)
     ? n
@@ -1810,9 +2431,14 @@ function numberOrNull(value: any): number | null {
 
 function corsHeaders() {
   return {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type"
+    "access-control-allow-origin":
+      "*",
+
+    "access-control-allow-methods":
+      "GET,POST,OPTIONS",
+
+    "access-control-allow-headers":
+      "content-type"
   };
 }
 
@@ -1919,7 +2545,7 @@ body{
 }
 .placedBanner{
   margin-bottom:6px;
-  padding:4px 6px;
+  padding:5px 7px;
   border-radius:6px;
   background:#14532d;
   color:#bbf7d0;
@@ -1969,6 +2595,10 @@ body{
   border-color:#854d0e;
   background:#1c160b
 }
+.liveLine.placed{
+  border-color:#166534;
+  background:#0c1711
+}
 .liveMinute{color:#67e8f9}
 .liveScore{
   font-size:16px;
@@ -1994,6 +2624,16 @@ body{
   border-radius:6px;
   background:#422006;
   color:#fde68a;
+  font-size:8px;
+  font-weight:900;
+  text-align:center
+}
+.placedWaitBanner{
+  margin-top:6px;
+  padding:5px 7px;
+  border-radius:6px;
+  background:#052e16;
+  color:#bbf7d0;
   font-size:8px;
   font-weight:900;
   text-align:center
@@ -2038,8 +2678,14 @@ body{
   font-weight:900;
   cursor:pointer
 }
-.check{background:#2563eb;color:#fff}
-.bet{background:#16a34a;color:#fff}
+.check{
+  background:#2563eb;
+  color:#fff
+}
+.bet{
+  background:#16a34a;
+  color:#fff
+}
 .bet[disabled]{
   background:#26303c;
   color:#788393
@@ -2078,7 +2724,9 @@ body{
   padding:0 9px 9px;
   border-top:1px solid #252c38
 }
-.daily.open .dailyBody{display:block}
+.daily.open .dailyBody{
+  display:block
+}
 .dailySummary{
   margin-top:8px;
   display:grid;
@@ -2114,9 +2762,18 @@ body{
   border-radius:5px;
   background:#202632
 }
-.win{color:#4ade80;font-weight:900}
-.loss{color:#f87171;font-weight:900}
-.pending{color:#fbbf24;font-weight:900}
+.win{
+  color:#4ade80;
+  font-weight:900
+}
+.loss{
+  color:#f87171;
+  font-weight:900
+}
+.pending{
+  color:#fbbf24;
+  font-weight:900
+}
 .footer{
   margin-top:14px;
   text-align:center;
@@ -2130,28 +2787,61 @@ body{
 <div class="app">
 
 <div class="title">⚡ TOP SIGNAL MANUAL</div>
+
 <div class="subtitle">
-V2.0.4 LIVE V27 STATE · TRACKER → MATCHER → V27 LIVE
+V2.0.5 ACTIVE BET LIFECYCLE · TRACKER → MATCHER → V27 LIVE
 </div>
 
 <div class="summary">
-  <div class="sum"><div id="sumTargets" class="v">0</div><div class="l">TARGETS</div></div>
-  <div class="sum"><div id="sumReady" class="v">0</div><div class="l">ODDS READY</div></div>
-  <div class="sum"><div id="sumPlaced" class="v">0</div><div class="l">PLACED</div></div>
-  <div class="sum"><div id="sumBest" class="v">—</div><div class="l">BEST O0.5</div></div>
+  <div class="sum">
+    <div id="sumTargets" class="v">0</div>
+    <div class="l">ACTIVE</div>
+  </div>
+
+  <div class="sum">
+    <div id="sumReady" class="v">0</div>
+    <div class="l">ODDS READY</div>
+  </div>
+
+  <div class="sum">
+    <div id="sumPlaced" class="v">0</div>
+    <div class="l">BET PLACED</div>
+  </div>
+
+  <div class="sum">
+    <div id="sumBest" class="v">—</div>
+    <div class="l">BEST O0.5</div>
+  </div>
 </div>
 
-<div id="stats" class="stats">Loading...</div>
+<div id="stats" class="stats">
+Loading...
+</div>
+
 <div id="list"></div>
 
 <div id="daily" class="daily">
-  <button id="dailyHead" class="dailyHead" type="button">
-    <span>📊 ДНЕШНИ МАЧОВЕ · <span id="dailyCount">0</span></span>
-    <span id="dailyArrow">▸</span>
+  <button
+    id="dailyHead"
+    class="dailyHead"
+    type="button"
+  >
+    <span>
+      📊 ДНЕШНИ МАЧОВЕ ·
+      <span id="dailyCount">0</span>
+    </span>
+
+    <span id="dailyArrow">
+      ▸
+    </span>
   </button>
 
   <div class="dailyBody">
-    <div id="dailySummary" class="dailySummary"></div>
+    <div
+      id="dailySummary"
+      class="dailySummary"
+    ></div>
+
     <div id="dailyList"></div>
   </div>
 </div>
@@ -2163,13 +2853,20 @@ DAILY MATCH LOG · EUROPE/SOFIA · SUCCESS = WIN / (WIN + LOSS)
 </div>
 
 <script>
-const CLOUDBET_ORIGIN = 'https://www.cloud0007.com';
+const CLOUDBET_ORIGIN =
+  'https://www.cloud0007.com';
 
-const TARGET_REFRESH_MS = 10000;
-const DAILY_REFRESH_MS = 30000;
+const TARGET_REFRESH_MS =
+  10000;
 
-let targetRefreshRunning = false;
-let dailyRefreshRunning = false;
+const DAILY_REFRESH_MS =
+  30000;
+
+let targetRefreshRunning =
+  false;
+
+let dailyRefreshRunning =
+  false;
 
 let latestTargets = [];
 let latestDaily = [];
@@ -2177,208 +2874,566 @@ let dailyOpen = false;
 
 
 function esc(v){
-  return String(v ?? '').replace(/[&<>"']/g,c=>({
-    '&':'&amp;',
-    '<':'&lt;',
-    '>':'&gt;',
-    '"':'&quot;',
-    "'":'&#39;'
-  }[c]));
+  return String(v ?? '')
+    .replace(
+      /[&<>"']/g,
+      c => ({
+        '&':'&amp;',
+        '<':'&lt;',
+        '>':'&gt;',
+        '"':'&quot;',
+        "'":'&#39;'
+      }[c])
+    );
 }
+
 
 function num(v){
-  const x=Number(v);
-  return Number.isFinite(x)?x:null;
+  const x =
+    Number(v);
+
+  return Number.isFinite(x)
+    ? x
+    : null;
 }
 
-function eventUrl(target,action){
-  const id=String(target?.eventId??'').trim();
 
-  const u=new URL(
-    CLOUDBET_ORIGIN+
-    '/en/sports/soccer/live/'+
-    encodeURIComponent(id)
+function eventUrl(
+  target,
+  action
+){
+  const id =
+    String(
+      target?.eventId ??
+      ''
+    ).trim();
+
+  const u =
+    new URL(
+      CLOUDBET_ORIGIN +
+      '/en/sports/soccer/live/' +
+      encodeURIComponent(id)
+    );
+
+  u.searchParams.set(
+    'markets-tab',
+    'goals'
   );
 
-  u.searchParams.set('markets-tab','goals');
-  u.searchParams.set('ts-action',action);
-  u.searchParams.set('ts-event',id);
-  u.searchParams.set('ts-launch',Date.now().toString());
+  u.searchParams.set(
+    'ts-action',
+    action
+  );
 
-  u.hash=
-    'ts-action='+encodeURIComponent(action)+
-    '&ts-event='+encodeURIComponent(id);
+  u.searchParams.set(
+    'ts-event',
+    id
+  );
+
+  u.searchParams.set(
+    'ts-launch',
+    Date.now().toString()
+  );
+
+  u.hash =
+    'ts-action=' +
+    encodeURIComponent(action) +
+    '&ts-event=' +
+    encodeURIComponent(id);
 
   return u.href;
 }
 
-function go(target,action){
-  if(!target?.eventId)return;
-  if(action==='bet'&&target?.betPlaced)return;
 
-  const id=String(target.eventId).trim();
+function go(
+  target,
+  action
+){
+  if (!target?.eventId) {
+    return;
+  }
 
-  try{
-    window.name=
-      'TOP_SIGNAL::'+
+  if (
+    action === 'bet' &&
+    target?.betPlaced
+  ) {
+    return;
+  }
+
+  const id =
+    String(
+      target.eventId
+    ).trim();
+
+  try {
+    window.name =
+      'TOP_SIGNAL::' +
       JSON.stringify({
         action,
-        eventId:id,
-        createdAt:Date.now()
+        eventId: id,
+        createdAt:
+          Date.now()
       });
-  }catch(e){
+
+  } catch (e) {
     console.warn(
       'TOP SIGNAL window.name save failed',
       e
     );
   }
 
-  location.href=eventUrl(target,action);
+  location.href =
+    eventUrl(
+      target,
+      action
+    );
 }
 
+
 function card(t){
-  const odds=num(t?.overOdds);
-  const ready=odds!==null;
-  const placed=t?.betPlaced===true;
+  const odds =
+    num(
+      t?.betPlaced
+        ? (
+            t?.betOdds ??
+            t?.overOdds
+          )
+        : t?.overOdds
+    );
 
-  const liveFeedOk=t?.liveFeedOk===true;
-  const liveFound=t?.liveFound===true;
-  const liveValid=t?.canAct===true;
+  const ready =
+    odds !== null;
 
-  const liveMinute=
-    t?.liveMinuteDisplay||
+  const placed =
+    t?.betPlaced === true;
+
+  const result =
+    String(
+      t?.resultStatus ??
+      'PENDING'
+    ).toUpperCase();
+
+  const liveFeedOk =
+    t?.liveFeedOk === true;
+
+  const liveFound =
+    t?.liveFound === true;
+
+  const liveValid =
+    t?.canAct === true;
+
+  const liveMinute =
+    t?.liveMinuteDisplay ||
     (
-      num(t?.liveMinute)!==null
-        ? String(num(t?.liveMinute))+"'"
+      num(t?.liveMinute) !== null
+        ? String(
+            num(t?.liveMinute)
+          ) + "'"
         : '—'
     );
 
-  const liveScore=
-    num(t?.liveHomeScore)!==null&&
-    num(t?.liveAwayScore)!==null
-      ? String(num(t?.liveHomeScore))+':'+String(num(t?.liveAwayScore))
+  const liveScore =
+    num(t?.liveHomeScore) !== null &&
+    num(t?.liveAwayScore) !== null
+      ? (
+          String(
+            num(t?.liveHomeScore)
+          ) +
+          ':' +
+          String(
+            num(t?.liveAwayScore)
+          )
+        )
       : '—';
 
-  const livePeriod=
-    String(t?.livePeriod??'—');
+  const livePeriod =
+    String(
+      t?.livePeriod ??
+      '—'
+    );
 
-  let liveClass='unknown';
-  let liveBanner='';
+  let liveClass =
+    'unknown';
 
-  if(liveFeedOk&&liveFound){
-    if(liveValid){
-      liveClass='ok';
-    }else{
-      liveClass='bad';
-      liveBanner=
-        '<div class="invalidBanner">'+
-        '❌ ВЕЧЕ НЕ Е 1H 0:0 · CHECK/BET LOCKED'+
+  let liveBanner =
+    '';
+
+  if (placed) {
+    liveClass =
+      'placed';
+
+    liveBanner =
+      '<div class="placedWaitBanner">' +
+      '💰 BET PLACED · ЧАКАМЕ WIN / LOSS ОТ TRACKER' +
+      '</div>';
+
+  } else if (
+    liveFeedOk &&
+    liveFound
+  ) {
+    if (liveValid) {
+      liveClass =
+        'ok';
+
+    } else {
+      liveClass =
+        'bad';
+
+      liveBanner =
+        '<div class="invalidBanner">' +
+        '❌ CHECK/BET LOCKED · ' +
+        esc(
+          t?.liveReason ||
+          'LIVE STATE INVALID'
+        ) +
         '</div>';
     }
-  }else if(liveFeedOk&&!liveFound){
-    liveClass='bad';
-    liveBanner=
-      '<div class="invalidBanner">'+
-      '❌ МАЧЪТ НЕ Е В ТЕКУЩИЯ V27 LIVE FEED · LOCKED'+
+
+  } else if (
+    liveFeedOk &&
+    !liveFound
+  ) {
+    liveClass =
+      'bad';
+
+    liveBanner =
+      '<div class="invalidBanner">' +
+      '❌ МАЧЪТ НЕ Е В ТЕКУЩИЯ V27 LIVE FEED · LOCKED' +
       '</div>';
-  }else{
-    liveBanner=
-      '<div class="unknownBanner">'+
-      '⚠ LIVE DATA TEMPORARILY UNAVAILABLE · ENTRY DATA ONLY'+
+
+  } else {
+    liveBanner =
+      '<div class="unknownBanner">' +
+      '⚠ V27 LIVE DATA UNAVAILABLE · CHECK/BET LOCKED' +
       '</div>';
   }
 
-  const actionLocked=
-    liveFeedOk&&!liveValid;
+  const actionLocked =
+    placed ||
+    !liveValid;
 
   return (
-    '<div class="card '+(placed?'placed':'')+'">'+
-    (placed?'<div class="placedBanner">✅ ЗАЛОЖЕНО</div>':'')+
-    '<div class="match">⚽ '+esc(t?.matchName||'Hunter target')+'</div>'+
-    '<div class="event">Event '+esc(t?.eventId||'')+'</div>'+
+    '<div class="card ' +
+    (placed ? 'placed' : '') +
+    '">' +
 
-    '<div class="liveLine '+liveClass+'">'+
-      '<span class="liveMinute">⏱ '+esc(liveMinute)+'</span>'+
-      '<span class="liveScore">⚽ '+esc(liveScore)+'</span>'+
-      '<span class="livePeriod">'+esc(livePeriod)+'</span>'+
-    '</div>'+
+    (
+      placed
+        ? '<div class="placedBanner">✅ BET PLACED</div>'
+        : ''
+    ) +
 
-    liveBanner+
+    '<div class="match">⚽ ' +
+      esc(
+        t?.matchName ||
+        'Hunter target'
+      ) +
+    '</div>' +
 
-    '<div class="meta">'+
-      '<span>ENTRY '+esc(t?.minute??'—')+"'</span>"+
-      '<span>🎯 Hunter '+esc(t?.hunterScore??'—')+'</span>'+
-    '</div>'+
-    '<div class="marketLine">'+
-      '<div class="marketName">1H O0.5</div>'+
-      '<div>'+
-        '<div class="odds">'+(ready?'@'+odds.toFixed(2):'@—')+'</div>'+
-        '<div class="state '+(ready?'ready':'waiting')+'">'+
-          (placed?'PLACED ✅':ready?'READY ✅':'WAIT')+
-        '</div>'+
-      '</div>'+
-    '</div>'+
-    '<div class="actions">'+
-      '<button class="btn check" data-action="check" data-id="'+esc(t?.eventId)+'" '+
-        (actionLocked?'disabled':'')+'>'+
-        (actionLocked?'CHECK LOCKED':'CHECK')+
-      '</button>'+
-      '<button class="btn bet" data-action="bet" data-id="'+esc(t?.eventId)+'" '+
-        ((placed||!ready||actionLocked)?'disabled':'')+'>'+
-        (placed?'✅ ЗАЛОЖЕНО':actionLocked?'BET LOCKED':'BET NOW')+
-      '</button>'+
-    '</div>'+
+    '<div class="event">Event ' +
+      esc(
+        t?.eventId ||
+        ''
+      ) +
+    '</div>' +
+
+    '<div class="liveLine ' +
+      liveClass +
+    '">' +
+
+      '<span class="liveMinute">⏱ ' +
+        esc(liveMinute) +
+      '</span>' +
+
+      '<span class="liveScore">⚽ ' +
+        esc(liveScore) +
+      '</span>' +
+
+      '<span class="livePeriod">' +
+        esc(livePeriod) +
+      '</span>' +
+
+    '</div>' +
+
+    liveBanner +
+
+    '<div class="meta">' +
+
+      '<span>ENTRY ' +
+        esc(
+          t?.minute ??
+          '—'
+        ) +
+        "'" +
+      '</span>' +
+
+      '<span>🎯 Hunter ' +
+        esc(
+          t?.hunterScore ??
+          '—'
+        ) +
+      '</span>' +
+
+    '</div>' +
+
+    '<div class="marketLine">' +
+
+      '<div class="marketName">' +
+        '1H O0.5' +
+      '</div>' +
+
+      '<div>' +
+
+        '<div class="odds">' +
+          (
+            ready
+              ? '@' +
+                odds.toFixed(2)
+              : '@—'
+          ) +
+        '</div>' +
+
+        '<div class="state ' +
+          (
+            placed
+              ? 'ready'
+              : ready
+                ? 'ready'
+                : 'waiting'
+          ) +
+        '">' +
+
+          (
+            placed
+              ? 'BET PLACED ✅'
+              : ready
+                ? 'READY ✅'
+                : 'WAIT'
+          ) +
+
+        '</div>' +
+
+      '</div>' +
+
+    '</div>' +
+
+    '<div class="actions">' +
+
+      '<button ' +
+        'class="btn check" ' +
+        'data-action="check" ' +
+        'data-id="' +
+        esc(t?.eventId) +
+        '" ' +
+        (
+          actionLocked
+            ? 'disabled'
+            : ''
+        ) +
+      '>' +
+
+        (
+          placed
+            ? 'CHECK LOCKED'
+            : actionLocked
+              ? 'CHECK LOCKED'
+              : 'CHECK'
+        ) +
+
+      '</button>' +
+
+      '<button ' +
+        'class="btn bet" ' +
+        'data-action="bet" ' +
+        'data-id="' +
+        esc(t?.eventId) +
+        '" ' +
+        (
+          (
+            placed ||
+            !ready ||
+            actionLocked
+          )
+            ? 'disabled'
+            : ''
+        ) +
+      '>' +
+
+        (
+          placed
+            ? '✅ BET PLACED'
+            : actionLocked
+              ? 'BET LOCKED'
+              : 'BET NOW'
+        ) +
+
+      '</button>' +
+
+    '</div>' +
+
+    (
+      placed &&
+      result === 'PENDING'
+        ? '<div class="state waiting" style="margin-top:7px;text-align:center">⏳ RESULT PENDING</div>'
+        : ''
+    ) +
+
     '</div>'
   );
 }
 
+
 function dailyRow(m){
-  const placed=String(m?.bet_status??'').toUpperCase()==='PLACED';
-  const result=String(m?.result_status??'PENDING').toUpperCase();
+  const placed =
+    String(
+      m?.bet_status ??
+      ''
+    ).toUpperCase() ===
+    'PLACED';
 
-  const odds=num(
-    placed
-      ? (m?.bet_odds??m?.found_odds)
-      : m?.found_odds
-  );
+  const result =
+    String(
+      m?.result_status ??
+      'PENDING'
+    ).toUpperCase();
 
-  let resultHtml='—';
+  const odds =
+    num(
+      placed
+        ? (
+            m?.bet_odds ??
+            m?.found_odds
+          )
+        : m?.found_odds
+    );
 
-  if(placed){
-    if(result==='WIN'){
-      resultHtml='<span class="win">✅ ПЕЧЕЛИ</span>';
-    }else if(result==='LOSS'){
-      resultHtml='<span class="loss">❌ НЕ ПЕЧЕЛИ</span>';
-    }else{
-      resultHtml='<span class="pending">⏳ PENDING</span>';
+  let resultHtml =
+    '—';
+
+  if (placed) {
+    if (result === 'WIN') {
+      resultHtml =
+        '<span class="win">✅ ПЕЧЕЛИ</span>';
+
+    } else if (
+      result === 'LOSS'
+    ) {
+      resultHtml =
+        '<span class="loss">❌ НЕ ПЕЧЕЛИ</span>';
+
+    } else {
+      resultHtml =
+        '<span class="pending">⏳ PENDING</span>';
     }
   }
 
   return (
-    '<div class="dailyRow">'+
-      '<div class="dailyMatch">'+esc(m?.match_name||'Unknown match')+'</div>'+
-      '<div class="dailyStatus">'+
-        '<span>'+(odds!==null?'@'+odds.toFixed(2):'@—')+'</span>'+
-        '<span class="pill">'+(placed?'ЗАЛОЖЕН':'НЕЗАЛОЖЕН')+'</span>'+
-        '<span>'+resultHtml+'</span>'+
-      '</div>'+
+    '<div class="dailyRow">' +
+
+      '<div class="dailyMatch">' +
+        esc(
+          m?.match_name ||
+          'Unknown match'
+        ) +
+      '</div>' +
+
+      '<div class="dailyStatus">' +
+
+        '<span>' +
+          (
+            odds !== null
+              ? '@' +
+                odds.toFixed(2)
+              : '@—'
+          ) +
+        '</span>' +
+
+        '<span class="pill">' +
+          (
+            placed
+              ? 'ЗАЛОЖЕН'
+              : 'НЕЗАЛОЖЕН'
+          ) +
+        '</span>' +
+
+        '<span>' +
+          resultHtml +
+        '</span>' +
+
+      '</div>' +
+
     '</div>'
   );
 }
 
+
 function renderDailySummary(s){
-  const rate=
-    s?.successRate===null||s?.successRate===undefined
+  const rate =
+    s?.successRate === null ||
+    s?.successRate === undefined
       ? '—'
-      : Number(s.successRate).toFixed(1)+'%';
+      : Number(
+          s.successRate
+        ).toFixed(1) +
+        '%';
 
   return (
-    '<div class="ds"><span>ДНЕС</span><strong>'+esc(s?.today??0)+'</strong></div>'+
-    '<div class="ds"><span>ЗАЛОЖЕНИ</span><strong>'+esc(s?.placed??0)+'</strong></div>'+
-    '<div class="ds"><span>ПЕЧЕЛИ</span><strong class="win">'+esc(s?.wins??0)+'</strong></div>'+
-    '<div class="ds"><span>НЕ ПЕЧЕЛИ</span><strong class="loss">'+esc(s?.losses??0)+'</strong></div>'+
-    '<div class="ds"><span>НЕЗАЛОЖЕНИ</span><strong>'+esc(s?.notPlaced??0)+'</strong></div>'+
-    '<div class="ds"><span>УСПЕХ</span><strong>'+esc(rate)+'</strong></div>'
+    '<div class="ds">' +
+      '<span>ДНЕС</span>' +
+      '<strong>' +
+        esc(
+          s?.today ??
+          0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+    '<div class="ds">' +
+      '<span>ЗАЛОЖЕНИ</span>' +
+      '<strong>' +
+        esc(
+          s?.placed ??
+          0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+    '<div class="ds">' +
+      '<span>ПЕЧЕЛИ</span>' +
+      '<strong class="win">' +
+        esc(
+          s?.wins ??
+          0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+    '<div class="ds">' +
+      '<span>НЕ ПЕЧЕЛИ</span>' +
+      '<strong class="loss">' +
+        esc(
+          s?.losses ??
+          0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+    '<div class="ds">' +
+      '<span>НЕЗАЛОЖЕНИ</span>' +
+      '<strong>' +
+        esc(
+          s?.notPlaced ??
+          0
+        ) +
+      '</strong>' +
+    '</div>' +
+
+    '<div class="ds">' +
+      '<span>УСПЕХ</span>' +
+      '<strong>' +
+        esc(rate) +
+      '</strong>' +
+    '</div>'
   );
 }
 
@@ -2388,59 +3443,148 @@ function renderDailySummary(s){
 // ==========================================================
 
 async function refreshTargets(){
-  const r=await fetch(
-    '/api/targets?ts='+Date.now(),
-    {cache:'no-store'}
-  );
+  const r =
+    await fetch(
+      '/api/targets?ts=' +
+      Date.now(),
+      {
+        cache:
+          'no-store'
+      }
+    );
 
-  const d=await r.json();
+  const d =
+    await r.json();
 
-  if(!r.ok||!d?.success){
+  if (
+    !r.ok ||
+    !d?.success
+  ) {
     throw new Error(
-      d?.error||('HTTP '+r.status)
+      d?.error ||
+      (
+        'HTTP ' +
+        r.status
+      )
     );
   }
 
-  latestTargets=Array.isArray(d.targets)?d.targets:[];
+  latestTargets =
+    Array.isArray(d.targets)
+      ? d.targets
+      : [];
 
-  const ready=latestTargets.filter(
-    x=>num(x?.overOdds)!==null
-  );
+  const ready =
+    latestTargets.filter(
+      x =>
+        x?.betPlaced !== true &&
+        num(x?.overOdds) !== null
+    );
 
-  const placed=latestTargets.filter(
-    x=>x?.betPlaced===true
-  );
+  const placed =
+    latestTargets.filter(
+      x =>
+        x?.betPlaced === true
+    );
 
-  const best=
+  const best =
     ready
-      .map(x=>num(x?.overOdds))
-      .filter(x=>x!==null)
-      .sort((a,b)=>b-a)[0]??null;
+      .map(
+        x =>
+          num(
+            x?.overOdds
+          )
+      )
+      .filter(
+        x =>
+          x !== null
+      )
+      .sort(
+        (a,b) =>
+          b - a
+      )[0] ??
+    null;
 
-  document.getElementById('sumTargets').textContent=
-    String(latestTargets.length);
+  document
+    .getElementById(
+      'sumTargets'
+    )
+    .textContent =
+      String(
+        latestTargets.length
+      );
 
-  document.getElementById('sumReady').textContent=
-    String(ready.length);
+  document
+    .getElementById(
+      'sumReady'
+    )
+    .textContent =
+      String(
+        ready.length
+      );
 
-  document.getElementById('sumPlaced').textContent=
-    String(placed.length);
+  document
+    .getElementById(
+      'sumPlaced'
+    )
+    .textContent =
+      String(
+        placed.length
+      );
 
-  document.getElementById('sumBest').textContent=
-    best===null?'—':best.toFixed(2);
+  document
+    .getElementById(
+      'sumBest'
+    )
+    .textContent =
+      best === null
+        ? '—'
+        : best.toFixed(2);
 
-  document.getElementById('stats').textContent=
-    'Tracker '+(d.tracker_signals??0)+
-    ' · Matcher '+(d.matcher_hunter_results??0)+
-    ' · Secure '+latestTargets.length+
-    ' · V27 '+(d.live_feed_ok?'LIVE ✅':'ERROR ⚠')+
-    ' · live matches '+(d.live_matches??'—')+
-    ' · targets 10s · daily 30s';
+  document
+    .getElementById(
+      'stats'
+    )
+    .textContent =
+      'Tracker ' +
+      (d.tracker_signals ?? 0) +
 
-  document.getElementById('list').innerHTML=
-    latestTargets.length
-      ? latestTargets.map(card).join('')
-      : '<div class="empty">Няма активен secure Hunter target.<br>Чакаме нов сигнал.</div>';
+      ' · Matcher ' +
+      (d.matcher_hunter_results ?? 0) +
+
+      ' · Secure ' +
+      (d.secure_targets ?? 0) +
+
+      ' · Placed/Pending ' +
+      (d.placed_pending ?? 0) +
+
+      ' · V27 ' +
+      (
+        d.live_feed_ok
+          ? 'LIVE ✅'
+          : 'ERROR ⚠'
+      ) +
+
+      ' · live matches ' +
+      (d.live_matches ?? '—') +
+
+      ' · active 10s · daily 30s';
+
+  document
+    .getElementById(
+      'list'
+    )
+    .innerHTML =
+      latestTargets.length
+        ? latestTargets
+            .map(card)
+            .join('')
+        : (
+            '<div class="empty">' +
+            'Няма активен Hunter target или чакащ BET PLACED.<br>' +
+            'Чакаме нов сигнал.' +
+            '</div>'
+          );
 }
 
 
@@ -2449,136 +3593,260 @@ async function refreshTargets(){
 // ==========================================================
 
 async function refreshDaily(){
-  const r=await fetch(
-    '/api/daily?ts='+Date.now(),
-    {cache:'no-store'}
-  );
+  const r =
+    await fetch(
+      '/api/daily?ts=' +
+      Date.now(),
+      {
+        cache:
+          'no-store'
+      }
+    );
 
-  const d=await r.json();
+  const d =
+    await r.json();
 
-  if(!r.ok||!d?.success){
+  if (
+    !r.ok ||
+    !d?.success
+  ) {
     throw new Error(
-      d?.error||('DAILY HTTP '+r.status)
+      d?.error ||
+      (
+        'DAILY HTTP ' +
+        r.status
+      )
     );
   }
 
-  latestDaily=Array.isArray(d.matches)?d.matches:[];
+  latestDaily =
+    Array.isArray(d.matches)
+      ? d.matches
+      : [];
 
-  document.getElementById('dailyCount').textContent=
-    String(latestDaily.length);
+  document
+    .getElementById(
+      'dailyCount'
+    )
+    .textContent =
+      String(
+        latestDaily.length
+      );
 
-  document.getElementById('dailySummary').innerHTML=
-    renderDailySummary(d.summary||{});
+  document
+    .getElementById(
+      'dailySummary'
+    )
+    .innerHTML =
+      renderDailySummary(
+        d.summary ||
+        {}
+      );
 
-  document.getElementById('dailyList').innerHTML=
-    latestDaily.length
-      ? latestDaily.map(dailyRow).join('')
-      : '<div class="empty">Още няма мачове за днес.</div>';
+  document
+    .getElementById(
+      'dailyList'
+    )
+    .innerHTML =
+      latestDaily.length
+        ? latestDaily
+            .map(dailyRow)
+            .join('')
+        : (
+            '<div class="empty">' +
+            'Още няма мачове за днес.' +
+            '</div>'
+          );
 }
 
 
 // ==========================================================
-// SAFE REFRESH — V2.0.1 ANTI-OVERLAP
+// SAFE REFRESH — ANTI-OVERLAP
 // ==========================================================
 
 async function safeRefreshTargets(){
-  if(targetRefreshRunning){
+  if (
+    targetRefreshRunning
+  ) {
     console.log(
       'TARGET refresh skipped — previous request still running'
     );
+
     return;
   }
 
-  targetRefreshRunning=true;
+  targetRefreshRunning =
+    true;
 
-  try{
+  try {
     await refreshTargets();
-  }catch(e){
-    console.warn('TARGET REFRESH ERROR',e);
 
-    const stats=document.getElementById('stats');
+  } catch (e) {
+    console.warn(
+      'TARGET REFRESH ERROR',
+      e
+    );
 
-    if(stats){
-      stats.innerHTML=
-        '<span class="err">'+
-        'TEMP CONNECTION ERROR · keeping last targets · '+
-        esc(e?.message||e)+
+    const stats =
+      document.getElementById(
+        'stats'
+      );
+
+    if (stats) {
+      stats.innerHTML =
+        '<span class="err">' +
+        'TEMP CONNECTION ERROR · keeping last targets · ' +
+        esc(
+          e?.message ||
+          e
+        ) +
         '</span>';
     }
-  }finally{
-    targetRefreshRunning=false;
+
+  } finally {
+    targetRefreshRunning =
+      false;
   }
 }
 
+
 async function safeRefreshDaily(){
-  if(dailyRefreshRunning){
+  if (
+    dailyRefreshRunning
+  ) {
     console.log(
       'DAILY refresh skipped — previous request still running'
     );
+
     return;
   }
 
-  dailyRefreshRunning=true;
+  dailyRefreshRunning =
+    true;
 
-  try{
+  try {
     await refreshDaily();
-  }catch(e){
-    console.warn('DAILY REFRESH ERROR',e);
-  }finally{
-    dailyRefreshRunning=false;
+
+  } catch (e) {
+    console.warn(
+      'DAILY REFRESH ERROR',
+      e
+    );
+
+  } finally {
+    dailyRefreshRunning =
+      false;
   }
 }
 
 
 // DAILY TOGGLE
 document
-  .getElementById('dailyHead')
-  .addEventListener('click',()=>{
-    dailyOpen=!dailyOpen;
+  .getElementById(
+    'dailyHead'
+  )
+  .addEventListener(
+    'click',
+    () => {
+      dailyOpen =
+        !dailyOpen;
 
-    const el=document.getElementById('daily');
-    const arrow=document.getElementById('dailyArrow');
+      const el =
+        document.getElementById(
+          'daily'
+        );
 
-    if(dailyOpen){
-      el.classList.add('open');
-      arrow.textContent='▾';
-    }else{
-      el.classList.remove('open');
-      arrow.textContent='▸';
+      const arrow =
+        document.getElementById(
+          'dailyArrow'
+        );
+
+      if (dailyOpen) {
+        el.classList.add(
+          'open'
+        );
+
+        arrow.textContent =
+          '▾';
+
+      } else {
+        el.classList.remove(
+          'open'
+        );
+
+        arrow.textContent =
+          '▸';
+      }
     }
-  });
+  );
 
 
 // BUTTONS
-document.addEventListener('click',e=>{
-  const b=e.target.closest('[data-action]');
-  if(!b)return;
+document.addEventListener(
+  'click',
+  e => {
+    const b =
+      e.target.closest(
+        '[data-action]'
+      );
 
-  const id=b.getAttribute('data-id');
-  const action=b.getAttribute('data-action');
-
-  const target=latestTargets.find(
-    x=>String(x?.eventId)===String(id)
-  );
-
-  if(!target)return;
-
-  if(action==='check'){
-    if(!b.disabled&&target?.canAct!==false){
-      go(target,'check');
+    if (!b) {
+      return;
     }
-    return;
-  }
 
-  if(
-    action==='bet'&&
-    !b.disabled&&
-    !target?.betPlaced&&
-    target?.canAct!==false
-  ){
-    go(target,'bet');
+    const id =
+      b.getAttribute(
+        'data-id'
+      );
+
+    const action =
+      b.getAttribute(
+        'data-action'
+      );
+
+    const target =
+      latestTargets.find(
+        x =>
+          String(
+            x?.eventId
+          ) ===
+          String(id)
+      );
+
+    if (!target) {
+      return;
+    }
+
+    if (
+      action === 'check'
+    ) {
+      if (
+        !b.disabled &&
+        target?.betPlaced !== true &&
+        target?.canAct === true
+      ) {
+        go(
+          target,
+          'check'
+        );
+      }
+
+      return;
+    }
+
+    if (
+      action === 'bet' &&
+      !b.disabled &&
+      !target?.betPlaced &&
+      target?.canAct === true
+    ) {
+      go(
+        target,
+        'bet'
+      );
+    }
   }
-});
+);
 
 
 // ==========================================================
@@ -2601,4 +3869,4 @@ setInterval(
 </script>
 </body>
 </html>`;
-  }
+}
