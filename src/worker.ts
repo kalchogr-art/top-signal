@@ -24,7 +24,7 @@ import { debugCloudbet } from "./odds/cloudbet";
 // - browser/Monkey logic is unchanged
 // ============================================================
 
-const VERSION = "V2.0.5 ACTIVE BET LIFECYCLE";
+const VERSION = "V2.0.6 SIMPLE BET CARD";
 const APP_NAME = "top-signal";
 const TIME_ZONE = "Europe/Sofia";
 
@@ -2780,6 +2780,42 @@ body{
   color:#596273;
   font-size:7px
 }
+
+.simpleBetInfo{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:14px;
+  margin-top:16px;
+  margin-bottom:14px;
+}
+.simpleHunter{
+  font-size:16px;
+  font-weight:900;
+  color:#f4f4f5;
+}
+.simpleOdds{
+  font-size:30px;
+  line-height:1;
+  font-weight:1000;
+  color:#fff;
+  letter-spacing:-1px;
+}
+.simpleActions{
+  display:block !important;
+  grid-template-columns:none !important;
+}
+.simpleBetButton{
+  width:100% !important;
+  min-height:58px;
+  font-size:18px !important;
+  font-weight:1000 !important;
+  border-radius:14px !important;
+}
+.card.placed .simpleBetButton{
+  opacity:1 !important;
+}
+
 </style>
 </head>
 
@@ -2789,7 +2825,7 @@ body{
 <div class="title">⚡ TOP SIGNAL MANUAL</div>
 
 <div class="subtitle">
-V2.0.5 ACTIVE BET LIFECYCLE · TRACKER → MATCHER → V27 LIVE
+V2.0.6 SIMPLE BET CARD · TRACKER → MATCHER → V27 LIVE
 </div>
 
 <div class="summary">
@@ -3001,287 +3037,96 @@ function card(t){
         : t?.overOdds
     );
 
+  // Valid decimal odds only.
+  // 0 / 0.00 / null must never become READY or BET NOW.
   const ready =
-    odds !== null;
+    odds !== null &&
+    odds > 1;
 
   const placed =
     t?.betPlaced === true;
 
-  const result =
-    String(
-      t?.resultStatus ??
-      'PENDING'
-    ).toUpperCase();
-
-  const liveFeedOk =
-    t?.liveFeedOk === true;
-
-  const liveFound =
-    t?.liveFound === true;
-
   const liveValid =
     t?.canAct === true;
-
-  const liveMinute =
-    t?.liveMinuteDisplay ||
-    (
-      num(t?.liveMinute) !== null
-        ? String(
-            num(t?.liveMinute)
-          ) + "'"
-        : '—'
-    );
-
-  const liveScore =
-    num(t?.liveHomeScore) !== null &&
-    num(t?.liveAwayScore) !== null
-      ? (
-          String(
-            num(t?.liveHomeScore)
-          ) +
-          ':' +
-          String(
-            num(t?.liveAwayScore)
-          )
-        )
-      : '—';
-
-  const livePeriod =
-    String(
-      t?.livePeriod ??
-      '—'
-    );
-
-  let liveClass =
-    'unknown';
-
-  let liveBanner =
-    '';
-
-  if (placed) {
-    liveClass =
-      'placed';
-
-    liveBanner =
-      '<div class="placedWaitBanner">' +
-      '💰 BET PLACED · ЧАКАМЕ WIN / LOSS ОТ TRACKER' +
-      '</div>';
-
-  } else if (
-    liveFeedOk &&
-    liveFound
-  ) {
-    if (liveValid) {
-      liveClass =
-        'ok';
-
-    } else {
-      liveClass =
-        'bad';
-
-      liveBanner =
-        '<div class="invalidBanner">' +
-        '❌ CHECK/BET LOCKED · ' +
-        esc(
-          t?.liveReason ||
-          'LIVE STATE INVALID'
-        ) +
-        '</div>';
-    }
-
-  } else if (
-    liveFeedOk &&
-    !liveFound
-  ) {
-    liveClass =
-      'bad';
-
-    liveBanner =
-      '<div class="invalidBanner">' +
-      '❌ МАЧЪТ НЕ Е В ТЕКУЩИЯ V27 LIVE FEED · LOCKED' +
-      '</div>';
-
-  } else {
-    liveBanner =
-      '<div class="unknownBanner">' +
-      '⚠ V27 LIVE DATA UNAVAILABLE · CHECK/BET LOCKED' +
-      '</div>';
-  }
 
   const actionLocked =
     placed ||
     !liveValid;
+
+  const hunterScore =
+    num(
+      t?.hunterScore
+    );
 
   return (
     '<div class="card ' +
     (placed ? 'placed' : '') +
     '">' +
 
-    (
-      placed
-        ? '<div class="placedBanner">✅ BET PLACED</div>'
-        : ''
-    ) +
-
-    '<div class="match">⚽ ' +
-      esc(
-        t?.matchName ||
-        'Hunter target'
-      ) +
-    '</div>' +
-
-    '<div class="event">Event ' +
-      esc(
-        t?.eventId ||
-        ''
-      ) +
-    '</div>' +
-
-    '<div class="liveLine ' +
-      liveClass +
-    '">' +
-
-      '<span class="liveMinute">⏱ ' +
-        esc(liveMinute) +
-      '</span>' +
-
-      '<span class="liveScore">⚽ ' +
-        esc(liveScore) +
-      '</span>' +
-
-      '<span class="livePeriod">' +
-        esc(livePeriod) +
-      '</span>' +
-
-    '</div>' +
-
-    liveBanner +
-
-    '<div class="meta">' +
-
-      '<span>ENTRY ' +
+      '<div class="match">⚽ ' +
         esc(
-          t?.minute ??
-          '—'
+          t?.matchName ||
+          'Hunter target'
         ) +
-        "'" +
-      '</span>' +
-
-      '<span>🎯 Hunter ' +
-        esc(
-          t?.hunterScore ??
-          '—'
-        ) +
-      '</span>' +
-
-    '</div>' +
-
-    '<div class="marketLine">' +
-
-      '<div class="marketName">' +
-        '1H O0.5' +
       '</div>' +
 
-      '<div>' +
+      '<div class="simpleBetInfo">' +
 
-        '<div class="odds">' +
+        '<div class="simpleHunter">' +
+          '🔥 HUNTER ' +
+          esc(
+            hunterScore !== null
+              ? hunterScore
+              : '—'
+          ) +
+        '</div>' +
+
+        '<div class="simpleOdds">' +
           (
             ready
-              ? '@' +
-                odds.toFixed(2)
+              ? '@' + odds.toFixed(2)
               : '@—'
           ) +
         '</div>' +
 
-        '<div class="state ' +
-          (
-            placed
-              ? 'ready'
-              : ready
-                ? 'ready'
-                : 'waiting'
-          ) +
-        '">' +
-
-          (
-            placed
-              ? 'BET PLACED ✅'
-              : ready
-                ? 'READY ✅'
-                : 'WAIT'
-          ) +
-
-        '</div>' +
-
       '</div>' +
 
-    '</div>' +
+      '<div class="actions simpleActions">' +
 
-    '<div class="actions">' +
-
-      '<button ' +
-        'class="btn check" ' +
-        'data-action="check" ' +
-        'data-id="' +
-        esc(t?.eventId) +
-        '" ' +
-        (
-          actionLocked
-            ? 'disabled'
-            : ''
-        ) +
-      '>' +
-
-        (
-          placed
-            ? 'CHECK LOCKED'
-            : actionLocked
-              ? 'CHECK LOCKED'
-              : 'CHECK'
-        ) +
-
-      '</button>' +
-
-      '<button ' +
-        'class="btn bet" ' +
-        'data-action="bet" ' +
-        'data-id="' +
-        esc(t?.eventId) +
-        '" ' +
-        (
+        '<button ' +
+          'class="btn bet simpleBetButton" ' +
+          'data-action="bet" ' +
+          'data-id="' +
+          esc(t?.eventId) +
+          '" ' +
           (
-            placed ||
-            !ready ||
-            actionLocked
-          )
-            ? 'disabled'
-            : ''
-        ) +
-      '>' +
+            (
+              placed ||
+              !ready ||
+              actionLocked
+            )
+              ? 'disabled'
+              : ''
+          ) +
+        '>' +
 
-        (
-          placed
-            ? '✅ BET PLACED'
-            : actionLocked
-              ? 'BET LOCKED'
-              : 'BET NOW'
-        ) +
+          (
+            placed
+              ? '✅ BET PLACED'
+              : actionLocked
+                ? 'BET LOCKED'
+                : !ready
+                  ? 'WAIT ODDS'
+                  : 'BET NOW'
+          ) +
 
-      '</button>' +
+        '</button>' +
 
-    '</div>' +
-
-    (
-      placed &&
-      result === 'PENDING'
-        ? '<div class="state waiting" style="margin-top:7px;text-align:center">⏳ RESULT PENDING</div>'
-        : ''
-    ) +
+      '</div>' +
 
     '</div>'
   );
 }
-
 
 function dailyRow(m){
   const placed =
