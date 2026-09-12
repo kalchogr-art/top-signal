@@ -1,3 +1,4 @@
+
 import { debugBetsafe } from "./odds/betsafe";
 import { debugCloudbet } from "./odds/cloudbet";
 
@@ -24,7 +25,7 @@ import { debugCloudbet } from "./odds/cloudbet";
 // - browser/Monkey logic is unchanged
 // ============================================================
 
-const VERSION = "V2.0.6 SIMPLE BET CARD";
+const VERSION = "V2.0.7 SIGNAL ODDS FIRST";
 const APP_NAME = "top-signal";
 const TIME_ZONE = "Europe/Sofia";
 
@@ -687,6 +688,24 @@ async function buildTargets(env: Env) {
       signal?.created_at
     );
 
+    // ========================================================
+    // SIGNAL ODDS FIRST
+    // ========================================================
+    // Tracker already stores the exact Cloudbet 1H O0.5 odds
+    // at ENTRY. Use that value immediately instead of waiting
+    // for the old browser /api/odds capture flow.
+    const signalEntryOdds =
+      numberOrNull(
+        signal?.entry_odds ??
+        signal?.entryOdds ??
+        item?.entry_odds ??
+        item?.entryOdds ??
+        signal?.cloudbet?.entry_odds ??
+        signal?.cloudbet?.entryOdds ??
+        cloudbet?.entry_odds ??
+        cloudbet?.entryOdds
+      );
+
     const live = findV27Match(
       v27.matches,
       matchId,
@@ -767,6 +786,20 @@ async function buildTargets(env: Env) {
       minute,
       hunterScore,
 
+      oddsSource:
+        (
+          signalEntryOdds !== null &&
+          signalEntryOdds > 1
+        )
+          ? "TRACKER_SIGNAL_ENTRY_ODDS"
+          : (
+              numberOrNull(
+                oddsRow?.over_odds
+              ) !== null
+                ? "LIVE_ODDS_FALLBACK"
+                : "NONE"
+            ),
+
       classification:
         classification ||
         "CONFIDENT_MATCH",
@@ -779,9 +812,13 @@ async function buildTargets(env: Env) {
             ? (
                 betRow?.odds ??
                 dailyRow?.bet_odds ??
+                signalEntryOdds ??
                 oddsRow?.over_odds
               )
-            : oddsRow?.over_odds
+            : (
+                signalEntryOdds ??
+                oddsRow?.over_odds
+              )
         ),
 
       underOdds:
@@ -791,6 +828,8 @@ async function buildTargets(env: Env) {
 
       oddsUpdatedAt:
         oddsRow?.updated_at ??
+        signal?.updated_at ??
+        signal?.entry_time ??
         null,
 
       betPlaced,
@@ -2825,7 +2864,7 @@ body{
 <div class="title">⚡ TOP SIGNAL MANUAL</div>
 
 <div class="subtitle">
-V2.0.6 SIMPLE BET CARD · TRACKER → MATCHER → V27 LIVE
+V2.0.7 SIGNAL ODDS FIRST · TRACKER → MATCHER → V27 LIVE
 </div>
 
 <div class="summary">
@@ -3321,9 +3360,16 @@ async function refreshTargets(){
 
   const ready =
     latestTargets.filter(
-      x =>
-        x?.betPlaced !== true &&
-        num(x?.overOdds) !== null
+      x => {
+        const o =
+          num(x?.overOdds);
+
+        return (
+          x?.betPlaced !== true &&
+          o !== null &&
+          o > 1
+        );
+      }
     );
 
   const placed =
@@ -3342,7 +3388,8 @@ async function refreshTargets(){
       )
       .filter(
         x =>
-          x !== null
+          x !== null &&
+          x > 1
       )
       .sort(
         (a,b) =>
