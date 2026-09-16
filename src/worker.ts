@@ -16,7 +16,7 @@
     // NO LOCAL PERSISTENCE IS USED TO KEEP A CARD AFTER TRACKER REMOVES IT.
     // ============================================================
 
-    const VERSION = "V2.1.0 BET READY TRACKER DASHBOARD";
+    const VERSION = "V2.1.1 BET READY + DAILY ARCHIVE";
     const APP_NAME = "top-signal";
     const TIME_ZONE = "Europe/Sofia";
 
