@@ -16,7 +16,7 @@
         // NO LOCAL PERSISTENCE IS USED TO KEEP A CARD AFTER TRACKER REMOVES IT.
         // ============================================================
 
-        const VERSION = "V2.1.2 FRONTEND + ARCHIVE FIX";
+        const VERSION = "V2.1.3 BET NOW LAUNCH FIX";
         const APP_NAME = "top-signal";
         const TIME_ZONE = "Europe/Sofia";
 
@@ -780,7 +780,19 @@
     function renderDaily(a){document.getElementById('dailyCount').textContent=String(a.length);var el=document.getElementById('dailyList');if(!a.length){el.innerHTML='<div class="empty">Още няма мачове за днес.</div>';return;}var h='';for(var i=0;i<a.length;i++){var m=a[i],p=String(m.bet_status||'').toUpperCase()==='PLACED',res=String(m.result_status||'PENDING').toUpperCase(),o=num(p?(m.bet_odds!=null?m.bet_odds:m.found_odds):m.found_odds),cls='',txt='—';if(p){if(res==='WIN'){cls='win';txt='✅ ПЕЧЕЛИ';}else if(res==='LOSS'){cls='loss';txt='❌ НЕ ПЕЧЕЛИ';}else{cls='pending';txt='⏳ PENDING';}}h+='<div class="dailyRow"><div class="dailyMatch">'+esc(m.match_name)+'</div><div class="dailyStatus"><span>'+(o!==null?'@'+o.toFixed(2):'@—')+'</span><span>'+(p?'ЗАЛОЖЕН':'НЕЗАЛОЖЕН')+'</span><span class="'+cls+'">'+txt+'</span></div></div>';}el.innerHTML=h;}
     async function loadDaily(){if(dailyLoading)return;dailyLoading=true;try{var r=await fetch('/api/daily?ts='+Date.now(),{cache:'no-store'}),j=await r.json();if(!r.ok||j.success===false)throw new Error(j.error||('HTTP '+r.status));document.getElementById('dailySummary').innerHTML=summary(j.summary||{});renderDaily(Array.isArray(j.matches)?j.matches:[]);}catch(e){document.getElementById('dailyList').innerHTML='<div class="empty">Грешка при зареждане на архива.</div>';}finally{dailyLoading=false;}}
     document.getElementById('dailyHead').addEventListener('click',function(){dailyOpen=!dailyOpen;document.getElementById('daily').classList.toggle('open',dailyOpen);document.getElementById('dailyArrow').textContent=dailyOpen?'▾':'▸';});
-    document.addEventListener('click',function(e){var b=e.target.closest?e.target.closest('[data-bet-id]'):null;if(!b)return;var id=b.getAttribute('data-bet-id'),t=null;for(var i=0;i<lastTargets.length;i++)if(String(lastTargets[i].eventId)===String(id)){t=lastTargets[i];break;}if(!t||t.betPlaced||t.canAct!==true)return;try{localStorage.setItem('top_signal_bet_now',JSON.stringify({eventId:t.eventId,matchName:t.matchName,odds:t.overOdds,minute:t.liveMinuteDisplay||t.liveMinute||t.minute,requestedAt:new Date().toISOString()}));}catch(err){}window.dispatchEvent(new CustomEvent('TOP_SIGNAL_BET_NOW',{detail:t}));});
+    document.addEventListener('click',function(e){var b=e.target.closest?e.target.closest('[data-bet-id]'):null;if(!b)return;var id=b.getAttribute('data-bet-id'),t=null;for(var i=0;i<lastTargets.length;i++)if(String(lastTargets[i].eventId)===String(id)){t=lastTargets[i];break;}if(!t||t.betPlaced||t.canAct!==true)return;
+    var eventId=String(t.eventId||'').trim();
+    if(!eventId)return;
+    var launch=Date.now();
+    var q='ts-action=bet&ts-event='+encodeURIComponent(eventId)+'&ts-launch='+launch;
+    var cloudbet='https://www.cloudbet.com/en/sports/soccer/live/'+encodeURIComponent(eventId)+'?'+q+'#'+q;
+    try{
+      window.name='TOP_SIGNAL::bet::'+eventId;
+      sessionStorage.setItem('topSignalActionV79','bet');
+      sessionStorage.setItem('topSignalEventV79',eventId);
+      localStorage.setItem('top_signal_bet_now',JSON.stringify({eventId:eventId,matchName:t.matchName,odds:t.overOdds,minute:t.liveMinuteDisplay||t.liveMinute||t.minute,requestedAt:new Date().toISOString()}));
+    }catch(err){}
+    window.location.href=cloudbet;});
     window.topSignalBetPlaced=async function(p){p=p||{};var body={eventId:String(p.eventId||''),status:'PLACED',odds:p.odds==null?null:p.odds,stake:p.stake==null?null:p.stake,placedAt:p.placedAt||new Date().toISOString(),source:p.source||'CLOUDBET_FRONTEND'};var r=await fetch('/api/bet-status',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}),j=await r.json();if(!r.ok||j.success===false)throw new Error(j.error||('HTTP '+r.status));await loadTargets();await loadDaily();return j;};
     loadTargets();loadDaily();setInterval(loadTargets,5000);setInterval(loadDaily,30000);
     })();
