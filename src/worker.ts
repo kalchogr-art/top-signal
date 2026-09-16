@@ -16,7 +16,7 @@
         // NO LOCAL PERSISTENCE IS USED TO KEEP A CARD AFTER TRACKER REMOVES IT.
         // ============================================================
 
-        const VERSION = "V2.1.3.1 CLOUD0007 LINK FIX";
+        const VERSION = "V2.1.4 BET NOW V7.9 HANDOFF";
         const APP_NAME = "top-signal";
         const TIME_ZONE = "Europe/Sofia";
 
@@ -784,8 +784,8 @@
     var eventId=String(t.eventId||'').trim();
     if(!eventId)return;
     var launch=Date.now();
-    var q='ts-action=bet&ts-event='+encodeURIComponent(eventId)+'&ts-launch='+launch;
-    var cloudbet='https://www.cloud0007.com/en/sports?'+q+'#'+q;
+    var q='markets-tab=goals&ts-action=bet&ts-event='+encodeURIComponent(eventId)+'&ts-launch='+launch;
+    var cloudbet='https://www.cloud0007.com/en/sports/soccer/live/'+encodeURIComponent(eventId)+'?'+q+'#ts-action=bet&ts-event='+encodeURIComponent(eventId);
     try{
       window.name='TOP_SIGNAL::bet::'+eventId;
       sessionStorage.setItem('topSignalActionV79','bet');
