@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.3 ENTRY + LIVE MINUTES";
+  "V1.9.4 TRACKER 1-TO-1";
 
 const APP_NAME =
   "top-signal";
@@ -429,18 +429,10 @@ export default {
             };
           });
 
-        // Sofia calendar-day count of dashboard signals stored in live_odds.
-        const todayResult =
-          await env.DB.prepare(`
-            SELECT COUNT(*) AS n
-            FROM live_odds
-            WHERE date(datetime(created_at, '+3 hours')) =
-                  date(datetime('now', '+3 hours'))
-          `).first();
-
         return json({
           success: true,
-          today_signals: Number(todayResult?.n ?? 0),
+          // Active signal count comes from /api/targets (Tracker), not D1.
+          today_signals: null,
           archive
         });
 
@@ -1278,43 +1270,36 @@ async function buildTargets(
               : [];
 
 
+  // ========================================================
+  // V1.9.4 — TRACKER IS THE SINGLE SOURCE OF TRUTH
+  //
+  // No D1 row is allowed to create an active Dashboard signal.
+  // No Matcher rematch is allowed to create an active Dashboard signal.
+  // Every current Tracker entry is handled 1-to-1 here.
+  // ========================================================
+
   const trackerSignals =
     rawEntries.filter(
       (item: Obj) => {
+        const status =
+          safe(item?.status).toUpperCase();
 
         const type =
           safe(
             item?.type ??
-            (
-              typeof item?.signal === "string"
-                ? item.signal
-                : ""
-            ) ??
+            (typeof item?.signal === "string" ? item.signal : "") ??
             item?.event_type
-          )
-            .toUpperCase();
-
+          ).toUpperCase();
 
         const action =
-          safe(
-            item?.action
-          )
-            .toUpperCase();
+          safe(item?.action).toUpperCase();
 
-
-        const status =
-          safe(
-            item?.status
-          )
-            .toUpperCase();
-
-
+        // /entries is already the Tracker's current-entry endpoint.
+        // Keep current TRACKING entries and explicit HUNTER_ENTRY/ENTRY records.
         return (
+          status === "TRACKING" ||
           type === "HUNTER_ENTRY" ||
-          (
-            action === "ENTRY" &&
-            status === "TRACKING"
-          )
+          action === "ENTRY"
         );
       }
     );
@@ -1364,24 +1349,15 @@ async function buildTargets(
 
     const betReady =
       item?.bet_ready === true ||
-      safe(
-        item?.bet_status
-      )
-        .toUpperCase() ===
-        "READY_TO_BET" ||
-      safe(
-        item?.bet_ready
-      )
-        .toLowerCase() ===
-        "true";
-
-
-    // Keep only Tracker targets that are actually ready for betting.
-    if (
-      !betReady
-    ) {
-      continue;
-    }
+      item?.ready === true ||
+      cloudbet?.bet_ready === true ||
+      cloudbet?.ready === true ||
+      safe(item?.bet_status).toUpperCase() === "READY_TO_BET" ||
+      safe(item?.bet_status).toUpperCase() === "BET_READY" ||
+      safe(cloudbet?.bet_status).toUpperCase() === "READY_TO_BET" ||
+      safe(cloudbet?.bet_status).toUpperCase() === "BET_READY" ||
+      safe(item?.bet_ready).toLowerCase() === "true" ||
+      safe(cloudbet?.bet_ready).toLowerCase() === "true";
 
 
     const matchName =
@@ -1398,6 +1374,25 @@ async function buildTargets(
       );
 
 
+    const entryMinute =
+      numberOrNull(
+        item?.entry_minute ??
+        item?.entryMinute ??
+        item?.signal?.entry_minute ??
+        item?.signal?.entryMinute
+      );
+
+    const liveMinute =
+      numberOrNull(
+        item?.live_minute ??
+        item?.liveMinute ??
+        item?.current_minute ??
+        item?.currentMinute ??
+        cloudbet?.minute ??
+        cloudbet?.live_minute ??
+        item?.minute
+      );
+
     const target: Obj = {
 
       eventId,
@@ -1408,47 +1403,49 @@ async function buildTargets(
 
       matchId:
         item?.match_id ??
+        item?.matchId ??
         null,
 
       matchName,
 
+      league:
+        safe(
+          item?.league ??
+          item?.competition ??
+          cloudbet?.competition?.name ??
+          cloudbet?.competition
+        ),
+
       home:
-        extractTeamName(
-          item?.home
-        ) ||
-        extractTeamName(
-          cloudbet?.home
-        ) ||
+        extractTeamName(item?.home) ||
+        extractTeamName(cloudbet?.home) ||
         split.home,
 
       away:
-        extractTeamName(
-          item?.away
-        ) ||
-        extractTeamName(
-          cloudbet?.away
-        ) ||
+        extractTeamName(item?.away) ||
+        extractTeamName(cloudbet?.away) ||
         split.away,
 
+      // IMPORTANT:
+      // entryMinute = minute when Hunter created the signal.
+      // minute/liveMinute = current Tracker/Cloudbet live minute.
+      entryMinute,
+
+      liveMinute,
+
       minute:
-        numberOrNull(
-          item?.entry_minute ??
-          item?.minute
-        ),
+        liveMinute,
 
       score:
-        scoreToString(
-          item?.score
-        ) ||
-        scoreToString(
-          cloudbet?.score
-        ) ||
+        scoreToString(item?.score) ||
+        scoreToString(cloudbet?.score) ||
         "0:0",
 
       hunterScore:
         numberOrNull(
           item?.hunter_score ??
-          item?.goal_signal?.score
+          item?.goal_signal?.score ??
+          item?.signal?.hunter_score
         ),
 
       cloudbetMatch:
@@ -1458,24 +1455,20 @@ async function buildTargets(
         ),
 
       cloudbetHome:
-        extractTeamName(
-          cloudbet?.home
-        ),
+        extractTeamName(cloudbet?.home),
 
       cloudbetAway:
-        extractTeamName(
-          cloudbet?.away
-        ),
+        extractTeamName(cloudbet?.away),
 
       classification:
         item?.classification ??
         item?.matcher_classification ??
-        "TRACKER_READY",
+        "TRACKER_DIRECT",
 
       secureMatch:
         item?.secure_match === true ||
         item?.security?.secure_match === true ||
-        betReady,
+        !!eventId,
 
       matcherScore:
         numberOrNull(
@@ -1510,9 +1503,22 @@ async function buildTargets(
 
     const trackerOdds =
       validOdds(
+        item?.current_odds ??
+        item?.currentOdds ??
         item?.entry_odds ??
+        item?.entryOdds ??
         item?.odds ??
         item?.cloudbet_odds ??
+        item?.bet?.current_odds ??
+        item?.bet?.entry_odds ??
+        item?.bet_ready_data?.current_odds ??
+        item?.bet_ready_data?.entry_odds ??
+        cloudbet?.current_odds ??
+        cloudbet?.currentOdds ??
+        cloudbet?.entry_odds ??
+        cloudbet?.entryOdds ??
+        cloudbet?.over_odds ??
+        cloudbet?.odds?.over ??
         cloudbet?.odds
       );
 
@@ -1568,8 +1574,14 @@ async function buildTargets(
           ? "TRACKER"
           : stored?.source ?? null,
 
+      // Active rows come 1-to-1 from Tracker.
+      // BET NOW is enabled only when this Tracker record itself is ready
+      // or already carries a valid current/entry odd.
       ready:
-        betReady &&
+        (
+          betReady ||
+          trackerOdds !== null
+        ) &&
         (
           trackerOdds !== null ||
           storedOdds !== null
@@ -2204,7 +2216,7 @@ async function saveTarget(
       target.matchName ||
         null,
 
-      target.minute,
+      target.entryMinute,
 
       target.score ||
         null,
@@ -2914,12 +2926,22 @@ function validOdds(v){
   const x=Number(v);
   return Number.isFinite(x)&&x>1&&x<=50?x:null;
 }
+function slugify(v){
+  return String(v??'')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^a-z0-9]+/g,'-')
+    .replace(/^-+|-+$/g,'');
+}
 function eventUrl(t){
   const id=String(t?.eventId??'').trim();
-  const u=new URL(CLOUDBET_ORIGIN+'/en/sports/soccer/live/'+encodeURIComponent(id));
+  const competition=slugify(t?.league||'');
+  const path=competition
+    ? '/en/sports/soccer/'+encodeURIComponent(competition)+'/'+encodeURIComponent(id)
+    : '/en/sports/soccer/event/'+encodeURIComponent(id);
+  const u=new URL(CLOUDBET_ORIGIN+path);
   u.searchParams.set('markets-tab','goals');
-  u.searchParams.set('ts-action','bet');
-  u.searchParams.set('ts-event',id);
   return u.href;
 }
 function go(t){
@@ -2932,7 +2954,7 @@ function activeRow(t){
   const odds=validOdds(t?.overOdds);
   const match=esc(t?.matchName||t?.cloudbetMatch||'Hunter target');
   const entryMinute=t?.entryMinute!=null?esc(t.entryMinute)+"'":'—';
-  const liveMinute=t?.minute!=null?esc(t.minute)+"'":'—';
+  const liveMinute=t?.liveMinute!=null?esc(t.liveMinute)+"'":(t?.minute!=null?esc(t.minute)+"'":'—');
   const oddsText=odds!==null?'@'+odds.toFixed(2):'@—';
   const id=esc(t?.eventId||'');
   return '<div class="row '+(placed?'placed':'')+'">'+
@@ -2979,7 +3001,7 @@ async function refresh(){
         : '<div class="empty">Няма активни сигнали.</div>';
 
     const archive=Array.isArray(ad?.archive)?ad.archive:[];
-    document.getElementById('todayCount').textContent=String(ad?.today_signals??latestTargets.length);
+    document.getElementById('todayCount').textContent=String(latestTargets.length);
     document.getElementById('archiveCount').textContent=String(archive.length);
     document.getElementById('archiveBody').innerHTML=
       archive.length
