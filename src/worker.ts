@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.1 TRACKER DIRECT";
+  "V1.9.3 ENTRY + LIVE MINUTES";
 
 const APP_NAME =
   "top-signal";
@@ -282,6 +282,175 @@ export default {
           },
           500
         );
+      }
+    }
+
+
+    // ========================================================
+    // BET ARCHIVE — ONLY CONFIRMED BET_PLACED EVENTS
+    // Result is resolved from Tracker when GOAL / NO_GOAL is available.
+    // ========================================================
+
+    if (
+      url.pathname === "/api/archive" &&
+      request.method === "GET"
+    ) {
+      try {
+        await ensureBetStatusTable(env);
+
+        const rowsResult =
+          await env.DB.prepare(`
+            SELECT
+              b.event_id,
+              b.status AS bet_status,
+              b.placed,
+              b.placed_at,
+              l.match_name,
+              l.minute,
+              l.over_odds,
+              l.score
+            FROM bet_status b
+            LEFT JOIN live_odds l
+              ON l.event_id = b.event_id
+            WHERE b.placed = 1
+            ORDER BY b.placed_at DESC
+            LIMIT 500
+          `).all();
+
+        const rows =
+          Array.isArray(rowsResult?.results)
+            ? rowsResult.results
+            : [];
+
+        let trackerRaw: any[] = [];
+
+        try {
+          const trackerData =
+            await fetchServiceJSON(env.TRACKER, "/entries");
+
+          trackerRaw =
+            Array.isArray(trackerData)
+              ? trackerData
+              : Array.isArray(trackerData?.hunter_entries)
+                ? trackerData.hunter_entries
+                : Array.isArray(trackerData?.entries)
+                  ? trackerData.entries
+                  : Array.isArray(trackerData?.signals)
+                    ? trackerData.signals
+                    : Array.isArray(trackerData?.data)
+                      ? trackerData.data
+                      : [];
+        } catch {}
+
+        const norm = (v: any) =>
+          safe(v)
+            .toLowerCase()
+            .replace(/\s+/g, " ")
+            .trim();
+
+        const archive =
+          rows.map((row: Obj) => {
+            const rowName = norm(row?.match_name);
+
+            const tr =
+              trackerRaw.find((x: Obj) => {
+                const cloudbet =
+                  x?.cloudbet ??
+                  x?.tracker_cloudbet ??
+                  {};
+
+                const eventId =
+                  safe(
+                    x?.cloudbet_event_id ??
+                    x?.event_id ??
+                    cloudbet?.event_id ??
+                    cloudbet?.id
+                  ).replace(/\.0+$/, "");
+
+                if (
+                  eventId &&
+                  eventId === safe(row?.event_id)
+                ) {
+                  return true;
+                }
+
+                const trackerName =
+                  norm(
+                    x?.match_name ??
+                    x?.match ??
+                    cloudbet?.match
+                  );
+
+                return (
+                  !!rowName &&
+                  !!trackerName &&
+                  rowName === trackerName
+                );
+              }) ?? null;
+
+            const trackerStatus =
+              safe(
+                tr?.status ??
+                tr?.result ??
+                tr?.bet_result
+              ).toUpperCase();
+
+            let resultStatus = "WAITING";
+
+            if (
+              trackerStatus === "GOAL" ||
+              trackerStatus === "WIN" ||
+              trackerStatus === "WON"
+            ) {
+              resultStatus = "WIN";
+            } else if (
+              trackerStatus === "NO_GOAL" ||
+              trackerStatus === "LOSS" ||
+              trackerStatus === "LOST"
+            ) {
+              resultStatus = "LOSS";
+            }
+
+            return {
+              eventId: row?.event_id ?? null,
+              matchName: row?.match_name ?? "—",
+              entryMinute:
+                tr?.entry_minute ??
+                tr?.entryMinute ??
+                tr?.signal?.entry_minute ??
+                tr?.signal?.entryMinute ??
+                null,
+              liveMinute: row?.minute ?? null,
+              minute: row?.minute ?? null,
+              odds: validOdds(row?.over_odds),
+              placedAt: row?.placed_at ?? null,
+              resultStatus,
+              trackerStatus: trackerStatus || null
+            };
+          });
+
+        // Sofia calendar-day count of dashboard signals stored in live_odds.
+        const todayResult =
+          await env.DB.prepare(`
+            SELECT COUNT(*) AS n
+            FROM live_odds
+            WHERE date(datetime(created_at, '+3 hours')) =
+                  date(datetime('now', '+3 hours'))
+          `).first();
+
+        return json({
+          success: true,
+          today_signals: Number(todayResult?.n ?? 0),
+          archive
+        });
+
+      } catch (error: any) {
+        return json({
+          success: false,
+          today_signals: 0,
+          archive: [],
+          error: error?.message ?? String(error)
+        }, 500);
       }
     }
 
@@ -2671,1700 +2840,172 @@ function renderHtml():
   string {
 
   return `<!DOCTYPE html>
-
 <html lang="bg">
-
 <head>
-
 <meta charset="UTF-8">
-
-<meta
-  name="viewport"
-  content="width=device-width, initial-scale=1.0"
->
-
-<title>
-Top Signal Control
-</title>
-
-
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Top Signal</title>
 <style>
-
-* {
-
-  box-sizing:
-    border-box;
+*{box-sizing:border-box}
+body{margin:0;background:#0b0e13;color:#fff;font-family:Arial,Helvetica,sans-serif}
+.app{max-width:900px;margin:0 auto;padding:12px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.title{font-size:18px;font-weight:900}
+.count{font-size:14px;font-weight:900;color:#c4b5fd;white-space:nowrap}
+.list{display:flex;flex-direction:column;gap:7px}
+.row{display:grid;grid-template-columns:minmax(0,1fr) 48px 48px 62px 112px;align-items:center;gap:7px;background:#151a22;border:1px solid #252c38;border-radius:10px;padding:8px 9px;min-height:44px}
+.row.placed{border-color:#166534}
+.match{font-size:13px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.minute,.odds{font-size:12px;text-align:center;color:#c5ccd8;white-space:nowrap}
+.betbtn{border:0;border-radius:8px;padding:9px 6px;font-size:11px;font-weight:900;background:#16a34a;color:#fff;cursor:pointer;white-space:nowrap}
+.betbtn[disabled]{background:#14532d;color:#86efac;cursor:default}
+.empty{padding:18px 8px;text-align:center;color:#7d8797;font-size:12px}
+.archive{margin-top:14px;border:1px solid #252c38;border-radius:10px;overflow:hidden;background:#11161e}
+.archiveHead{width:100%;border:0;background:#171d27;color:#fff;padding:12px;text-align:left;font-size:13px;font-weight:900;cursor:pointer}
+.archiveBody{display:none;padding:7px}
+.archive.open .archiveBody{display:block}
+.arow{display:grid;grid-template-columns:minmax(0,1fr) 48px 48px 62px 96px;align-items:center;gap:7px;padding:8px 4px;border-bottom:1px solid #222936}
+.arow:last-child{border-bottom:0}
+.result{font-size:11px;font-weight:900;text-align:right;white-space:nowrap}
+.win{color:#4ade80}.loss{color:#f87171}.waiting{color:#facc15}
+.note{margin-top:8px;color:#697386;font-size:9px;text-align:center}
+@media(max-width:520px){
+ .app{padding:8px}
+ .row,.arow{grid-template-columns:minmax(0,1fr) 34px 34px 48px 88px;gap:4px}
+ .match{font-size:11px}
+ .minute,.odds{font-size:10px}
+ .betbtn,.result{font-size:9px}
 }
-
-
-body {
-
-  margin:
-    0;
-
-  background:
-    #0b0e13;
-
-  color:
-    #ffffff;
-
-  font-family:
-    Arial,
-    Helvetica,
-    sans-serif;
-}
-
-
-.app {
-
-  max-width:
-    760px;
-
-  margin:
-    0 auto;
-
-  padding:
-    16px;
-}
-
-
-.title {
-
-  font-size:
-    25px;
-
-  font-weight:
-    900;
-}
-
-
-.subtitle {
-
-  margin-top:
-    6px;
-
-  color:
-    #8d96a5;
-
-  font-size:
-    11px;
-
-  line-height:
-    1.5;
-}
-
-
-.summary {
-
-  margin-top:
-    16px;
-
-  display:
-    grid;
-
-  grid-template-columns:
-    repeat(
-      4,
-      1fr
-    );
-
-  gap:
-    8px;
-}
-
-
-.sum {
-
-  background:
-    #151a22;
-
-  border:
-    1px solid
-    #252c38;
-
-  border-radius:
-    13px;
-
-  padding:
-    12px 8px;
-
-  text-align:
-    center;
-}
-
-
-.sum .v {
-
-  font-size:
-    22px;
-
-  font-weight:
-    900;
-}
-
-
-.sum .l {
-
-  margin-top:
-    3px;
-
-  font-size:
-    9px;
-
-  color:
-    #8d96a5;
-}
-
-
-.stats {
-
-  margin-top:
-    10px;
-
-  color:
-    #7d8797;
-
-  font-size:
-    11px;
-
-  line-height:
-    1.5;
-}
-
-
-.card {
-
-  margin-top:
-    14px;
-
-  padding:
-    16px;
-
-  background:
-    #151a22;
-
-  border:
-    1px solid
-    #252c38;
-
-  border-radius:
-    16px;
-}
-
-
-.card.placed {
-
-  border-color:
-    #166534;
-}
-
-
-.match {
-
-  font-size:
-    18px;
-
-  font-weight:
-    900;
-
-  line-height:
-    1.3;
-}
-
-
-.event {
-
-  margin-top:
-    6px;
-
-  color:
-    #7d8797;
-
-  font-size:
-    10px;
-
-  word-break:
-    break-all;
-}
-
-
-.meta {
-
-  display:
-    flex;
-
-  flex-wrap:
-    wrap;
-
-  gap:
-    6px;
-
-  margin-top:
-    10px;
-}
-
-
-.badge {
-
-  padding:
-    6px 8px;
-
-  background:
-    #202632;
-
-  border-radius:
-    8px;
-
-  color:
-    #c5ccd8;
-
-  font-size:
-    11px;
-}
-
-
-.market {
-
-  margin-top:
-    16px;
-
-  color:
-    #8d96a5;
-
-  font-size:
-    10px;
-}
-
-
-.oddsline {
-
-  display:
-    flex;
-
-  align-items:
-    center;
-
-  justify-content:
-    space-between;
-
-  gap:
-    10px;
-
-  margin-top:
-    4px;
-}
-
-
-.odds {
-
-  font-size:
-    38px;
-
-  font-weight:
-    900;
-}
-
-
-.placedText {
-
-  font-size:
-    29px;
-
-  color:
-    #86efac;
-}
-
-
-.state {
-
-  font-size:
-    10px;
-
-  text-align:
-    right;
-
-  line-height:
-    1.4;
-}
-
-
-.ready {
-
-  color:
-    #86efac;
-}
-
-
-.waiting {
-
-  color:
-    #fbbf24;
-}
-
-
-.placedState {
-
-  color:
-    #86efac;
-}
-
-
-.actions {
-
-  display:
-    grid;
-
-  grid-template-columns:
-    1fr 1fr;
-
-  gap:
-    8px;
-
-  margin-top:
-    14px;
-}
-
-
-.btn {
-
-  border:
-    0;
-
-  border-radius:
-    11px;
-
-  padding:
-    13px 10px;
-
-  font-size:
-    12px;
-
-  font-weight:
-    900;
-
-  cursor:
-    pointer;
-}
-
-
-.check {
-
-  background:
-    #2563eb;
-
-  color:
-    white;
-}
-
-
-.bet {
-
-  background:
-    #16a34a;
-
-  color:
-    white;
-}
-
-
-.btn[disabled] {
-
-  background:
-    #26303c;
-
-  color:
-    #788393;
-
-  cursor:
-    not-allowed;
-}
-
-
-.copy {
-
-  margin-top:
-    8px;
-
-  width:
-    100%;
-
-  background:
-    #202632;
-
-  color:
-    #cbd5e1;
-
-  border:
-    1px solid
-    #303947;
-}
-
-
-.empty {
-
-  margin-top:
-    18px;
-
-  padding:
-    28px 20px;
-
-  background:
-    #151a22;
-
-  border:
-    1px solid
-    #252c38;
-
-  border-radius:
-    16px;
-
-  text-align:
-    center;
-
-  color:
-    #9aa4b3;
-
-  font-size:
-    13px;
-
-  line-height:
-    1.8;
-}
-
-
-.footer {
-
-  margin-top:
-    20px;
-
-  text-align:
-    center;
-
-  color:
-    #596273;
-
-  font-size:
-    9px;
-
-  line-height:
-    1.5;
-}
-
-
-.err {
-
-  color:
-    #fca5a5;
-}
-
-
-.small {
-
-  font-size:
-    9px;
-
-  color:
-    #697281;
-
-  margin-top:
-    8px;
-
-  line-height:
-    1.5;
-}
-
-
-@media (
-  max-width:
-  430px
-) {
-
-  .app {
-
-    padding:
-      12px;
-  }
-
-
-  .title {
-
-    font-size:
-      22px;
-  }
-
-
-  .odds {
-
-    font-size:
-      34px;
-  }
-
-
-  .placedText {
-
-    font-size:
-      25px;
-  }
-
-
-  .summary {
-
-    grid-template-columns:
-      repeat(
-        2,
-        1fr
-      );
-
-    gap:
-      6px;
-  }
-
-
-  .sum {
-
-    padding:
-      10px 6px;
-  }
-
-
-  .actions {
-
-    grid-template-columns:
-      1fr;
-  }
-}
-
 </style>
-
 </head>
-
-
 <body>
-
 <div class="app">
-
-
-  <div class="title">
-
-    ⚡ TOP SIGNAL MANUAL
-
+  <div class="top">
+    <div class="title">⚡ TOP SIGNAL</div>
+    <div class="count">ДНЕШНИ СИГНАЛИ: <span id="todayCount">0</span></div>
   </div>
 
-
-  <div class="subtitle">
-
-    V1.9.1 TRACKER DIRECT
-
-    · TRACKER → MATCHER → SELECT MATCH
-
-    → CHECK ODDS / BET NOW
-
+  <div id="list" class="list">
+    <div class="empty">Зареждане...</div>
   </div>
 
-
-  <div class="summary">
-
-
-    <div class="sum">
-
-      <div
-        id="sumTargets"
-        class="v"
-      >
-        0
-      </div>
-
-      <div class="l">
-
-        TARGETS
-
-      </div>
-
-    </div>
-
-
-    <div class="sum">
-
-      <div
-        id="sumReady"
-        class="v"
-      >
-        0
-      </div>
-
-      <div class="l">
-
-        ODDS READY
-
-      </div>
-
-    </div>
-
-
-    <div class="sum">
-
-      <div
-        id="sumPlaced"
-        class="v"
-      >
-        0
-      </div>
-
-      <div class="l">
-
-        PLACED
-
-      </div>
-
-    </div>
-
-
-    <div class="sum">
-
-      <div
-        id="sumBest"
-        class="v"
-      >
-        —
-      </div>
-
-      <div class="l">
-
-        BEST O0.5
-
-      </div>
-
-    </div>
-
-
+  <div id="archive" class="archive">
+    <button id="archiveToggle" class="archiveHead">▸ АРХИВ · <span id="archiveCount">0</span></button>
+    <div id="archiveBody" class="archiveBody"></div>
   </div>
 
-
-  <div
-    id="stats"
-    class="stats"
-  >
-
-    Loading...
-
-  </div>
-
-
-  <div id="list">
-  </div>
-
-
-  <div class="footer">
-
-    CHECK READS REAL 1H O0.5 ODDS
-
-    · BET NOW OPENS ONLY THE SELECTED EVENT
-
-    · FINAL BET CONFIRMATION IS MANUAL
-
-  </div>
-
-
+  <div class="note">BET PLACED се показва само след потвърден успешен залог.</div>
 </div>
 
-
 <script>
+const REFRESH_MS=3000;
+const CLOUDBET_ORIGIN='https://www.cloud0007.com';
+let latestTargets=[];
 
-const CLOUDBET_ORIGIN =
-  'https://www.cloud0007.com';
-
-
-const REFRESH_MS =
-  3000;
-
-
-// ==========================================================
-// HTML ESCAPE
-// ==========================================================
-
-function esc(v) {
-
-  return String(
-    v ?? ''
-  ).replace(
-
-    /[&<>"']/g,
-
-    c => ({
-
-      '&':
-        '&amp;',
-
-      '<':
-        '&lt;',
-
-      '>':
-        '&gt;',
-
-      '"':
-        '&quot;',
-
-      "'":
-        '&#39;'
-
-    }[c])
-  );
+function esc(v){
+  return String(v??'')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#039;');
 }
-
-
-// ==========================================================
-// NUMBER
-// ==========================================================
-
-function num(v) {
-
-  if (
-    v ===
-      null ||
-
-    v ===
-      undefined ||
-
-    v ===
-      ''
-  ) {
-
-    return null;
-  }
-
-
-  const x =
-    Number(v);
-
-
-  return Number
-    .isFinite(x)
-
-      ? x
-
-      : null;
+function validOdds(v){
+  const x=Number(v);
+  return Number.isFinite(x)&&x>1&&x<=50?x:null;
 }
-
-
-// ==========================================================
-// VALID ODDS
-// ==========================================================
-
-function validOdds(v) {
-
-  const x =
-    num(v);
-
-
-  if (
-    x ===
-      null ||
-
-    x <=
-      1 ||
-
-    x >
-      50
-  ) {
-
-    return null;
-  }
-
-
-  return x;
-}
-
-
-// ==========================================================
-// EVENT URL
-// ==========================================================
-
-function eventUrl(
-  target,
-  action
-) {
-
-  const id =
-    String(
-      target?.eventId ??
-      ''
-    )
-      .trim();
-
-
-  const u =
-    new URL(
-
-      CLOUDBET_ORIGIN +
-
-      '/en/sports/soccer/live/' +
-
-      encodeURIComponent(
-        id
-      )
-    );
-
-
-  u.searchParams.set(
-    'markets-tab',
-    'goals'
-  );
-
-
-  u.searchParams.set(
-    'ts-action',
-    action
-  );
-
-
-  u.searchParams.set(
-    'ts-event',
-    id
-  );
-
-
+function eventUrl(t){
+  const id=String(t?.eventId??'').trim();
+  const u=new URL(CLOUDBET_ORIGIN+'/en/sports/soccer/live/'+encodeURIComponent(id));
+  u.searchParams.set('markets-tab','goals');
+  u.searchParams.set('ts-action','bet');
+  u.searchParams.set('ts-event',id);
   return u.href;
 }
-
-
-// ==========================================================
-// OPEN EVENT
-// ==========================================================
-
-function go(
-  target,
-  action
-) {
-
-  if (
-    !target?.eventId
-  ) {
-
-    return;
-  }
-
-
-  if (
-    target?.betPlaced ===
-    true
-  ) {
-
-    return;
-  }
-
-
-  location.href =
-    eventUrl(
-      target,
-      action
-    );
+function go(t){
+  if(!t?.eventId||t?.betPlaced===true)return;
+  // SAME TAB
+  location.href=eventUrl(t);
 }
-
-
-// ==========================================================
-// COPY EVENT ID
-// ==========================================================
-
-async function copyId(
-  id
-) {
-
-  try {
-
-    await navigator
-      .clipboard
-      .writeText(
-        String(id)
-      );
-
-  } catch {
-
-    const ta =
-      document
-        .createElement(
-          'textarea'
-        );
-
-
-    ta.value =
-      String(id);
-
-
-    document.body
-      .appendChild(
-        ta
-      );
-
-
-    ta.select();
-
-
-    document
-      .execCommand(
-        'copy'
-      );
-
-
-    ta.remove();
-  }
+function activeRow(t){
+  const placed=t?.betPlaced===true;
+  const odds=validOdds(t?.overOdds);
+  const match=esc(t?.matchName||t?.cloudbetMatch||'Hunter target');
+  const entryMinute=t?.entryMinute!=null?esc(t.entryMinute)+"'":'—';
+  const liveMinute=t?.minute!=null?esc(t.minute)+"'":'—';
+  const oddsText=odds!==null?'@'+odds.toFixed(2):'@—';
+  const id=esc(t?.eventId||'');
+  return '<div class="row '+(placed?'placed':'')+'">'+
+    '<div class="match">'+match+'</div>'+
+    '<div class="minute" title="ENTRY minute">📥 '+entryMinute+'</div>'+
+    '<div class="minute" title="Live minute">⏱ '+liveMinute+'</div>'+
+    '<div class="odds">'+oddsText+'</div>'+
+    '<button class="betbtn" data-bet="'+id+'" '+((placed||odds===null)?'disabled':'')+'>'+
+      (placed?'BET PLACED':'BET NOW')+
+    '</button>'+
+  '</div>';
 }
-
-
-// ==========================================================
-// CARD
-// ==========================================================
-
-function card(t) {
-
-  const odds =
-    validOdds(
-      t?.overOdds
-    );
-
-
-  const placed =
-    t?.betPlaced ===
-    true;
-
-
-  const ready =
-    !placed &&
-    odds !==
-      null;
-
-
-  const match =
-    esc(
-
-      t?.matchName ||
-
-      t?.cloudbetMatch ||
-
-      'Hunter target'
-    );
-
-
-  const eventId =
-    esc(
-      t?.eventId ||
-      ''
-    );
-
-
-  const minute =
-
-    t?.minute !==
-      null &&
-
-    t?.minute !==
-      undefined
-
-      ? esc(
-          t.minute
-        ) + "'"
-
-      : '—';
-
-
-  const hunter =
-
-    t?.hunterScore !==
-      null &&
-
-    t?.hunterScore !==
-      undefined
-
-      ? esc(
-          t.hunterScore
-        )
-
-      : '—';
-
-
-  const matcher =
-
-    t?.matcherScore !==
-      null &&
-
-    t?.matcherScore !==
-      undefined
-
-      ? esc(
-          t.matcherScore
-        )
-
-      : '—';
-
-
-  const score =
-    esc(
-      t?.score ||
-      '—'
-    );
-
-
-  const placedAt =
-    t?.betPlacedAt
-      ? esc(
-          t.betPlacedAt
-        )
-      : '';
-
-
-  return (
-
-    '<div class="card ' +
-
-      (
-        placed
-          ? 'placed'
-          : ''
-      ) +
-
-    '">' +
-
-
-      '<div class="match">' +
-
-        match +
-
-      '</div>' +
-
-
-      '<div class="event">' +
-
-        'Cloudbet Event ID: ' +
-
-        eventId +
-
-      '</div>' +
-
-
-      '<div class="meta">' +
-
-
-        '<div class="badge">' +
-
-          '⏱ ' +
-
-          minute +
-
-        '</div>' +
-
-
-        '<div class="badge">' +
-
-          '🎯 Hunter ' +
-
-          hunter +
-
-        '</div>' +
-
-
-        '<div class="badge">' +
-
-          '🔗 Matcher ' +
-
-          matcher +
-
-        '</div>' +
-
-
-        '<div class="badge">' +
-
-          '⚽ ' +
-
-          score +
-
-        '</div>' +
-
-
-      '</div>' +
-
-
-      '<div class="market">' +
-
-        '1H TOTAL GOALS · OVER 0.5' +
-
-      '</div>' +
-
-
-      '<div class="oddsline">' +
-
-
-        '<div class="odds ' +
-
-          (
-            placed
-              ? 'placedText'
-              : ''
-          ) +
-
-        '">' +
-
-          (
-            placed
-
-              ? 'ЗАЛОЖЕН ✅'
-
-              : ready
-
-                ? '@ ' +
-                  odds.toFixed(
-                    2
-                  )
-
-                : '@ —'
-          ) +
-
-        '</div>' +
-
-
-        '<div class="state ' +
-
-          (
-            placed
-
-              ? 'placedState'
-
-              : ready
-
-                ? 'ready'
-
-                : 'waiting'
-          ) +
-
-        '">' +
-
-          (
-            placed
-
-              ? 'BET PLACED ✅'
-
-              : ready
-
-                ? 'ODDS READY ✅'
-
-                : 'WAITING FOR CHECK ⏳'
-          ) +
-
-        '</div>' +
-
-
-      '</div>' +
-
-
-      (
-        placedAt
-
-          ? '<div class="small">' +
-              'Placed: ' +
-              placedAt +
-            '</div>'
-
-          : ''
-      ) +
-
-
-      '<div class="actions">' +
-
-
-        '<button ' +
-
-          'class="btn check" ' +
-
-          'data-action="check" ' +
-
-          'data-id="' +
-            eventId +
-          '" ' +
-
-          (
-            placed
-              ? 'disabled'
-              : ''
-          ) +
-
-        '>' +
-
-          (
-            placed
-
-              ? 'CHECKED ✅'
-
-              : 'CHECK ODDS'
-          ) +
-
-        '</button>' +
-
-
-        '<button ' +
-
-          'class="btn bet" ' +
-
-          'data-action="bet" ' +
-
-          'data-id="' +
-            eventId +
-          '" ' +
-
-          (
-            placed ||
-            !ready
-
-              ? 'disabled'
-
-              : ''
-          ) +
-
-        '>' +
-
-          (
-            placed
-
-              ? 'ЗАЛОЖЕН ✅'
-
-              : 'BET NOW'
-          ) +
-
-        '</button>' +
-
-
-      '</div>' +
-
-
-      '<button ' +
-
-        'class="btn copy" ' +
-
-        'data-action="copy" ' +
-
-        'data-id="' +
-          eventId +
-        '">' +
-
-        'COPY EVENT ID' +
-
-      '</button>' +
-
-
-      '<div class="small">' +
-
-        (
-          placed
-
-            ? 'Този Event ID вече е маркиран като BET_PLACED. ' +
-              'BET NOW е заключен срещу повторно действие.'
-
-            : 'CHECK ODDS → чете реалния 1H O0.5 коефициент.<br>' +
-              'BET NOW → отваря точния мач и подготвя избора. ' +
-              'След успешно ръчно потвърждение статусът става ЗАЛОЖЕН ✅.'
-        ) +
-
-      '</div>' +
-
-
-    '</div>'
-  );
+function archiveRow(x){
+  const match=esc(x?.matchName||'—');
+  const entryMinute=x?.entryMinute!=null?esc(x.entryMinute)+"'":'—';
+  const liveMinute=x?.liveMinute!=null?esc(x.liveMinute)+"'":'—';
+  const odds=validOdds(x?.odds);
+  const oddsText=odds!==null?'@'+odds.toFixed(2):'@—';
+  const st=String(x?.resultStatus||'WAITING').toUpperCase();
+  let cls='waiting',label='ЧАКА';
+  if(st==='WIN'){cls='win';label='ПЕЧЕЛИ';}
+  if(st==='LOSS'){cls='loss';label='НЕ ПЕЧЕЛИ';}
+  return '<div class="arow">'+
+    '<div class="match">'+match+'</div>'+
+    '<div class="minute" title="ENTRY minute">📥 '+entryMinute+'</div>'+
+    '<div class="minute" title="Last live minute">⏱ '+liveMinute+'</div>'+
+    '<div class="odds">'+oddsText+'</div>'+
+    '<div class="result '+cls+'">'+label+'</div>'+
+  '</div>';
 }
-
-
-// ==========================================================
-// STATE
-// ==========================================================
-
-let latestTargets =
-  [];
-
-
-// ==========================================================
-// REFRESH
-// ==========================================================
-
-async function refresh() {
-
-  try {
-
-    const r =
-      await fetch(
-
-        '/api/targets?ts=' +
-          Date.now(),
-
-        {
-
-          cache:
-            'no-store'
-        }
-      );
-
-
-    const d =
-      await r
-        .json();
-
-
-    if (
-      !r.ok ||
-      !d?.success
-    ) {
-
-      throw new Error(
-
-        d?.error ||
-
-        (
-          'HTTP ' +
-          r.status
-        )
-      );
-    }
-
-
-    latestTargets =
-
-      Array.isArray(
-        d.targets
-      )
-
-        ? d.targets
-
-        : [];
-
-
-    const placed =
-      latestTargets
-        .filter(
-          x =>
-            x?.betPlaced ===
-            true
-        );
-
-
-    const ready =
-      latestTargets
-        .filter(
-          x =>
-            x?.betPlaced !==
-              true &&
-
-            validOdds(
-              x?.overOdds
-            ) !==
-              null
-        );
-
-
-    const best =
-
-      ready
-
-        .map(
-          x =>
-            validOdds(
-              x?.overOdds
-            )
-        )
-
-        .filter(
-          x =>
-            x !==
-            null
-        )
-
-        .sort(
-          (
-            a,
-            b
-          ) =>
-            b - a
-        )[0] ??
-
-      null;
-
-
-    document
-      .getElementById(
-        'sumTargets'
-      )
-      .textContent =
-        String(
-          latestTargets
-            .length
-        );
-
-
-    document
-      .getElementById(
-        'sumReady'
-      )
-      .textContent =
-        String(
-          ready.length
-        );
-
-
-    document
-      .getElementById(
-        'sumPlaced'
-      )
-      .textContent =
-        String(
-          placed.length
-        );
-
-
-    document
-      .getElementById(
-        'sumBest'
-      )
-      .textContent =
-
-        best ===
-          null
-
-          ? '—'
-
-          : best
-              .toFixed(
-                2
-              );
-
-
-    document
-      .getElementById(
-        'stats'
-      )
-      .textContent =
-
-        'Tracker ' +
-
-        (
-          d.tracker_signals ??
-          0
-        ) +
-
-        ' · Matcher Hunter ' +
-
-        (
-          d.matcher_hunter_results ??
-          0
-        ) +
-
-        ' · Secure ' +
-
-        latestTargets.length +
-
-        ' · Ready ' +
-
-        ready.length +
-
-        ' · Placed ' +
-
-        placed.length +
-
-        ' · refresh 3s';
-
-
-    document
-      .getElementById(
-        'list'
-      )
-      .innerHTML =
-
-        latestTargets.length
-
-          ? latestTargets
-              .map(
-                card
-              )
-              .join('')
-
-          : (
-
-            '<div class="empty">' +
-
-              'Няма активен secure Hunter target.<br>' +
-
-              'Чакаме нов сигнал.' +
-
-            '</div>'
-          );
-
-
-  } catch (
-    e
-  ) {
-
-    document
-      .getElementById(
-        'stats'
-      )
-      .innerHTML =
-
-        '<span class="err">' +
-
-        'CONNECTION ERROR: ' +
-
-        esc(
-          e?.message ||
-          e
-        ) +
-
-        '</span>';
-  }
+async function refresh(){
+  try{
+    const [tr,ar]=await Promise.all([
+      fetch('/api/targets?ts='+Date.now(),{cache:'no-store'}),
+      fetch('/api/archive?ts='+Date.now(),{cache:'no-store'})
+    ]);
+    const td=await tr.json();
+    const ad=await ar.json();
+
+    latestTargets=Array.isArray(td?.targets)?td.targets:[];
+    document.getElementById('list').innerHTML=
+      latestTargets.length
+        ? latestTargets.map(activeRow).join('')
+        : '<div class="empty">Няма активни сигнали.</div>';
+
+    const archive=Array.isArray(ad?.archive)?ad.archive:[];
+    document.getElementById('todayCount').textContent=String(ad?.today_signals??latestTargets.length);
+    document.getElementById('archiveCount').textContent=String(archive.length);
+    document.getElementById('archiveBody').innerHTML=
+      archive.length
+        ? archive.map(archiveRow).join('')
+        : '<div class="empty">Няма заложени мачове.</div>';
+  }catch(e){}
 }
-
-
-// ==========================================================
-// BUTTONS
-// ==========================================================
-
-document
-  .addEventListener(
-
-    'click',
-
-    e => {
-
-      const b =
-        e.target
-          .closest(
-            '[data-action]'
-          );
-
-
-      if (
-        !b
-      ) {
-
-        return;
-      }
-
-
-      if (
-        b.disabled
-      ) {
-
-        return;
-      }
-
-
-      const id =
-        b.getAttribute(
-          'data-id'
-        );
-
-
-      const action =
-        b.getAttribute(
-          'data-action'
-        );
-
-
-      const target =
-        latestTargets
-          .find(
-            x =>
-              String(
-                x?.eventId
-              ) ===
-              String(
-                id
-              )
-          );
-
-
-      if (
-        action ===
-        'copy'
-      ) {
-
-        copyId(
-          id
-        );
-
-        return;
-      }
-
-
-      if (
-        !target
-      ) {
-
-        return;
-      }
-
-
-      if (
-        target?.betPlaced ===
-        true
-      ) {
-
-        return;
-      }
-
-
-      if (
-        action ===
-        'check'
-      ) {
-
-        go(
-          target,
-          'check'
-        );
-
-        return;
-      }
-
-
-      if (
-        action ===
-        'bet'
-      ) {
-
-        const odds =
-          validOdds(
-            target
-              ?.overOdds
-          );
-
-
-        if (
-          odds ===
-          null
-        ) {
-
-          return;
-        }
-
-
-        go(
-          target,
-          'bet'
-        );
-      }
-    }
-  );
-
-
-// ==========================================================
-// START
-// ==========================================================
-
+document.addEventListener('click',e=>{
+  const b=e.target.closest('[data-bet]');
+  if(!b||b.disabled)return;
+  const id=b.getAttribute('data-bet');
+  const t=latestTargets.find(x=>String(x?.eventId)===String(id));
+  if(t)go(t);
+});
+document.getElementById('archiveToggle').addEventListener('click',()=>{
+  const a=document.getElementById('archive');
+  a.classList.toggle('open');
+  document.getElementById('archiveToggle').innerHTML=
+    (a.classList.contains('open')?'▾':'▸')+
+    ' АРХИВ · <span id="archiveCount">'+
+    document.querySelectorAll('#archiveBody .arow').length+
+    '</span>';
+});
 refresh();
-
-
-setInterval(
-  refresh,
-  REFRESH_MS
-);
-
+setInterval(refresh,REFRESH_MS);
 </script>
-
-
 </body>
-
 </html>`;
 }
