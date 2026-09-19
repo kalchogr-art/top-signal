@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.6 BET PLACED DIAGNOSTIC";
+  "V1.9.7 BET STATUS SCHEMA MIGRATION";
 
 const APP_NAME =
   "top-signal";
@@ -2553,6 +2553,52 @@ async function ensureBetStatusTable(
     `)
 
     .run();
+
+
+  // V1.9.7 — migrate older bet_status tables safely.
+  // CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+  const schema =
+    await env.DB
+      .prepare(
+        "PRAGMA table_info(bet_status)"
+      )
+      .all();
+
+  const columns =
+    new Set(
+      (schema?.results ?? [])
+        .map(
+          (row: any) =>
+            String(
+              row?.name ?? ""
+            )
+        )
+    );
+
+  if (!columns.has("placed")) {
+    await env.DB
+      .prepare(
+        "ALTER TABLE bet_status ADD COLUMN placed INTEGER NOT NULL DEFAULT 0"
+      )
+      .run();
+  }
+
+  if (!columns.has("placed_at")) {
+    await env.DB
+      .prepare(
+        "ALTER TABLE bet_status ADD COLUMN placed_at TEXT"
+      )
+      .run();
+  }
+
+  if (!columns.has("updated_at")) {
+    await env.DB
+      .prepare(
+        "ALTER TABLE bet_status ADD COLUMN updated_at TEXT"
+      )
+      .run();
+  }
+
 }
 
 
