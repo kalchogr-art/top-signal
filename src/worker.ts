@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.11 TODAY + DAILY ARCHIVE + TRACKER HISTORY SYNC";
+  "V1.9.12 DAILY POSSIBLE + PLACED COUNTERS";
 
 const APP_NAME =
   "top-signal";
@@ -3467,7 +3467,10 @@ body{margin:0;background:#0b0e13;color:#fff;font-family:Arial,Helvetica,sans-ser
 <div class="app">
   <div class="top">
     <div class="title">⚡ TOP SIGNAL</div>
-    <div class="count">ДНЕШНИ СИГНАЛИ: <span id="todayCount">0</span></div>
+    <div class="count" style="text-align:right;line-height:1.45">
+      <div>ОБЩО ВЪЗМОЖНИ ЗА ДНЕС: <span id="todayCount">0</span></div>
+      <div>ЗАЛОЖЕНИ: <span id="topPlacedCount">0</span></div>
+    </div>
   </div>
 
   <div class="section">
@@ -3580,6 +3583,7 @@ async function refresh(){
 
     const today=Array.isArray(ad?.today)?ad.today:[];
     document.getElementById('todayCount').textContent=String(ad?.today_signals??0);
+    document.getElementById('topPlacedCount').textContent=String(today.length);
     document.getElementById('placedTodayCount').textContent=String(today.length);
     document.getElementById('todayBody').innerHTML=
       today.length
