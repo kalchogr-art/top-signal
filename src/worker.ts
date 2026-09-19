@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.8 BET STATUS CREATED AT FIX";
+  "V1.9.9 BET PLACED PRODUCTION";
 
 const APP_NAME =
   "top-signal";
@@ -1224,75 +1224,53 @@ export default {
       }
 
       try {
-        await ensureBetStatusTable(env);
-
-        const storedEvent =
-          await getStoredEvent(
-            env,
-            eventId
-          );
-
-        const before =
-          await getBetStatus(
-            env,
-            eventId
-          );
-
         const saved =
           await saveBetPlacedServerSide(
             env,
             eventId
           );
 
-        const after =
-          await getBetStatus(
-            env,
-            eventId
+        if (!saved?.success) {
+          return json(
+            {
+              success: false,
+              version: VERSION,
+              action: "BET_PLACED_HANDOFF",
+              eventId,
+              error:
+                saved?.error ??
+                "BET_PLACED_SAVE_FAILED"
+            },
+            400
+          );
+        }
+
+        // Successful D1 write -> remove one-shot handoff parameter
+        // and return to the normal dashboard.
+        const cleanUrl =
+          new URL(
+            request.url
           );
 
-        // During diagnosis DO NOT redirect.
-        // Show exactly what the Worker/D1 sees.
-        return json({
-          success:
-            saved?.success === true,
+        cleanUrl.searchParams.delete(
+          "bet-placed"
+        );
 
-          version:
-            VERSION,
-
-          diagnostic:
-            "BET_PLACED_HANDOFF",
-
-          eventId,
-
-          live_odds_event_found:
-            !!storedEvent,
-
-          live_odds_event:
-            storedEvent ?? null,
-
-          bet_status_before:
-            before ?? null,
-
-          save_result:
-            saved ?? null,
-
-          bet_status_after:
-            after ?? null
-        });
+        return Response.redirect(
+          cleanUrl.toString(),
+          302
+        );
 
       } catch (error: any) {
         return json(
           {
             success: false,
             version: VERSION,
-            diagnostic: "BET_PLACED_HANDOFF",
+            action: "BET_PLACED_HANDOFF",
             eventId,
             error:
               error?.message ??
-              String(error),
-            stack:
-              error?.stack ??
-              null
+              String(error)
           },
           500
         );
