@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.9 BET PLACED PRODUCTION";
+  "V1.9.10 ARCHIVE RESULT SYNC";
 
 const APP_NAME =
   "top-signal";
@@ -325,23 +325,155 @@ export default {
 
         let trackerRaw: any[] = [];
 
-        try {
-          const trackerData =
-            await fetchServiceJSON(env.TRACKER, "/entries");
+        const extractTrackerRows = (data: any): any[] => {
+          if (Array.isArray(data)) {
+            return data;
+          }
 
-          trackerRaw =
-            Array.isArray(trackerData)
-              ? trackerData
-              : Array.isArray(trackerData?.hunter_entries)
-                ? trackerData.hunter_entries
-                : Array.isArray(trackerData?.entries)
-                  ? trackerData.entries
-                  : Array.isArray(trackerData?.signals)
-                    ? trackerData.signals
-                    : Array.isArray(trackerData?.data)
-                      ? trackerData.data
-                      : [];
-        } catch {}
+          const possible = [
+            data?.hunter_entries,
+            data?.entries,
+            data?.signals,
+            data?.data,
+            data?.results,
+            data?.today,
+            data?.items
+          ];
+
+          for (const value of possible) {
+            if (Array.isArray(value)) {
+              return value;
+            }
+          }
+
+          return [];
+        };
+
+
+        // ----------------------------------------------------
+        // ACTIVE TRACKER ENTRIES
+        // ----------------------------------------------------
+
+        try {
+          const entriesData =
+            await fetchServiceJSON(
+              env.TRACKER,
+              "/entries"
+            );
+
+          trackerRaw.push(
+            ...extractTrackerRows(
+              entriesData
+            )
+          );
+
+        } catch (error) {
+          console.error(
+            "ARCHIVE /entries ERROR",
+            error
+          );
+        }
+
+
+        // ----------------------------------------------------
+        // TODAY HISTORY
+        //
+        // /entries can lose a signal after GOAL / NO_GOAL.
+        // /today is also read so confirmed bets can resolve
+        // after the active signal disappears.
+        // ----------------------------------------------------
+
+        try {
+          const todayData =
+            await fetchServiceJSON(
+              env.TRACKER,
+              "/today"
+            );
+
+          trackerRaw.push(
+            ...extractTrackerRows(
+              todayData
+            )
+          );
+
+        } catch (error) {
+          console.error(
+            "ARCHIVE /today ERROR",
+            error
+          );
+        }
+
+
+        // ----------------------------------------------------
+        // DEDUPLICATE
+        // /today is loaded after /entries, therefore the later
+        // copy can replace the active copy with its final result.
+        // ----------------------------------------------------
+
+        const trackerMap =
+          new Map<string, Obj>();
+
+        for (const item of trackerRaw) {
+
+          const cloudbet =
+            item?.cloudbet ??
+            item?.tracker_cloudbet ??
+            {};
+
+          const eventId =
+            safe(
+              item?.cloudbet_event_id ??
+              item?.event_id ??
+              cloudbet?.event_id ??
+              cloudbet?.id
+            )
+              .replace(
+                /\.0+$/,
+                ""
+              );
+
+          const signalId =
+            safe(
+              item?.id ??
+              item?.signal_id
+            );
+
+          const matchId =
+            safe(
+              item?.match_id
+            );
+
+          const matchName =
+            safe(
+              item?.match_name ??
+              item?.match ??
+              cloudbet?.match
+            )
+              .toLowerCase()
+              .replace(/\s+/g, " ")
+              .trim();
+
+          const key =
+            eventId
+              ? "event:" + eventId
+              : signalId
+                ? "signal:" + signalId
+                : matchId
+                  ? "match:" + matchId
+                  : matchName
+                    ? "name:" + matchName
+                    : "";
+
+          if (key) {
+            trackerMap.set(
+              key,
+              item
+            );
+          }
+        }
+
+        trackerRaw =
+          [...trackerMap.values()];
 
         const norm = (v: any) =>
           safe(v)
@@ -391,21 +523,27 @@ export default {
 
             const trackerStatus =
               safe(
-                tr?.status ??
                 tr?.result ??
-                tr?.bet_result
-              ).toUpperCase();
+                tr?.status ??
+                tr?.bet_result ??
+                tr?.result_status ??
+                tr?.final_result
+              )
+                .toUpperCase()
+                .replace(/\s+/g, "_");
 
             let resultStatus = "WAITING";
 
             if (
               trackerStatus === "GOAL" ||
+              trackerStatus === "GOAL_HIT" ||
               trackerStatus === "WIN" ||
               trackerStatus === "WON"
             ) {
               resultStatus = "WIN";
             } else if (
               trackerStatus === "NO_GOAL" ||
+              trackerStatus === "NOGOAL" ||
               trackerStatus === "LOSS" ||
               trackerStatus === "LOST"
             ) {
@@ -3283,6 +3421,7 @@ body{margin:0;background:#0b0e13;color:#fff;font-family:Arial,Helvetica,sans-ser
   </div>
 
   <div class="note">BET PLACED се показва само след потвърден успешен залог.</div>
+  <div class="note">TOP SIGNAL · ${VERSION}</div>
 </div>
 
 <script>
