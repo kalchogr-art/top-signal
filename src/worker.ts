@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.10 ARCHIVE RESULT SYNC";
+  "V1.9.11 TODAY + DAILY ARCHIVE + TRACKER HISTORY SYNC";
 
 const APP_NAME =
   "top-signal";
@@ -287,8 +287,10 @@ export default {
 
 
     // ========================================================
-    // BET ARCHIVE — ONLY CONFIRMED BET_PLACED EVENTS
-    // Result is resolved from Tracker when GOAL / NO_GOAL is available.
+    // V1.9.11 — BET HISTORY
+    // Only confirmed BET_PLACED events from Top Signal D1.
+    // Final football result comes from Tracker's persistent /history.
+    // Matching priority: exact Cloudbet event_id, then exact normalized name.
     // ========================================================
 
     if (
@@ -315,7 +317,7 @@ export default {
               ON l.event_id = b.event_id
             WHERE b.placed = 1
             ORDER BY b.placed_at DESC
-            LIMIT 500
+            LIMIT 1000
           `).all();
 
         const rows =
@@ -323,157 +325,46 @@ export default {
             ? rowsResult.results
             : [];
 
-        let trackerRaw: any[] = [];
-
-        const extractTrackerRows = (data: any): any[] => {
-          if (Array.isArray(data)) {
-            return data;
-          }
-
-          const possible = [
-            data?.hunter_entries,
-            data?.entries,
-            data?.signals,
-            data?.data,
-            data?.results,
-            data?.today,
-            data?.items
-          ];
-
-          for (const value of possible) {
-            if (Array.isArray(value)) {
-              return value;
-            }
-          }
-
-          return [];
-        };
-
-
-        // ----------------------------------------------------
-        // ACTIVE TRACKER ENTRIES
-        // ----------------------------------------------------
+        let trackerHistory: any[] = [];
 
         try {
-          const entriesData =
+          const historyData =
             await fetchServiceJSON(
               env.TRACKER,
-              "/entries"
+              "/history?days=120"
             );
 
-          trackerRaw.push(
-            ...extractTrackerRows(
-              entriesData
-            )
-          );
+          trackerHistory =
+            Array.isArray(historyData)
+              ? historyData
+              : Array.isArray(historyData?.entries)
+                ? historyData.entries
+                : Array.isArray(historyData?.signals)
+                  ? historyData.signals
+                  : Array.isArray(historyData?.results)
+                    ? historyData.results
+                    : [];
 
         } catch (error) {
           console.error(
-            "ARCHIVE /entries ERROR",
+            "ARCHIVE /history ERROR",
             error
           );
-        }
 
-
-        // ----------------------------------------------------
-        // TODAY HISTORY
-        //
-        // /entries can lose a signal after GOAL / NO_GOAL.
-        // /today is also read so confirmed bets can resolve
-        // after the active signal disappears.
-        // ----------------------------------------------------
-
-        try {
-          const todayData =
-            await fetchServiceJSON(
-              env.TRACKER,
-              "/today"
-            );
-
-          trackerRaw.push(
-            ...extractTrackerRows(
-              todayData
-            )
-          );
-
-        } catch (error) {
-          console.error(
-            "ARCHIVE /today ERROR",
-            error
-          );
-        }
-
-
-        // ----------------------------------------------------
-        // DEDUPLICATE
-        // /today is loaded after /entries, therefore the later
-        // copy can replace the active copy with its final result.
-        // ----------------------------------------------------
-
-        const trackerMap =
-          new Map<string, Obj>();
-
-        for (const item of trackerRaw) {
-
-          const cloudbet =
-            item?.cloudbet ??
-            item?.tracker_cloudbet ??
-            {};
-
-          const eventId =
-            safe(
-              item?.cloudbet_event_id ??
-              item?.event_id ??
-              cloudbet?.event_id ??
-              cloudbet?.id
-            )
-              .replace(
-                /\.0+$/,
-                ""
+          // Compatibility fallback while Tracker V6.7.10.16 is deploying.
+          try {
+            const entriesData =
+              await fetchServiceJSON(
+                env.TRACKER,
+                "/entries"
               );
 
-          const signalId =
-            safe(
-              item?.id ??
-              item?.signal_id
-            );
-
-          const matchId =
-            safe(
-              item?.match_id
-            );
-
-          const matchName =
-            safe(
-              item?.match_name ??
-              item?.match ??
-              cloudbet?.match
-            )
-              .toLowerCase()
-              .replace(/\s+/g, " ")
-              .trim();
-
-          const key =
-            eventId
-              ? "event:" + eventId
-              : signalId
-                ? "signal:" + signalId
-                : matchId
-                  ? "match:" + matchId
-                  : matchName
-                    ? "name:" + matchName
-                    : "";
-
-          if (key) {
-            trackerMap.set(
-              key,
-              item
-            );
-          }
+            trackerHistory =
+              extractHunterSignals(
+                entriesData
+              );
+          } catch {}
         }
-
-        trackerRaw =
-          [...trackerMap.values()];
 
         const norm = (v: any) =>
           safe(v)
@@ -481,45 +372,61 @@ export default {
             .replace(/\s+/g, " ")
             .trim();
 
-        const archive =
+        const byEvent =
+          new Map<string, Obj>();
+
+        const byName =
+          new Map<string, Obj>();
+
+        for (const tr of trackerHistory) {
+          const cloudbet =
+            tr?.cloudbet ??
+            tr?.tracker_cloudbet ??
+            {};
+
+          const eventId =
+            safe(
+              tr?.cloudbet_event_id ??
+              tr?.event_id ??
+              cloudbet?.event_id ??
+              cloudbet?.id
+            ).replace(/\.0+$/, "");
+
+          if (eventId) {
+            byEvent.set(
+              eventId,
+              tr
+            );
+          }
+
+          const name =
+            norm(
+              tr?.match_name ??
+              tr?.match ??
+              cloudbet?.match
+            );
+
+          if (name) {
+            byName.set(
+              name,
+              tr
+            );
+          }
+        }
+
+        const history =
           rows.map((row: Obj) => {
-            const rowName = norm(row?.match_name);
+            const eventId =
+              safe(row?.event_id)
+                .replace(/\.0+$/, "");
+
+            const rowName =
+              norm(row?.match_name);
 
             const tr =
-              trackerRaw.find((x: Obj) => {
-                const cloudbet =
-                  x?.cloudbet ??
-                  x?.tracker_cloudbet ??
-                  {};
-
-                const eventId =
-                  safe(
-                    x?.cloudbet_event_id ??
-                    x?.event_id ??
-                    cloudbet?.event_id ??
-                    cloudbet?.id
-                  ).replace(/\.0+$/, "");
-
-                if (
-                  eventId &&
-                  eventId === safe(row?.event_id)
-                ) {
-                  return true;
-                }
-
-                const trackerName =
-                  norm(
-                    x?.match_name ??
-                    x?.match ??
-                    cloudbet?.match
-                  );
-
-                return (
-                  !!rowName &&
-                  !!trackerName &&
-                  rowName === trackerName
-                );
-              }) ?? null;
+              byEvent.get(eventId) ??
+              byName.get(rowName) ??
+              null;
 
             const trackerStatus =
               safe(
@@ -532,7 +439,8 @@ export default {
                 .toUpperCase()
                 .replace(/\s+/g, "_");
 
-            let resultStatus = "WAITING";
+            let resultStatus =
+              "WAITING";
 
             if (
               trackerStatus === "GOAL" ||
@@ -540,36 +448,168 @@ export default {
               trackerStatus === "WIN" ||
               trackerStatus === "WON"
             ) {
-              resultStatus = "WIN";
+              resultStatus = "GOAL";
             } else if (
               trackerStatus === "NO_GOAL" ||
               trackerStatus === "NOGOAL" ||
               trackerStatus === "LOSS" ||
               trackerStatus === "LOST"
             ) {
-              resultStatus = "LOSS";
+              resultStatus = "NO_GOAL";
             }
 
+            const trackerOdds =
+              validOdds(
+                tr?.entry_odds ??
+                tr?.cloudbet?.entry_odds
+              );
+
+            const storedOdds =
+              validOdds(
+                row?.over_odds
+              );
+
             return {
-              eventId: row?.event_id ?? null,
-              matchName: row?.match_name ?? "—",
+              eventId:
+                row?.event_id ?? null,
+
+              matchName:
+                tr?.match_name ??
+                tr?.match ??
+                row?.match_name ??
+                "—",
+
               entryMinute:
                 tr?.entry_minute ??
                 tr?.entryMinute ??
-                tr?.signal?.entry_minute ??
-                tr?.signal?.entryMinute ??
                 null,
-              liveMinute: row?.minute ?? null,
-              minute: row?.minute ?? null,
-              odds: validOdds(row?.over_odds),
-              placedAt: row?.placed_at ?? null,
+
+              goalMinute:
+                tr?.goal_minute ??
+                tr?.goalMinute ??
+                null,
+
+              odds:
+                trackerOdds ??
+                storedOdds,
+
+              placedAt:
+                row?.placed_at ??
+                null,
+
               resultStatus,
-              trackerStatus: trackerStatus || null
+
+              trackerStatus:
+                trackerStatus ||
+                null,
+
+              trackerFound:
+                !!tr
             };
           });
 
-        // Persistent Sofia calendar-day count.
-        // Backfill protects signals already seen earlier today before V1.9.4.
+        const sofiaDay = (iso: any) => {
+          const d =
+            iso
+              ? new Date(iso)
+              : null;
+
+          if (
+            !d ||
+            Number.isNaN(d.getTime())
+          ) {
+            return "UNKNOWN";
+          }
+
+          const parts =
+            new Intl.DateTimeFormat(
+              "en-CA",
+              {
+                timeZone:
+                  "Europe/Sofia",
+                year:
+                  "numeric",
+                month:
+                  "2-digit",
+                day:
+                  "2-digit"
+              }
+            ).formatToParts(d);
+
+          const get =
+            (type: string) =>
+              parts.find(
+                p => p.type === type
+              )?.value ?? "";
+
+          return (
+            get("year") +
+            "-" +
+            get("month") +
+            "-" +
+            get("day")
+          );
+        };
+
+        const todayKey =
+          sofiaDay(
+            new Date().toISOString()
+          );
+
+        const today =
+          history.filter(
+            item =>
+              sofiaDay(
+                item?.placedAt
+              ) === todayKey
+          );
+
+        const older =
+          history.filter(
+            item =>
+              sofiaDay(
+                item?.placedAt
+              ) !== todayKey
+          );
+
+        const groupsMap =
+          new Map<string, Obj[]>();
+
+        for (const item of older) {
+          const day =
+            sofiaDay(
+              item?.placedAt
+            );
+
+          if (!groupsMap.has(day)) {
+            groupsMap.set(
+              day,
+              []
+            );
+          }
+
+          groupsMap
+            .get(day)!
+            .push(item);
+        }
+
+        const archiveDays =
+          [...groupsMap.entries()]
+            .map(
+              ([date, items]) => ({
+                date,
+                count:
+                  items.length,
+                items
+              })
+            )
+            .sort(
+              (a, b) =>
+                b.date.localeCompare(
+                  a.date
+                )
+            );
+
         await backfillDailySignalsFromLiveOdds(env);
 
         const todaySignals =
@@ -577,16 +617,30 @@ export default {
 
         return json({
           success: true,
-          today_signals: todaySignals,
-          archive
+          version:
+            VERSION,
+          today_signals:
+            todaySignals,
+          placed_today:
+            today.length,
+          today,
+          archive:
+            history,
+          archive_days:
+            archiveDays
         });
 
       } catch (error: any) {
         return json({
           success: false,
           today_signals: 0,
+          placed_today: 0,
+          today: [],
           archive: [],
-          error: error?.message ?? String(error)
+          archive_days: [],
+          error:
+            error?.message ??
+            String(error)
         }, 500);
       }
     }
@@ -3375,31 +3429,36 @@ function renderHtml():
 *{box-sizing:border-box}
 body{margin:0;background:#0b0e13;color:#fff;font-family:Arial,Helvetica,sans-serif}
 .app{max-width:900px;margin:0 auto;padding:12px}
-.top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
 .title{font-size:18px;font-weight:900}
 .count{font-size:14px;font-weight:900;color:#c4b5fd;white-space:nowrap}
-.list{display:flex;flex-direction:column;gap:7px}
-.row{display:grid;grid-template-columns:minmax(0,1fr) 48px 48px 62px 112px;align-items:center;gap:7px;background:#151a22;border:1px solid #252c38;border-radius:10px;padding:8px 9px;min-height:44px}
-.row.placed{border-color:#166534}
+.section{margin-top:14px;border:1px solid #252c38;border-radius:12px;overflow:hidden;background:#11161e}
+.sectionHead{background:#171d27;padding:12px;font-size:13px;font-weight:900}
+.list,.sectionBody{display:flex;flex-direction:column;gap:0}
+.row{display:grid;grid-template-columns:minmax(0,1fr) 48px 48px 62px 112px;align-items:center;gap:7px;background:#151a22;border-bottom:1px solid #252c38;padding:9px;min-height:46px}
+.row:last-child{border-bottom:0}
+.row.placed{border-left:3px solid #16a34a}
+.hrow{display:grid;grid-template-columns:minmax(0,1fr) 48px 48px 62px 86px;align-items:center;gap:7px;padding:9px;border-bottom:1px solid #222936}
+.hrow:last-child{border-bottom:0}
 .match{font-size:13px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.minute,.odds{font-size:12px;text-align:center;color:#c5ccd8;white-space:nowrap}
+.minute,.odds{font-size:11px;text-align:center;color:#c5ccd8;white-space:nowrap}
 .betbtn{border:0;border-radius:8px;padding:9px 6px;font-size:11px;font-weight:900;background:#16a34a;color:#fff;cursor:pointer;white-space:nowrap}
 .betbtn[disabled]{background:#14532d;color:#86efac;cursor:default}
 .empty{padding:18px 8px;text-align:center;color:#7d8797;font-size:12px}
-.archive{margin-top:14px;border:1px solid #252c38;border-radius:10px;overflow:hidden;background:#11161e}
-.archiveHead{width:100%;border:0;background:#171d27;color:#fff;padding:12px;text-align:left;font-size:13px;font-weight:900;cursor:pointer}
-.archiveBody{display:none;padding:7px}
-.archive.open .archiveBody{display:block}
-.arow{display:grid;grid-template-columns:minmax(0,1fr) 48px 48px 62px 96px;align-items:center;gap:7px;padding:8px 4px;border-bottom:1px solid #222936}
-.arow:last-child{border-bottom:0}
-.result{font-size:11px;font-weight:900;text-align:right;white-space:nowrap}
-.win{color:#4ade80}.loss{color:#f87171}.waiting{color:#facc15}
+.result{font-size:10px;font-weight:900;text-align:right;white-space:nowrap}
+.goal{color:#4ade80}.nogoal{color:#f87171}.waiting{color:#facc15}
+.day{border-top:1px solid #252c38}
+.day:first-child{border-top:0}
+.dayHead{width:100%;border:0;background:#141a23;color:#fff;padding:11px 12px;text-align:left;font-size:12px;font-weight:900;cursor:pointer}
+.dayBody{display:none}
+.day.open .dayBody{display:block}
 .note{margin-top:8px;color:#697386;font-size:9px;text-align:center}
 @media(max-width:520px){
  .app{padding:8px}
- .row,.arow{grid-template-columns:minmax(0,1fr) 34px 34px 48px 88px;gap:4px}
+ .row{grid-template-columns:minmax(0,1fr) 34px 34px 46px 86px;gap:4px}
+ .hrow{grid-template-columns:minmax(0,1fr) 34px 34px 46px 70px;gap:4px}
  .match{font-size:11px}
- .minute,.odds{font-size:10px}
+ .minute,.odds{font-size:9px}
  .betbtn,.result{font-size:9px}
 }
 </style>
@@ -3411,16 +3470,22 @@ body{margin:0;background:#0b0e13;color:#fff;font-family:Arial,Helvetica,sans-ser
     <div class="count">ДНЕШНИ СИГНАЛИ: <span id="todayCount">0</span></div>
   </div>
 
-  <div id="list" class="list">
-    <div class="empty">Зареждане...</div>
+  <div class="section">
+    <div class="sectionHead">⚡ АКТИВНИ СИГНАЛИ · <span id="activeCount">0</span></div>
+    <div id="list" class="list"><div class="empty">Зареждане...</div></div>
   </div>
 
-  <div id="archive" class="archive">
-    <button id="archiveToggle" class="archiveHead">▸ АРХИВ · <span id="archiveCount">0</span></button>
-    <div id="archiveBody" class="archiveBody"></div>
+  <div class="section">
+    <div class="sectionHead">📅 ДНЕС · <span id="placedTodayCount">0</span></div>
+    <div id="todayBody" class="sectionBody"><div class="empty">Няма залози днес.</div></div>
   </div>
 
-  <div class="note">BET PLACED се показва само след потвърден успешен залог.</div>
+  <div class="section">
+    <div class="sectionHead">🗂 АРХИВ · ПО ДНИ</div>
+    <div id="archiveDays"><div class="empty">Няма архив.</div></div>
+  </div>
+
+  <div class="note">ДНЕС и АРХИВ съдържат само потвърдени BET PLACED залози.</div>
   <div class="note">TOP SIGNAL · ${VERSION}</div>
 </div>
 
@@ -3451,7 +3516,6 @@ function eventUrl(t){
 }
 function go(t){
   if(!t?.eventId||t?.betPlaced===true)return;
-  // SAME TAB
   location.href=eventUrl(t);
 }
 function activeRow(t){
@@ -3472,22 +3536,30 @@ function activeRow(t){
     '</button>'+
   '</div>';
 }
-function archiveRow(x){
+function historyRow(x){
   const match=esc(x?.matchName||'—');
-  const entryMinute=x?.entryMinute!=null?esc(x.entryMinute)+"'":'—';
-  const liveMinute=x?.liveMinute!=null?esc(x.liveMinute)+"'":'—';
+  const entry=x?.entryMinute!=null?esc(x.entryMinute)+"'":'—';
+  const goal=x?.goalMinute!=null?esc(x.goalMinute)+"'":'—';
   const odds=validOdds(x?.odds);
   const oddsText=odds!==null?'@'+odds.toFixed(2):'@—';
   const st=String(x?.resultStatus||'WAITING').toUpperCase();
   let cls='waiting',label='ЧАКА';
-  if(st==='WIN'){cls='win';label='ПЕЧЕЛИ';}
-  if(st==='LOSS'){cls='loss';label='НЕ ПЕЧЕЛИ';}
-  return '<div class="arow">'+
+  if(st==='GOAL'){cls='goal';label='GOAL';}
+  if(st==='NO_GOAL'){cls='nogoal';label='NO GOAL';}
+  return '<div class="hrow">'+
     '<div class="match">'+match+'</div>'+
-    '<div class="minute" title="ENTRY minute">📥 '+entryMinute+'</div>'+
-    '<div class="minute" title="Last live minute">⏱ '+liveMinute+'</div>'+
+    '<div class="minute" title="ENTRY">📥 '+entry+'</div>'+
+    '<div class="minute" title="Goal minute">⚽ '+goal+'</div>'+
     '<div class="odds">'+oddsText+'</div>'+
     '<div class="result '+cls+'">'+label+'</div>'+
+  '</div>';
+}
+function dayBlock(g,index){
+  const date=esc(g?.date||'—');
+  const items=Array.isArray(g?.items)?g.items:[];
+  return '<div class="day" data-day="'+index+'">'+
+    '<button class="dayHead" data-day-toggle="'+index+'">▸ '+date+' · '+items.length+' залога</button>'+
+    '<div class="dayBody">'+(items.length?items.map(historyRow).join(''):'<div class="empty">Няма записи.</div>')+'</div>'+
   '</div>';
 }
 async function refresh(){
@@ -3500,35 +3572,44 @@ async function refresh(){
     const ad=await ar.json();
 
     latestTargets=Array.isArray(td?.targets)?td.targets:[];
+    document.getElementById('activeCount').textContent=String(latestTargets.length);
     document.getElementById('list').innerHTML=
       latestTargets.length
         ? latestTargets.map(activeRow).join('')
         : '<div class="empty">Няма активни сигнали.</div>';
 
-    const archive=Array.isArray(ad?.archive)?ad.archive:[];
-    document.getElementById('todayCount').textContent=String(ad?.today_signals??latestTargets.length);
-    document.getElementById('archiveCount').textContent=String(archive.length);
-    document.getElementById('archiveBody').innerHTML=
-      archive.length
-        ? archive.map(archiveRow).join('')
-        : '<div class="empty">Няма заложени мачове.</div>';
+    const today=Array.isArray(ad?.today)?ad.today:[];
+    document.getElementById('todayCount').textContent=String(ad?.today_signals??0);
+    document.getElementById('placedTodayCount').textContent=String(today.length);
+    document.getElementById('todayBody').innerHTML=
+      today.length
+        ? today.map(historyRow).join('')
+        : '<div class="empty">Няма потвърдени залози днес.</div>';
+
+    const groups=Array.isArray(ad?.archive_days)?ad.archive_days:[];
+    document.getElementById('archiveDays').innerHTML=
+      groups.length
+        ? groups.map(dayBlock).join('')
+        : '<div class="empty">Няма по-стар архив.</div>';
   }catch(e){}
 }
 document.addEventListener('click',e=>{
   const b=e.target.closest('[data-bet]');
-  if(!b||b.disabled)return;
-  const id=b.getAttribute('data-bet');
-  const t=latestTargets.find(x=>String(x?.eventId)===String(id));
-  if(t)go(t);
-});
-document.getElementById('archiveToggle').addEventListener('click',()=>{
-  const a=document.getElementById('archive');
-  a.classList.toggle('open');
-  document.getElementById('archiveToggle').innerHTML=
-    (a.classList.contains('open')?'▾':'▸')+
-    ' АРХИВ · <span id="archiveCount">'+
-    document.querySelectorAll('#archiveBody .arow').length+
-    '</span>';
+  if(b&&!b.disabled){
+    const id=b.getAttribute('data-bet');
+    const t=latestTargets.find(x=>String(x?.eventId)===String(id));
+    if(t)go(t);
+    return;
+  }
+
+  const d=e.target.closest('[data-day-toggle]');
+  if(d){
+    const idx=d.getAttribute('data-day-toggle');
+    const box=document.querySelector('.day[data-day="'+idx+'"]');
+    if(!box)return;
+    box.classList.toggle('open');
+    d.textContent=(box.classList.contains('open')?'▾ ':'▸ ')+d.textContent.slice(2);
+  }
 });
 refresh();
 setInterval(refresh,REFRESH_MS);
