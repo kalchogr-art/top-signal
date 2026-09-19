@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.4 PERSISTENT TODAY COUNT";
+  "V1.9.5 SERVER SIDE BET PLACED";
 
 const APP_NAME =
   "top-signal";
@@ -1188,6 +1188,68 @@ export default {
           500
         );
       }
+    }
+
+
+    // ========================================================
+    // SERVER-SIDE BET PLACED HANDOFF
+    // Done -> /?bet-placed=EVENT_ID
+    // Worker writes D1 BEFORE returning the dashboard.
+    // No browser POST / no CORS dependency.
+    // ========================================================
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/" &&
+      url.searchParams.has("bet-placed")
+    ) {
+
+      const eventId =
+        safe(
+          url.searchParams.get(
+            "bet-placed"
+          )
+        );
+
+      if (eventId) {
+        try {
+          const saved =
+            await saveBetPlacedServerSide(
+              env,
+              eventId
+            );
+
+          if (!saved.success) {
+            console.error(
+              "[BET_PLACED_HANDOFF]",
+              saved.error,
+              eventId
+            );
+          }
+        } catch (error: any) {
+          console.error(
+            "[BET_PLACED_HANDOFF]",
+            error?.message ?? String(error),
+            eventId
+          );
+        }
+      }
+
+      // Always clean the one-shot query parameter.
+      // This also prevents an accidental refresh from creating another handoff.
+      const cleanUrl =
+        new URL(
+          request.url
+        );
+
+      cleanUrl.searchParams.delete(
+        "bet-placed"
+      );
+
+      return Response.redirect(
+        cleanUrl.toString(),
+        302
+      );
     }
 
 
@@ -2444,6 +2506,83 @@ async function ensureBetStatusTable(
     `)
 
     .run();
+}
+
+
+// ============================================================
+// SAVE BET PLACED — SERVER SIDE
+// ============================================================
+
+async function saveBetPlacedServerSide(
+  env: Env,
+  eventId: string
+): Promise<Obj> {
+
+  await ensureBetStatusTable(env);
+
+  const storedEvent =
+    await getStoredEvent(
+      env,
+      eventId
+    );
+
+  if (!storedEvent) {
+    return {
+      success: false,
+      error: "EVENT_NOT_FOUND",
+      eventId
+    };
+  }
+
+  const now =
+    new Date()
+      .toISOString();
+
+  await env.DB
+    .prepare(`
+      INSERT INTO bet_status (
+        event_id,
+        status,
+        placed,
+        placed_at,
+        updated_at
+      )
+
+      VALUES (
+        ?1,
+        'BET_PLACED',
+        1,
+        ?2,
+        ?2
+      )
+
+      ON CONFLICT(event_id)
+
+      DO UPDATE SET
+        status = 'BET_PLACED',
+        placed = 1,
+        placed_at = COALESCE(
+          bet_status.placed_at,
+          excluded.placed_at
+        ),
+        updated_at = excluded.updated_at
+    `)
+
+    .bind(
+      eventId,
+      now
+    )
+
+    .run();
+
+  return {
+    success: true,
+    eventId,
+    data: await getBetStatus(
+      env,
+      eventId
+    )
+  };
 }
 
 
