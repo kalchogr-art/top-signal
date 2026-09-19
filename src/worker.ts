@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.5 SERVER SIDE BET PLACED";
+  "V1.9.6 BET PLACED DIAGNOSTIC";
 
 const APP_NAME =
   "top-signal";
@@ -1211,45 +1211,92 @@ export default {
           )
         );
 
-      if (eventId) {
-        try {
-          const saved =
-            await saveBetPlacedServerSide(
-              env,
-              eventId
-            );
-
-          if (!saved.success) {
-            console.error(
-              "[BET_PLACED_HANDOFF]",
-              saved.error,
-              eventId
-            );
-          }
-        } catch (error: any) {
-          console.error(
-            "[BET_PLACED_HANDOFF]",
-            error?.message ?? String(error),
-            eventId
-          );
-        }
+      if (!eventId) {
+        return json(
+          {
+            success: false,
+            version: VERSION,
+            diagnostic: "BET_PLACED_HANDOFF",
+            error: "MISSING_EVENT_ID"
+          },
+          400
+        );
       }
 
-      // Always clean the one-shot query parameter.
-      // This also prevents an accidental refresh from creating another handoff.
-      const cleanUrl =
-        new URL(
-          request.url
+      try {
+        await ensureBetStatusTable(env);
+
+        const storedEvent =
+          await getStoredEvent(
+            env,
+            eventId
+          );
+
+        const before =
+          await getBetStatus(
+            env,
+            eventId
+          );
+
+        const saved =
+          await saveBetPlacedServerSide(
+            env,
+            eventId
+          );
+
+        const after =
+          await getBetStatus(
+            env,
+            eventId
+          );
+
+        // During diagnosis DO NOT redirect.
+        // Show exactly what the Worker/D1 sees.
+        return json({
+          success:
+            saved?.success === true,
+
+          version:
+            VERSION,
+
+          diagnostic:
+            "BET_PLACED_HANDOFF",
+
+          eventId,
+
+          live_odds_event_found:
+            !!storedEvent,
+
+          live_odds_event:
+            storedEvent ?? null,
+
+          bet_status_before:
+            before ?? null,
+
+          save_result:
+            saved ?? null,
+
+          bet_status_after:
+            after ?? null
+        });
+
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            version: VERSION,
+            diagnostic: "BET_PLACED_HANDOFF",
+            eventId,
+            error:
+              error?.message ??
+              String(error),
+            stack:
+              error?.stack ??
+              null
+          },
+          500
         );
-
-      cleanUrl.searchParams.delete(
-        "bet-placed"
-      );
-
-      return Response.redirect(
-        cleanUrl.toString(),
-        302
-      );
+      }
     }
 
 
