@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.7 BET STATUS SCHEMA MIGRATION";
+  "V1.9.8 BET STATUS CREATED AT FIX";
 
 const APP_NAME =
   "top-signal";
@@ -2638,6 +2638,7 @@ async function saveBetPlacedServerSide(
         status,
         placed,
         placed_at,
+        created_at,
         updated_at
       )
 
@@ -2645,6 +2646,7 @@ async function saveBetPlacedServerSide(
         ?1,
         'BET_PLACED',
         1,
+        ?2,
         ?2,
         ?2
       )
