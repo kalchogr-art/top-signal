@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.13 TRACKER TODAY COUNTER";
+  "V1.9.14 LIVE SELECTION BUTTON";
 
 const APP_NAME =
   "top-signal";
@@ -1837,13 +1837,40 @@ async function buildTargets(
       ) === 1;
 
 
+    // --------------------------------------------------------
+    // V1.9.14 — CURRENT LIVE SELECTION STATE
+    // The dashboard button must never rely on stale stored entry odds.
+    // --------------------------------------------------------
+
+    const liveSelection =
+      betPlaced
+        ? {
+            checked: true,
+            enabled: false,
+            status: "BET_PLACED",
+            price: null,
+            eventId: target.eventId
+          }
+        : await getLiveSelectionState(env, target);
+
+
     targets.push({
 
       ...target,
 
       overOdds:
-        trackerOdds ??
-        storedOdds,
+        liveSelection?.enabled === true
+          ? liveSelection?.price
+          : trackerOdds ?? storedOdds,
+
+      selectionStatus:
+        liveSelection?.status ?? null,
+
+      selectionEnabled:
+        liveSelection?.enabled === true,
+
+      selectionChecked:
+        liveSelection?.checked === true,
 
       underOdds:
         storedUnderOdds,
@@ -1860,10 +1887,7 @@ async function buildTargets(
 
       ready:
         betReady &&
-        (
-          trackerOdds !== null ||
-          storedOdds !== null
-        ),
+        liveSelection?.enabled === true,
 
       betPlaced,
 
@@ -1922,6 +1946,84 @@ async function buildTargets(
 
     targets
   };
+}
+
+
+// ============================================================
+// V1.9.14 — LIVE CLOUDBET SELECTION CHECK FOR BET NOW BUTTON
+// Reuses the existing MATCHER binding. A button is enabled ONLY when
+// the exact current 1H Over 0.5 selection is confirmed ENABLED.
+// ============================================================
+
+async function getLiveSelectionState(
+  env: Env,
+  target: Obj
+): Promise<Obj> {
+
+  const signal = {
+    type: "HUNTER_ENTRY",
+    signal: "HUNTER_ENTRY",
+    match: target?.matchName ?? "",
+    match_id: target?.matchId ?? target?.signalId ?? null,
+    home: target?.home ?? "",
+    away: target?.away ?? "",
+    entry_minute: numberOrNull(target?.entryMinute ?? target?.minute),
+    current_minute: numberOrNull(target?.minute),
+    hunter_score: numberOrNull(target?.hunterScore)
+  };
+
+  try {
+    const data = await callMatcher(env, [signal]);
+    const results = Array.isArray(data?.hunter_results)
+      ? data.hunter_results
+      : [];
+
+    const result = results.find((x: Obj) =>
+      safe(x?.signal?.match_id) === safe(signal.match_id)
+    ) ?? results[0] ?? null;
+
+    const foundEventId = safe(
+      result?.cloudbet?.event_id ?? result?.cloudbet?.id
+    ).replace(/\.0+$/, "");
+
+    const expectedEventId = safe(target?.eventId).replace(/\.0+$/, "");
+    const odds = result?.odds ?? null;
+    const status = safe(
+      odds?.selection_status ?? odds?.status
+    ).toUpperCase();
+    const price = validOdds(
+      odds?.price ?? odds?.raw_price
+    );
+
+    const sameEvent =
+      !!foundEventId &&
+      !!expectedEventId &&
+      foundEventId === expectedEventId;
+
+    const enabled =
+      sameEvent &&
+      odds?.available === true &&
+      price !== null &&
+      status === "SELECTION_ENABLED";
+
+    return {
+      checked: true,
+      enabled,
+      status: status || "SELECTION_UNAVAILABLE",
+      price: enabled ? price : null,
+      eventId: foundEventId || null
+    };
+
+  } catch (error) {
+    console.error("LIVE SELECTION CHECK ERROR", target?.eventId, error);
+    return {
+      checked: false,
+      enabled: false,
+      status: "SELECTION_CHECK_FAILED",
+      price: null,
+      eventId: null
+    };
+  }
 }
 
 
@@ -3565,6 +3667,7 @@ function go(t){
 }
 function activeRow(t){
   const placed=t?.betPlaced===true;
+  const selectionEnabled=t?.selectionEnabled===true;
   const odds=validOdds(t?.overOdds);
   const match=esc(t?.matchName||t?.cloudbetMatch||'Hunter target');
   const entryMinute=t?.entryMinute!=null?esc(t.entryMinute)+"'":'—';
@@ -3576,8 +3679,8 @@ function activeRow(t){
     '<div class="minute" title="ENTRY minute">📥 '+entryMinute+'</div>'+
     '<div class="minute" title="Live minute">⏱ '+liveMinute+'</div>'+
     '<div class="odds">'+oddsText+'</div>'+
-    '<button class="betbtn" data-bet="'+id+'" '+((placed||odds===null)?'disabled':'')+'>'+
-      (placed?'BET PLACED':'BET NOW')+
+    '<button class="betbtn" data-bet="'+id+'" '+((placed||!selectionEnabled||odds===null)?'disabled':'')+'>'+
+      (placed?'BET PLACED':(selectionEnabled&&odds!==null?'BET NOW':'DISABLED'))+
     '</button>'+
   '</div>';
 }
