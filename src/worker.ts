@@ -37,7 +37,7 @@
 // ============================================================
 
 const VERSION =
-  "V1.9.12 DAILY POSSIBLE + PLACED COUNTERS";
+  "V1.9.13 TRACKER TODAY COUNTER";
 
 const APP_NAME =
   "top-signal";
@@ -610,10 +610,11 @@ export default {
                 )
             );
 
-        await backfillDailySignalsFromLiveOdds(env);
-
+        // V1.9.13 — authoritative daily BET READY count comes from
+        // Tracker /today-stats, which uses the exact same population as /today.
+        // If Tracker is temporarily unavailable, fall back to the existing D1 counter.
         const todaySignals =
-          await getTodaySignalCount(env);
+          await getTrackerTodaySignalCount(env);
 
         return json({
           success: true,
@@ -2677,6 +2678,47 @@ async function backfillDailySignalsFromLiveOdds(
   } catch {
     // Counter must not break the dashboard if an old DB schema is unusual.
   }
+}
+
+
+// ============================================================
+// V1.9.13 — TRACKER TODAY COUNTER
+// Uses Tracker /today-stats so dashboard "ОБЩО ВЪЗМОЖНИ ЗА ДНЕС"
+// is identical to the ENTRY count used by Tracker /today.
+// Falls back to the existing Top Signal D1 counter if needed.
+// ============================================================
+
+async function getTrackerTodaySignalCount(
+  env: Env
+): Promise<number> {
+
+  try {
+    const data =
+      await fetchServiceJSON(
+        env.TRACKER,
+        "/today-stats"
+      );
+
+    const entry =
+      Number(data?.entry);
+
+    if (
+      data?.success === true &&
+      Number.isFinite(entry) &&
+      entry >= 0
+    ) {
+      return entry;
+    }
+  } catch (error) {
+    console.error(
+      "TRACKER /today-stats ERROR — using D1 fallback",
+      error
+    );
+  }
+
+  await backfillDailySignalsFromLiveOdds(env);
+
+  return await getTodaySignalCount(env);
 }
 
 
