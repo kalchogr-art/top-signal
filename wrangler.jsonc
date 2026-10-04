@@ -23,6 +23,10 @@
     {
       "binding": "V27",
       "service": "goal-watch-proxy"
+    },
+    {
+      "binding": "FREE_CHANNEL",
+      "service": "hunter-free-channel"
     }
   ],
 
