@@ -18,7 +18,7 @@
 //   GET /history?days=7
 // ============================================================
 
-const VERSION = "V1.6.0 TODAY STATS + CLOSED-DAY ARCHIVE";
+const VERSION = "V1.7.1 CORRECT RANGES + COMPLETE ARCHIVE + SOFIA HOURS";
 const APP_NAME = "hunter-free-channel";
 
 const MIN_ENTRY_MINUTE = 10;
@@ -105,7 +105,7 @@ export async function handleFreeChannel(request: Request, env: Env): Promise<Res
       try {
         const daysRaw = Number(url.searchParams.get("days") ?? 7);
         const days = Number.isFinite(daysRaw)
-          ? Math.max(1, Math.min(120, Math.trunc(daysRaw)))
+          ? Math.max(1, Math.min(3650, Math.trunc(daysRaw)))
           : 7;
 
         const raw = await fetchTrackerJSON(env.TRACKER, `/history?days=${days}`);
@@ -280,6 +280,10 @@ function normalizeSignal(row: any): Obj | null {
 }
 
 function isStrongCandidate(x: Obj): boolean {
+  // PUBLIC WEBSITE COHORT:
+  // ENTRY 10'-21' + Hunter Score >=64 + 15:00-23:59 Europe/Sofia.
+  // Statistics and Archive use this exact same cohort.
+  // Future FREE Telegram remains the narrower 19'-20' filter.
   const minute = numberOrNull(x?.entry_minute);
   const score = numberOrNull(x?.hunter_score);
   const createdAt = safe(x?.created_at);
@@ -291,6 +295,7 @@ function isStrongCandidate(x: Obj): boolean {
   const parts = sofiaParts(createdAt);
   if (!parts) return false;
 
+  // 15:00:00 through 23:59:59 Sofia.
   return parts.hour >= START_HOUR_SOFIA && parts.hour <= END_HOUR_SOFIA;
 }
 
@@ -486,17 +491,146 @@ function isStrongWindow(item){
   return minute >= 19 && minute <= 20;
 }
 
-const BASE='/free-channel';let selectedDays='today';
+const BASE='/free-channel';
+let selectedDays='today';
+
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
-async function get(path){const r=await fetch(BASE+path,{cache:'no-store'});const t=await r.text();let d;try{d=JSON.parse(t)}catch{throw new Error('DATA API UNAVAILABLE')}if(!r.ok||d.success===false)throw new Error(d.error||('HTTP '+r.status));return d}
-function resultText(x){if(x.result==='GOAL')return '⚽ GOAL'+(x.goal_minute!=null?' '+x.goal_minute+"'":'');if(x.result==='NO_GOAL')return 'NO GOAL';return 'TRACKING'}
-function row(x){const cls=x.result==='GOAL'?'goal':x.result==='NO_GOAL'?'no-goal':'tracking';const when=x.sofia_time?(x.sofia_time.time||'').slice(0,5):'';return '<div class="signal-row '+cls+'"><div><div class="league">'+esc(x.league||'LIVE')+'</div><div class="match">'+esc(x.match_name||'Unknown match')+'</div><div class="meta">ENTRY '+esc(x.entry_minute)+"' · "+esc(when)+' SOFIA</div></div><div class="hs">HS <b>'+esc(x.hunter_score)+'</b></div><div class="result">'+esc(resultText(x))+'</div></div>'}
-function renderLive(d){const a=d.candidates||[];document.getElementById('liveCount').textContent=a.length+' ACTIVE';document.getElementById('liveList').innerHTML=a.length?a.map(row).join(''):'<div class="empty">No live signals right now.</div>'}
-function groupByDay(a){const m={};for(const x of a){const k=x.sofia_time?.date||'UNKNOWN';(m[k]??=[]).push(x)}return m}
-function renderHistory(d){document.getElementById('sSignals').textContent=d.count??0;document.getElementById('sGoals').textContent=d.goals??0;document.getElementById('sNoGoals').textContent=d.no_goals??0;document.getElementById('sSuccess').textContent=d.success_pct==null?'—':d.success_pct+'%';const groups=groupByDay(d.candidates||[]);const dates=Object.keys(groups).sort().reverse();document.getElementById('archiveMeta').textContent=(selectedDays===3650?'ALL TIME':selectedDays+' DAYS')+' · '+dates.length+' DAYS';document.getElementById('archive').innerHTML=dates.length?dates.map((date,i)=>{const a=groups[date],g=a.filter(x=>x.result==='GOAL').length,n=a.filter(x=>x.result==='NO_GOAL').length,c=g+n,p=c?Math.round(g/c*1000)/10:null;return '<section class="day '+(i===0?'open':'')+'"><button class="day-head"><span><span class="arrow">▸</span> '+esc(date)+'</span><span class="right">'+a.length+' SIGNALS · '+g+'G / '+n+'NG'+(p==null?'':' · '+p+'%')+'</span></button><div class="day-body">'+a.map(row).join('')+'</div></section>'}).join(''):'<div class="empty">No signals for the selected period.</div>';document.querySelectorAll('.day-head').forEach(b=>b.onclick=()=>b.parentElement.classList.toggle('open'))}
-async function refreshLive(){try{renderLive(await get('/candidates'))}catch(e){document.getElementById('liveList').innerHTML='<div class="empty error">Unable to load live signals.</div>'}}
-async function refreshHistory(){try{renderHistory(await get('/history?days='+selectedDays))}catch(e){document.getElementById('archive').innerHTML='<div class="empty">ERROR · '+esc(e.message)+'</div>'}}
-document.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));b.classList.add('active');selectedDays=Number(b.dataset.days);refreshHistory()});refreshLive();refreshHistory();setInterval(refreshLive,30000);setInterval(refreshHistory,120000);
+
+async function get(path){
+  const r=await fetch(BASE+path,{cache:'no-store'});
+  const t=await r.text();
+  let d;
+  try{d=JSON.parse(t)}catch{throw new Error('DATA API UNAVAILABLE')}
+  if(!r.ok||d.success===false)throw new Error(d.error||('HTTP '+r.status));
+  return d;
+}
+
+function resultText(x){
+  if(x.result==='GOAL')return '⚽ GOAL'+(x.goal_minute!=null?' '+x.goal_minute+"'":'');
+  if(x.result==='NO_GOAL')return 'NO GOAL';
+  return 'TRACKING';
+}
+
+function row(x){
+  const cls=x.result==='GOAL'?'goal':x.result==='NO_GOAL'?'no-goal':'tracking';
+  const when=x.sofia_time?(x.sofia_time.time||'').slice(0,5):'';
+  return '<div class="signal-row '+cls+'"><div><div class="league">'+esc(x.league||'LIVE')+'</div><div class="match">'+esc(x.match_name||'Unknown match')+'</div><div class="meta">ENTRY '+esc(x.entry_minute)+"' · "+esc(when)+' SOFIA</div></div><div class="hs">HS <b>'+esc(x.hunter_score)+'</b></div><div class="result">'+esc(resultText(x))+'</div></div>';
+}
+
+function renderLive(d){
+  const a=d.candidates||[];
+  document.getElementById('liveCount').textContent=a.length+' ACTIVE';
+  document.getElementById('liveList').innerHTML=a.length?a.map(row).join(''):'<div class="empty">No live signals right now.</div>';
+}
+
+function groupByDay(a){
+  const m={};
+  for(const x of a){
+    const k=x.sofia_time?.date||'UNKNOWN';
+    (m[k]??=[]).push(x);
+  }
+  return m;
+}
+
+function renderStats(d){
+  document.getElementById('sSignals').textContent=d.count??0;
+  document.getElementById('sGoals').textContent=d.goals??0;
+  document.getElementById('sNoGoals').textContent=d.no_goals??0;
+  document.getElementById('sSuccess').textContent=d.success_pct==null?'—':d.success_pct+'%';
+}
+
+function todaySofia(){
+  return new Intl.DateTimeFormat('en-CA',{
+    timeZone:'Europe/Sofia',
+    year:'numeric',
+    month:'2-digit',
+    day:'2-digit'
+  }).format(new Date());
+}
+
+function renderArchive(d){
+  const today=todaySofia();
+
+  // Archive contains every previous-day signal only.
+  // Today's signals appear in LIVE/TODAY statistics and move here after midnight Sofia.
+  const archived=(d.candidates||[]).filter(x=>{
+    const day=x.sofia_time?.date||'';
+    return day && day<today;
+  });
+
+  const groups=groupByDay(archived);
+  const dates=Object.keys(groups).sort().reverse();
+
+  document.getElementById('archiveMeta').textContent=
+    dates.length+' DAYS · '+archived.length+' SIGNALS';
+
+  document.getElementById('archive').innerHTML=dates.length
+    ? dates.map((date,i)=>{
+        const a=groups[date];
+        const g=a.filter(x=>x.result==='GOAL').length;
+        const n=a.filter(x=>x.result==='NO_GOAL').length;
+        const c=g+n;
+        const p=c?Math.round(g/c*1000)/10:null;
+
+        return '<section class="day '+(i===0?'open':'')+'">'+
+          '<button class="day-head">'+
+            '<span><span class="arrow">▸</span> '+esc(date)+'</span>'+
+            '<span class="right">'+a.length+' SIGNALS · '+g+'G / '+n+'NG'+(p==null?'':' · '+p+'%')+'</span>'+
+          '</button>'+
+          '<div class="day-body">'+a.map(row).join('')+'</div>'+
+        '</section>';
+      }).join('')
+    : '<div class="empty">No completed days in the archive yet.</div>';
+
+  document.querySelectorAll('.day-head').forEach(
+    b=>b.onclick=()=>b.parentElement.classList.toggle('open')
+  );
+}
+
+async function refreshLive(){
+  try{
+    renderLive(await get('/candidates'));
+  }catch(e){
+    document.getElementById('liveList').innerHTML=
+      '<div class="empty error">Unable to load live signals.</div>';
+  }
+}
+
+async function refreshStats(){
+  try{
+    const days=selectedDays==='today'?1:selectedDays;
+    renderStats(await get('/history?days='+days));
+  }catch(e){
+    console.error('stats',e);
+  }
+}
+
+async function refreshArchive(){
+  try{
+    renderArchive(await get('/history?days=3650'));
+  }catch(e){
+    document.getElementById('archive').innerHTML=
+      '<div class="empty error">Unable to load archive.</div>';
+  }
+}
+
+document.querySelectorAll('.chip[data-days]').forEach(b=>{
+  b.onclick=()=>{
+    document.querySelectorAll('.chip[data-days]').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    selectedDays=b.dataset.days==='today'?'today':Number(b.dataset.days);
+    refreshStats();
+  };
+});
+
+refreshLive();
+refreshStats();
+refreshArchive();
+
+setInterval(refreshLive,30000);
+setInterval(refreshStats,120000);
+setInterval(refreshArchive,300000);
+
 </script>
 </body></html>`;
 }
