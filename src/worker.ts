@@ -57,6 +57,9 @@ interface Env {
 
   MATCHER:
     Fetcher;
+
+  FREE_CHANNEL:
+    Fetcher;
 }
 
 
@@ -1381,6 +1384,46 @@ export default {
           500
         );
       }
+    }
+
+
+    // ========================================================
+    // FREE CHANNEL — ISOLATED WORKER PROXY
+    // /free-channel -> hunter-free-channel /
+    // /free-channel/* -> hunter-free-channel /*
+    // Existing Top Signal dashboard/logic is untouched.
+    // ========================================================
+
+    if (
+      url.pathname === "/free-channel" ||
+      url.pathname.startsWith("/free-channel/")
+    ) {
+
+      const subPath =
+        url.pathname === "/free-channel"
+          ? "/"
+          : url.pathname.slice(
+              "/free-channel".length
+            );
+
+      const targetUrl =
+        new URL(request.url);
+
+      targetUrl.protocol =
+        "https:";
+
+      targetUrl.hostname =
+        "free-channel";
+
+      targetUrl.pathname =
+        subPath;
+
+      return env.FREE_CHANNEL.fetch(
+        new Request(
+          targetUrl.toString(),
+          request
+        )
+      );
     }
 
 
