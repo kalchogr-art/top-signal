@@ -18,7 +18,7 @@
 //   GET /history?days=7
 // ============================================================
 
-const VERSION = "V1.3.0 FULL FILTER PUBLIC SITE";
+const VERSION = "V1.4.0 D1 FULL HISTORY";
 const APP_NAME = "hunter-free-channel";
 
 const MIN_ENTRY_MINUTE = 19;
@@ -31,10 +31,55 @@ type Obj = Record<string, any>;
 
 interface Env {
   TRACKER: Fetcher;
+  DB: D1Database;
 }
 
 export async function handleFreeChannel(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+    
+const url = new URL(request.url);
+
+// Public data API is read directly from D1 so archive/statistics contain every Hunter signal.
+if (url.pathname.endsWith("/history")) {
+  const daysRaw = Number(url.searchParams.get("days") || "3650");
+  const days = Math.max(1, Math.min(36500, Number.isFinite(daysRaw) ? daysRaw : 3650));
+  const rows = await readSiteSignalsFromD1(env, days);
+  return json({
+    success: true,
+    worker: "hunter-free-channel",
+    version: "V1.4.0 D1 FULL HISTORY",
+    mode: "PUBLIC_SITE",
+    days,
+    ...siteSummary(rows),
+    filter: {
+      entry_minute_min: SITE_MINUTE_MIN,
+      entry_minute_max: SITE_MINUTE_MAX,
+      hunter_score_min: SITE_SCORE_MIN,
+      timezone: "Europe/Sofia"
+    },
+    candidates: rows,
+    timestamp: new Date().toISOString()
+  });
+}
+
+if (url.pathname.endsWith("/candidates")) {
+  const rows = await readLiveSiteCandidatesFromD1(env);
+  return json({
+    success: true,
+    worker: "hunter-free-channel",
+    version: "V1.4.0 D1 FULL HISTORY",
+    mode: "PUBLIC_SITE",
+    count: rows.length,
+    filter: {
+      entry_minute_min: SITE_MINUTE_MIN,
+      entry_minute_max: SITE_MINUTE_MAX,
+      hunter_score_min: SITE_SCORE_MIN,
+      timezone: "Europe/Sofia"
+    },
+    candidates: rows,
+    timestamp: new Date().toISOString()
+  });
+}
+
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
@@ -384,6 +429,96 @@ function safe(value: any): string {
 }
 
 
+
+// ============================================================
+// DIRECT D1 PUBLIC-SITE DATA
+// Full site cohort: 1H ENTRY 10-21, Hunter Score >=64.
+// This intentionally does NOT use Cloudbet / Matcher / BET READY.
+// ============================================================
+const SITE_MINUTE_MIN = 10;
+const SITE_MINUTE_MAX = 21;
+const SITE_SCORE_MIN = 64;
+
+function normalizeDbSignal(row: any) {
+  const created = String(row.created_at || row.entry_at || row.timestamp || "");
+  return {
+    id: String(row.id ?? row.signal_id ?? ""),
+    match_name: row.match_name ?? row.match ?? row.name ?? "Unknown match",
+    league: row.league ?? row.competition ?? row.tournament ?? "",
+    entry_minute: Number(row.entry_minute ?? row.minute ?? 0),
+    hunter_score: Number(row.hunter_score ?? row.score ?? 0),
+    score: row.entry_score ?? row.match_score ?? null,
+    status: row.status ?? null,
+    result: row.result ?? (
+      String(row.status || "").toUpperCase() === "GOAL" ? "GOAL" :
+      String(row.status || "").toUpperCase().includes("NO_GOAL") ? "NO_GOAL" :
+      null
+    ),
+    goal_minute: row.goal_minute == null ? null : Number(row.goal_minute),
+    goal_after_minutes: row.goal_after_minutes == null ? null : Number(row.goal_after_minutes),
+    created_at: created,
+    sofia_time: sofiaParts(created)
+  };
+}
+
+async function readSiteSignalsFromD1(env: Env, days?: number) {
+  const where = [
+    "entry_minute BETWEEN ? AND ?",
+    "hunter_score >= ?"
+  ];
+  const binds: any[] = [SITE_MINUTE_MIN, SITE_MINUTE_MAX, SITE_SCORE_MIN];
+
+  if (days && Number.isFinite(days) && days > 0 && days < 36500) {
+    const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+    where.push("created_at >= ?");
+    binds.push(cutoff);
+  }
+
+  const sql = `
+    SELECT *
+    FROM hunter_signals
+    WHERE ${where.join(" AND ")}
+    ORDER BY created_at DESC, id DESC
+    LIMIT 10000
+  `;
+
+  const res = await env.DB.prepare(sql).bind(...binds).all<any>();
+  return (res.results || []).map(normalizeDbSignal);
+}
+
+
+async function readLiveSiteCandidatesFromD1(env: Env) {
+  const cutoff = new Date(Date.now() - 90 * 60000).toISOString();
+  const res = await env.DB.prepare(`
+    SELECT *
+    FROM hunter_signals
+    WHERE entry_minute BETWEEN ? AND ?
+      AND hunter_score >= ?
+      AND created_at >= ?
+      AND (
+        result IS NULL OR result = '' OR
+        UPPER(COALESCE(status,'')) = 'TRACKING'
+      )
+    ORDER BY created_at DESC, id DESC
+    LIMIT 100
+  `).bind(SITE_MINUTE_MIN, SITE_MINUTE_MAX, SITE_SCORE_MIN, cutoff).all<any>();
+  return (res.results || []).map(normalizeDbSignal);
+}
+
+function siteSummary(rows: any[]) {
+  const completed = rows.filter(x => x.result === "GOAL" || x.result === "NO_GOAL");
+  const goals = completed.filter(x => x.result === "GOAL").length;
+  const noGoals = completed.filter(x => x.result === "NO_GOAL").length;
+  return {
+    count: rows.length,
+    completed: completed.length,
+    goals,
+    no_goals: noGoals,
+    success_pct: completed.length ? Math.round((goals / completed.length) * 1000) / 10 : 0
+  };
+}
+
+
 function renderDashboard(): string {
   return `<!DOCTYPE html>
 <html lang="bg">
@@ -467,7 +602,7 @@ header,.wrap,footer{max-width:920px;margin:0 auto;padding-left:20px;padding-righ
   <a class="cta cta-secondary" href="#" aria-label="Get Premium">Get Premium</a>
   <div class="cta-note">Telegram and Premium access links will be available soon.</div>
 </div>
-<div class="info"><b>FREE FILTER:</b> само ENTRY 10'–21' · Hunter Score ≥ 64 · 15:00–23:59 Sofia. Resultsте GOAL / NO GOAL остават видими в архива.</div></header>
+<div class="info"><b></div></header>
 <main class="wrap">
 <div id="status" class="status">⟳ Loading на Hunter данните...</div>
 <div class="section-title"><h2>🔥 LIVE SIGNALS</h2><span id="liveCount">0 ACTIVE</span></div><div id="liveList" class="list"><div class="empty">Проверка за активни STRONG сигнали...</div></div>
