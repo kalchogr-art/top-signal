@@ -18,11 +18,11 @@
 //   GET /history?days=7
 // ============================================================
 
-const VERSION = "V1.4.0 D1 FULL HISTORY";
+const VERSION = "V1.5.0 FULL TRACKER HISTORY PUBLIC SITE";
 const APP_NAME = "hunter-free-channel";
 
-const MIN_ENTRY_MINUTE = 19;
-const MAX_ENTRY_MINUTE = 20;
+const MIN_ENTRY_MINUTE = 10;
+const MAX_ENTRY_MINUTE = 21;
 const MIN_HUNTER_SCORE = 64;
 const START_HOUR_SOFIA = 15;
 const END_HOUR_SOFIA = 23;
@@ -31,55 +31,10 @@ type Obj = Record<string, any>;
 
 interface Env {
   TRACKER: Fetcher;
-  DB: D1Database;
 }
 
 export async function handleFreeChannel(request: Request, env: Env): Promise<Response> {
-    
-const url = new URL(request.url);
-
-// Public data API is read directly from D1 so archive/statistics contain every Hunter signal.
-if (url.pathname.endsWith("/history")) {
-  const daysRaw = Number(url.searchParams.get("days") || "3650");
-  const days = Math.max(1, Math.min(36500, Number.isFinite(daysRaw) ? daysRaw : 3650));
-  const rows = await readSiteSignalsFromD1(env, days);
-  return json({
-    success: true,
-    worker: "hunter-free-channel",
-    version: "V1.4.0 D1 FULL HISTORY",
-    mode: "PUBLIC_SITE",
-    days,
-    ...siteSummary(rows),
-    filter: {
-      entry_minute_min: SITE_MINUTE_MIN,
-      entry_minute_max: SITE_MINUTE_MAX,
-      hunter_score_min: SITE_SCORE_MIN,
-      timezone: "Europe/Sofia"
-    },
-    candidates: rows,
-    timestamp: new Date().toISOString()
-  });
-}
-
-if (url.pathname.endsWith("/candidates")) {
-  const rows = await readLiveSiteCandidatesFromD1(env);
-  return json({
-    success: true,
-    worker: "hunter-free-channel",
-    version: "V1.4.0 D1 FULL HISTORY",
-    mode: "PUBLIC_SITE",
-    count: rows.length,
-    filter: {
-      entry_minute_min: SITE_MINUTE_MIN,
-      entry_minute_max: SITE_MINUTE_MAX,
-      hunter_score_min: SITE_SCORE_MIN,
-      timezone: "Europe/Sofia"
-    },
-    candidates: rows,
-    timestamp: new Date().toISOString()
-  });
-}
-
+    const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
@@ -429,96 +384,6 @@ function safe(value: any): string {
 }
 
 
-
-// ============================================================
-// DIRECT D1 PUBLIC-SITE DATA
-// Full site cohort: 1H ENTRY 10-21, Hunter Score >=64.
-// This intentionally does NOT use Cloudbet / Matcher / BET READY.
-// ============================================================
-const SITE_MINUTE_MIN = 10;
-const SITE_MINUTE_MAX = 21;
-const SITE_SCORE_MIN = 64;
-
-function normalizeDbSignal(row: any) {
-  const created = String(row.created_at || row.entry_at || row.timestamp || "");
-  return {
-    id: String(row.id ?? row.signal_id ?? ""),
-    match_name: row.match_name ?? row.match ?? row.name ?? "Unknown match",
-    league: row.league ?? row.competition ?? row.tournament ?? "",
-    entry_minute: Number(row.entry_minute ?? row.minute ?? 0),
-    hunter_score: Number(row.hunter_score ?? row.score ?? 0),
-    score: row.entry_score ?? row.match_score ?? null,
-    status: row.status ?? null,
-    result: row.result ?? (
-      String(row.status || "").toUpperCase() === "GOAL" ? "GOAL" :
-      String(row.status || "").toUpperCase().includes("NO_GOAL") ? "NO_GOAL" :
-      null
-    ),
-    goal_minute: row.goal_minute == null ? null : Number(row.goal_minute),
-    goal_after_minutes: row.goal_after_minutes == null ? null : Number(row.goal_after_minutes),
-    created_at: created,
-    sofia_time: sofiaParts(created)
-  };
-}
-
-async function readSiteSignalsFromD1(env: Env, days?: number) {
-  const where = [
-    "entry_minute BETWEEN ? AND ?",
-    "hunter_score >= ?"
-  ];
-  const binds: any[] = [SITE_MINUTE_MIN, SITE_MINUTE_MAX, SITE_SCORE_MIN];
-
-  if (days && Number.isFinite(days) && days > 0 && days < 36500) {
-    const cutoff = new Date(Date.now() - days * 86400000).toISOString();
-    where.push("created_at >= ?");
-    binds.push(cutoff);
-  }
-
-  const sql = `
-    SELECT *
-    FROM hunter_signals
-    WHERE ${where.join(" AND ")}
-    ORDER BY created_at DESC, id DESC
-    LIMIT 10000
-  `;
-
-  const res = await env.DB.prepare(sql).bind(...binds).all<any>();
-  return (res.results || []).map(normalizeDbSignal);
-}
-
-
-async function readLiveSiteCandidatesFromD1(env: Env) {
-  const cutoff = new Date(Date.now() - 90 * 60000).toISOString();
-  const res = await env.DB.prepare(`
-    SELECT *
-    FROM hunter_signals
-    WHERE entry_minute BETWEEN ? AND ?
-      AND hunter_score >= ?
-      AND created_at >= ?
-      AND (
-        result IS NULL OR result = '' OR
-        UPPER(COALESCE(status,'')) = 'TRACKING'
-      )
-    ORDER BY created_at DESC, id DESC
-    LIMIT 100
-  `).bind(SITE_MINUTE_MIN, SITE_MINUTE_MAX, SITE_SCORE_MIN, cutoff).all<any>();
-  return (res.results || []).map(normalizeDbSignal);
-}
-
-function siteSummary(rows: any[]) {
-  const completed = rows.filter(x => x.result === "GOAL" || x.result === "NO_GOAL");
-  const goals = completed.filter(x => x.result === "GOAL").length;
-  const noGoals = completed.filter(x => x.result === "NO_GOAL").length;
-  return {
-    count: rows.length,
-    completed: completed.length,
-    goals,
-    no_goals: noGoals,
-    success_pct: completed.length ? Math.round((goals / completed.length) * 1000) / 10 : 0
-  };
-}
-
-
 function renderDashboard(): string {
   return `<!DOCTYPE html>
 <html lang="bg">
@@ -595,28 +460,24 @@ header,.wrap,footer{max-width:920px;margin:0 auto;padding-left:20px;padding-righ
 </style>
 </head>
 <body>
-<div class="ticker"><div class="ticker-track"><span><b>● LIVE</b> HUNTER LIVE SIGNALS</span><span>STRONG · 10'–21'</span><span>HUNTER SCORE ≥ 64</span><span>15:00–23:59 SOFIA</span><span>READ ONLY · TELEGRAM SOON</span></div></div>
-<header><div class="eyebrow"><span class="live-dot"></span>LIVE · NEXT GOAL HUNTER · FREE</div><h1>Hunter <em>Free Channel</em></h1><p class="subtitle">Live football signals powered by the Next Goal Hunter system. Track every qualifying 1H signal from the 10′–21′ window with Hunter Score ≥ 64, and explore transparent daily and all-time performance.</p>
+<header><div class="eyebrow"><span class="live-dot"></span>LIVE FOOTBALL SIGNALS · NEXT GOAL HUNTER</div><h1>Next Goal <em>Hunter</em></h1><p class="subtitle">Real-time football signals powered by the Next Goal Hunter system. Follow every qualifying signal, review completed results, and explore transparent performance history day by day.</p>
 <div class="cta-row">
   <a class="cta cta-primary" href="#" aria-label="Join Free Telegram">Join Free Telegram</a>
   <a class="cta cta-secondary" href="#" aria-label="Get Premium">Get Premium</a>
-  <div class="cta-note">Telegram and Premium access links will be available soon.</div>
+  <div class="cta-note">Free Telegram and Premium access are coming soon.</div>
 </div>
-<div class="info"><b></div></header>
+</header>
 <main class="wrap">
-<div id="status" class="status">⟳ Loading на Hunter данните...</div>
-<div class="section-title"><h2>🔥 LIVE SIGNALS</h2><span id="liveCount">0 ACTIVE</span></div><div id="liveList" class="list"><div class="empty">Проверка за активни STRONG сигнали...</div></div>
-<div class="section-title"><h2>📊 STATISTICS</h2><span>STRONG FILTER</span></div><div class="period-tabs"><button class="chip active" data-days="7">7 DAYS</button><button class="chip" data-days="30">30 DAYS</button><button class="chip" data-days="120">ALL TIME</button></div>
+<div class="section-title"><h2>🔥 LIVE SIGNALS</h2><span id="liveCount">0 ACTIVE</span></div><div id="liveList" class="list"><div class="empty">Checking for live signals...</div></div>
+<div class="section-title"><h2>📊 STATISTICS</h2><span>10′–21′ · HS ≥ 64</span></div><div class="period-tabs"><button class="chip active" data-days="7">7 DAYS</button><button class="chip" data-days="30">30 DAYS</button><button class="chip" data-days="3650">ALL TIME</button></div>
 <div class="stats-grid"><div class="stat"><div class="label">Signals</div><div class="value" id="sSignals">—</div></div><div class="stat green"><div class="label">Goal</div><div class="value" id="sGoals">—</div></div><div class="stat red"><div class="label">No Goal</div><div class="value" id="sNoGoals">—</div></div><div class="stat amber"><div class="label">Success</div><div class="value" id="sSuccess">—</div></div></div>
-<div class="section-title"><h2>🗂 ARCHIVE</h2><span id="archiveMeta">BY DAY</span></div><div id="archive" class="archive"><div class="empty">Loading на архива...</div></div>
+<div class="section-title"><h2>🗂 ARCHIVE</h2><span id="archiveMeta">BY DAY</span></div><div id="archive" class="archive"><div class="empty">Loading archive...</div></div>
 </main>
 <footer>
-  <b>NEXT GOAL HUNTER</b>
-  · Live football signal tracking
-  · Main filter: 1H 0:0 · Entry 10′–21′ · Hunter Score ≥ 64
-  · Performance statistics and completed results are published transparently
-  <br><br>
-  <span>Past performance does not guarantee future results. Signals are provided for informational purposes.</span>
+  <div style="color:var(--text);font-weight:700;margin-bottom:7px">NEXT GOAL HUNTER</div>
+  <div>Real-time football signal tracking with transparent historical results.</div>
+  <div style="margin-top:6px">1H · Entry 10′–21′ · Hunter Score ≥ 64</div>
+  <div style="margin-top:12px;color:var(--muted2)">Past performance does not guarantee future results. Information shown on this website is for informational purposes only.</div>
 </footer>
 
 <script>
@@ -627,13 +488,13 @@ function isStrongWindow(item){
 
 const BASE='/free-channel';let selectedDays=7;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
-async function get(path){const r=await fetch(BASE+path,{cache:'no-store'});const t=await r.text();let d;try{d=JSON.parse(t)}catch{throw new Error('INVALID JSON')}if(!r.ok||d.success===false)throw new Error(d.error||('HTTP '+r.status));return d}
+async function get(path){const r=await fetch(BASE+path,{cache:'no-store'});const t=await r.text();let d;try{d=JSON.parse(t)}catch{throw new Error('DATA API UNAVAILABLE')}if(!r.ok||d.success===false)throw new Error(d.error||('HTTP '+r.status));return d}
 function resultText(x){if(x.result==='GOAL')return '⚽ GOAL'+(x.goal_minute!=null?' '+x.goal_minute+"'":'');if(x.result==='NO_GOAL')return 'NO GOAL';return 'TRACKING'}
 function row(x){const cls=x.result==='GOAL'?'goal':x.result==='NO_GOAL'?'no-goal':'tracking';const when=x.sofia_time?(x.sofia_time.time||'').slice(0,5):'';return '<div class="signal-row '+cls+'"><div><div class="league">'+esc(x.league||'LIVE')+'</div><div class="match">'+esc(x.match_name||'Unknown match')+'</div><div class="meta">ENTRY '+esc(x.entry_minute)+"' · "+esc(when)+' SOFIA</div></div><div class="hs">HS <b>'+esc(x.hunter_score)+'</b></div><div class="result">'+esc(resultText(x))+'</div></div>'}
-function renderLive(d){const a=d.candidates||[];document.getElementById('liveCount').textContent=a.length+' ACTIVE';document.getElementById('liveList').innerHTML=a.length?a.map(row).join(''):'<div class="empty">Няма активен STRONG сигнал в момента.</div>'}
+function renderLive(d){const a=d.candidates||[];document.getElementById('liveCount').textContent=a.length+' ACTIVE';document.getElementById('liveList').innerHTML=a.length?a.map(row).join(''):'<div class="empty">No live signals right now.</div>'}
 function groupByDay(a){const m={};for(const x of a){const k=x.sofia_time?.date||'UNKNOWN';(m[k]??=[]).push(x)}return m}
-function renderHistory(d){document.getElementById('sSignals').textContent=d.count??0;document.getElementById('sGoals').textContent=d.goals??0;document.getElementById('sNoGoals').textContent=d.no_goals??0;document.getElementById('sSuccess').textContent=d.success_pct==null?'—':d.success_pct+'%';const groups=groupByDay(d.candidates||[]);const dates=Object.keys(groups).sort().reverse();document.getElementById('archiveMeta').textContent=(selectedDays===120?'ALL TIME':selectedDays+' DAYS')+' · '+dates.length+' DAYS';document.getElementById('archive').innerHTML=dates.length?dates.map((date,i)=>{const a=groups[date],g=a.filter(x=>x.result==='GOAL').length,n=a.filter(x=>x.result==='NO_GOAL').length,c=g+n,p=c?Math.round(g/c*1000)/10:null;return '<section class="day '+(i===0?'open':'')+'"><button class="day-head"><span><span class="arrow">▸</span> '+esc(date)+'</span><span class="right">'+a.length+' SIGNALS · '+g+'G / '+n+'NG'+(p==null?'':' · '+p+'%')+'</span></button><div class="day-body">'+a.map(row).join('')+'</div></section>'}).join(''):'<div class="empty">Няма сигнали за избрания период.</div>';document.querySelectorAll('.day-head').forEach(b=>b.onclick=()=>b.parentElement.classList.toggle('open'))}
-async function refreshLive(){try{const d=await get('/candidates');renderLive(d);document.getElementById('status').className='status';document.getElementById('status').textContent='● LIVE · '+new Date().toLocaleTimeString('bg-BG',{timeZone:'Europe/Sofia'})+' SOFIA'}catch(e){document.getElementById('status').className='status error';document.getElementById('status').textContent='ERROR · '+e.message}}
+function renderHistory(d){document.getElementById('sSignals').textContent=d.count??0;document.getElementById('sGoals').textContent=d.goals??0;document.getElementById('sNoGoals').textContent=d.no_goals??0;document.getElementById('sSuccess').textContent=d.success_pct==null?'—':d.success_pct+'%';const groups=groupByDay(d.candidates||[]);const dates=Object.keys(groups).sort().reverse();document.getElementById('archiveMeta').textContent=(selectedDays===3650?'ALL TIME':selectedDays+' DAYS')+' · '+dates.length+' DAYS';document.getElementById('archive').innerHTML=dates.length?dates.map((date,i)=>{const a=groups[date],g=a.filter(x=>x.result==='GOAL').length,n=a.filter(x=>x.result==='NO_GOAL').length,c=g+n,p=c?Math.round(g/c*1000)/10:null;return '<section class="day '+(i===0?'open':'')+'"><button class="day-head"><span><span class="arrow">▸</span> '+esc(date)+'</span><span class="right">'+a.length+' SIGNALS · '+g+'G / '+n+'NG'+(p==null?'':' · '+p+'%')+'</span></button><div class="day-body">'+a.map(row).join('')+'</div></section>'}).join(''):'<div class="empty">No signals for the selected period.</div>';document.querySelectorAll('.day-head').forEach(b=>b.onclick=()=>b.parentElement.classList.toggle('open'))}
+async function refreshLive(){try{renderLive(await get('/candidates'))}catch(e){document.getElementById('liveList').innerHTML='<div class="empty error">Unable to load live signals.</div>'}}
 async function refreshHistory(){try{renderHistory(await get('/history?days='+selectedDays))}catch(e){document.getElementById('archive').innerHTML='<div class="empty">ERROR · '+esc(e.message)+'</div>'}}
 document.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));b.classList.add('active');selectedDays=Number(b.dataset.days);refreshHistory()});refreshLive();refreshHistory();setInterval(refreshLive,30000);setInterval(refreshHistory,120000);
 </script>
