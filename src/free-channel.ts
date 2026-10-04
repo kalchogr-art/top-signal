@@ -18,7 +18,7 @@
 //   GET /history?days=7
 // ============================================================
 
-const VERSION = "V1.7.1 CORRECT RANGES + COMPLETE ARCHIVE + SOFIA HOURS";
+const VERSION = "V1.8.0 PUBLIC SITE HISTORY API";
 const APP_NAME = "hunter-free-channel";
 
 const MIN_ENTRY_MINUTE = 10;
@@ -108,7 +108,7 @@ export async function handleFreeChannel(request: Request, env: Env): Promise<Res
           ? Math.max(1, Math.min(3650, Math.trunc(daysRaw)))
           : 7;
 
-        const raw = await fetchTrackerJSON(env.TRACKER, `/history?days=${days}`);
+        const raw = await fetchTrackerJSON(env.TRACKER, `/public-site-history?days=${days}`);
         const all = extractSignals(raw);
 
         const candidates = all
