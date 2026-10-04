@@ -18,7 +18,7 @@
 //   GET /history?days=7
 // ============================================================
 
-const VERSION = "V1.0.0 READ ONLY STRONG";
+const VERSION = "V1.1.0 VISUAL STRONG";
 const APP_NAME = "hunter-free-channel";
 
 const MIN_ENTRY_MINUTE = 19;
@@ -40,7 +40,11 @@ export async function handleFreeChannel(request: Request, env: Env): Promise<Res
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    if (url.pathname === "/" || url.pathname === "/status") {
+    if (url.pathname === "/" && request.method === "GET") {
+      return html(renderDashboard());
+    }
+
+    if (url.pathname === "/status" && request.method === "GET") {
       return json({
         success: true,
         worker: APP_NAME,
@@ -377,6 +381,64 @@ function numberOrNull(value: any): number | null {
 function safe(value: any): string {
   if (value === null || value === undefined) return "";
   return String(value).trim();
+}
+
+
+function renderDashboard(): string {
+  return `<!DOCTYPE html>
+<html lang="bg">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hunter Free Channel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0A1220;--panel:#101A2E;--panel2:#0B1526;--line:#1E2C48;--green:#34C77B;--green2:#1F7A4C;--amber:#F2A93B;--red:#E85D5D;--text:#E9EDF6;--muted:#8A96AE;--muted2:#566079}
+*{box-sizing:border-box}html,body{margin:0;padding:0}body{min-height:100vh;background:radial-gradient(1200px 500px at 15% -10%,rgba(52,199,123,.08),transparent 60%),radial-gradient(900px 400px at 90% 0%,rgba(242,169,59,.06),transparent 55%),var(--bg);color:var(--text);font-family:'Archivo',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.ticker{background:#050A14;border-bottom:1px solid var(--line);padding:9px 0;overflow:hidden;white-space:nowrap;position:sticky;top:0;z-index:50}.ticker-track{display:inline-block;padding-left:100%;animation:ticker 34s linear infinite;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted)}.ticker-track span{margin-right:45px}.ticker-track b{color:var(--green)}@keyframes ticker{to{transform:translateX(-100%)}}
+header,.wrap,footer{max-width:920px;margin:0 auto;padding-left:20px;padding-right:20px}header{padding-top:32px;padding-bottom:18px}.eyebrow{display:flex;align-items:center;gap:8px;margin-bottom:13px;color:var(--green);font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase}.live-dot{width:7px;height:7px;border-radius:50%;background:var(--red);animation:pulse 1.8s infinite}@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(232,93,93,.55)}70%{box-shadow:0 0 0 8px rgba(232,93,93,0)}100%{box-shadow:0 0 0 0 rgba(232,93,93,0)}}h1{margin:0 0 12px;font-family:'Archivo Black',sans-serif;font-size:clamp(30px,6vw,46px);line-height:1.02;letter-spacing:-.02em}h1 em{color:var(--green);font-style:normal}.subtitle{max-width:65ch;margin:0;color:var(--muted);font-size:14px;line-height:1.55}.info{margin-top:15px;padding:12px 14px;border:1px solid var(--line);border-left:3px solid var(--amber);border-radius:6px;background:rgba(242,169,59,.05);color:var(--muted);font-size:12px;line-height:1.55}.info b{color:var(--amber)}
+.wrap{padding-bottom:55px}.status{padding:11px 13px;border:1px solid var(--line);border-left:3px solid var(--green);border-radius:7px;background:var(--panel);color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:11px;margin-bottom:14px}.section-title{display:flex;justify-content:space-between;align-items:end;margin:22px 0 9px}.section-title h2{margin:0;font-size:15px}.section-title span{color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:9px}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.stat{padding:13px 11px;background:var(--panel);border:1px solid var(--line);border-radius:8px}.stat .label{color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:8px;text-transform:uppercase;letter-spacing:.06em}.stat .value{margin-top:6px;font-family:'Archivo Black',sans-serif;font-size:21px}.stat.green .value{color:var(--green)}.stat.red .value{color:var(--red)}.stat.amber .value{color:var(--amber)}
+.period-tabs{display:flex;gap:7px;margin:9px 0 12px;flex-wrap:wrap}.chip{border:1px solid var(--line);background:var(--panel);color:var(--muted);padding:7px 11px;border-radius:20px;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:10.5px}.chip.active{background:var(--green);border-color:var(--green);color:#07140D;font-weight:600}.list{display:flex;flex-direction:column;gap:6px}.signal-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:9px;min-height:60px;padding:10px 12px;background:var(--panel);border:1px solid var(--line);border-radius:8px;border-left:3px solid var(--amber)}.signal-row.goal{border-left-color:var(--green)}.signal-row.no-goal{border-left-color:var(--red)}.league{color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:8px;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.match{margin-top:4px;font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{margin-top:4px;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:8.5px}.hs{color:var(--amber);font-family:'IBM Plex Mono',monospace;font-size:11px;text-align:right;white-space:nowrap}.result{font-family:'Archivo Black',sans-serif;font-size:12px;text-align:right;white-space:nowrap}.goal .result{color:var(--green)}.no-goal .result{color:var(--red)}.tracking .result{color:var(--amber)}.empty{padding:24px 15px;text-align:center;color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:11px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.day{border:1px solid var(--line);border-radius:8px;background:var(--panel);overflow:hidden}.day-head{width:100%;border:0;background:transparent;color:var(--text);padding:13px 14px;display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer;font:700 13px 'Archivo',sans-serif;text-align:left}.day-head .right{color:var(--muted);font:9px 'IBM Plex Mono',monospace;white-space:nowrap}.day-body{display:none;padding:0 7px 7px}.day.open .day-body{display:flex;flex-direction:column;gap:6px}.day.open .arrow{transform:rotate(90deg)}.arrow{display:inline-block;color:var(--muted);transition:transform .15s ease}.archive{display:flex;flex-direction:column;gap:7px}.small-summary{color:var(--muted);font:9px 'IBM Plex Mono',monospace;margin-top:5px}.error{border-left-color:var(--red);color:var(--red)}footer{padding-bottom:50px;color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:9.5px;line-height:1.6}
+@media(max-width:600px){.stats-grid{grid-template-columns:repeat(2,1fr)}header{padding-top:27px}.signal-row{grid-template-columns:minmax(0,1fr) auto}.result{grid-column:2}.hs{grid-column:2}.match{font-size:11.5px}.stat .value{font-size:19px}}@media(prefers-reduced-motion:reduce){.ticker-track,.live-dot{animation:none}}
+</style>
+</head>
+<body>
+<div class="ticker"><div class="ticker-track"><span><b>● LIVE</b> HUNTER FREE CHANNEL</span><span>STRONG · 19'–20'</span><span>HUNTER SCORE ≥ 64</span><span>15:00–23:59 SOFIA</span><span>READ ONLY · TELEGRAM SOON</span></div></div>
+<header><div class="eyebrow"><span class="live-dot"></span>LIVE · NEXT GOAL HUNTER · FREE</div><h1>Hunter <em>Free Channel</em></h1><p class="subtitle">Подбрани STRONG сигнали от Next Goal Hunter. Страницата показва текущите кандидати, резултатите и историята на филтъра.</p><div class="info"><b>FREE FILTER:</b> само ENTRY 19'–20' · Hunter Score ≥ 64 · 15:00–23:59 Sofia. Резултатите GOAL / NO GOAL остават видими в архива.</div></header>
+<main class="wrap">
+<div id="status" class="status">⟳ Зареждане на Hunter данните...</div>
+<div class="section-title"><h2>🔥 LIVE SIGNALS</h2><span id="liveCount">0 ACTIVE</span></div><div id="liveList" class="list"><div class="empty">Проверка за активни STRONG сигнали...</div></div>
+<div class="section-title"><h2>📊 STATISTICS</h2><span>STRONG FILTER</span></div><div class="period-tabs"><button class="chip active" data-days="7">7 DAYS</button><button class="chip" data-days="30">30 DAYS</button><button class="chip" data-days="120">ALL TIME</button></div>
+<div class="stats-grid"><div class="stat"><div class="label">Signals</div><div class="value" id="sSignals">—</div></div><div class="stat green"><div class="label">Goal</div><div class="value" id="sGoals">—</div></div><div class="stat red"><div class="label">No Goal</div><div class="value" id="sNoGoals">—</div></div><div class="stat amber"><div class="label">Success</div><div class="value" id="sSuccess">—</div></div></div>
+<div class="section-title"><h2>🗂 ARCHIVE</h2><span id="archiveMeta">BY DAY</span></div><div id="archive" class="archive"><div class="empty">Зареждане на архива...</div></div>
+</main>
+<footer><b>HUNTER FREE CHANNEL</b> · STRONG 19'–20' · SCORE ≥64 · Europe/Sofia · данни от Goal Watch Tracker</footer>
+<script>
+const BASE='/free-channel';let selectedDays=7;
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+async function get(path){const r=await fetch(BASE+path,{cache:'no-store'});const t=await r.text();let d;try{d=JSON.parse(t)}catch{throw new Error('INVALID JSON')}if(!r.ok||d.success===false)throw new Error(d.error||('HTTP '+r.status));return d}
+function resultText(x){if(x.result==='GOAL')return '⚽ GOAL'+(x.goal_minute!=null?' '+x.goal_minute+"'":'');if(x.result==='NO_GOAL')return 'NO GOAL';return 'TRACKING'}
+function row(x){const cls=x.result==='GOAL'?'goal':x.result==='NO_GOAL'?'no-goal':'tracking';const when=x.sofia_time?(x.sofia_time.time||'').slice(0,5):'';return '<div class="signal-row '+cls+'"><div><div class="league">'+esc(x.league||'LIVE')+'</div><div class="match">'+esc(x.match_name||'Unknown match')+'</div><div class="meta">ENTRY '+esc(x.entry_minute)+"' · "+esc(when)+' SOFIA</div></div><div class="hs">HS <b>'+esc(x.hunter_score)+'</b></div><div class="result">'+esc(resultText(x))+'</div></div>'}
+function renderLive(d){const a=d.candidates||[];document.getElementById('liveCount').textContent=a.length+' ACTIVE';document.getElementById('liveList').innerHTML=a.length?a.map(row).join(''):'<div class="empty">Няма активен STRONG сигнал в момента.</div>'}
+function groupByDay(a){const m={};for(const x of a){const k=x.sofia_time?.date||'UNKNOWN';(m[k]??=[]).push(x)}return m}
+function renderHistory(d){document.getElementById('sSignals').textContent=d.count??0;document.getElementById('sGoals').textContent=d.goals??0;document.getElementById('sNoGoals').textContent=d.no_goals??0;document.getElementById('sSuccess').textContent=d.success_pct==null?'—':d.success_pct+'%';const groups=groupByDay(d.candidates||[]);const dates=Object.keys(groups).sort().reverse();document.getElementById('archiveMeta').textContent=(selectedDays===120?'ALL TIME':selectedDays+' DAYS')+' · '+dates.length+' DAYS';document.getElementById('archive').innerHTML=dates.length?dates.map((date,i)=>{const a=groups[date],g=a.filter(x=>x.result==='GOAL').length,n=a.filter(x=>x.result==='NO_GOAL').length,c=g+n,p=c?Math.round(g/c*1000)/10:null;return '<section class="day '+(i===0?'open':'')+'"><button class="day-head"><span><span class="arrow">▸</span> '+esc(date)+'</span><span class="right">'+a.length+' SIGNALS · '+g+'G / '+n+'NG'+(p==null?'':' · '+p+'%')+'</span></button><div class="day-body">'+a.map(row).join('')+'</div></section>'}).join(''):'<div class="empty">Няма сигнали за избрания период.</div>';document.querySelectorAll('.day-head').forEach(b=>b.onclick=()=>b.parentElement.classList.toggle('open'))}
+async function refreshLive(){try{const d=await get('/candidates');renderLive(d);document.getElementById('status').className='status';document.getElementById('status').textContent='● ONLINE · TRACKER CONNECTED · READ ONLY · '+new Date().toLocaleTimeString('bg-BG',{timeZone:'Europe/Sofia'})+' SOFIA'}catch(e){document.getElementById('status').className='status error';document.getElementById('status').textContent='ERROR · '+e.message}}
+async function refreshHistory(){try{renderHistory(await get('/history?days='+selectedDays))}catch(e){document.getElementById('archive').innerHTML='<div class="empty">ERROR · '+esc(e.message)+'</div>'}}
+document.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));b.classList.add('active');selectedDays=Number(b.dataset.days);refreshHistory()});refreshLive();refreshHistory();setInterval(refreshLive,30000);setInterval(refreshHistory,120000);
+</script>
+</body></html>`;
+}
+
+function html(value: string, status = 200): Response {
+  return new Response(value, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=UTF-8",
+      "cache-control": "no-store"
+    }
+  });
 }
 
 function corsHeaders() {
