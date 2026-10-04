@@ -18,7 +18,7 @@
 //   GET /history?days=7
 // ============================================================
 
-const VERSION = "V1.5.0 FULL TRACKER HISTORY PUBLIC SITE";
+const VERSION = "V1.6.0 TODAY STATS + CLOSED-DAY ARCHIVE";
 const APP_NAME = "hunter-free-channel";
 
 const MIN_ENTRY_MINUTE = 10;
@@ -469,7 +469,7 @@ header,.wrap,footer{max-width:920px;margin:0 auto;padding-left:20px;padding-righ
 </header>
 <main class="wrap">
 <div class="section-title"><h2>🔥 LIVE SIGNALS</h2><span id="liveCount">0 ACTIVE</span></div><div id="liveList" class="list"><div class="empty">Checking for live signals...</div></div>
-<div class="section-title"><h2>📊 STATISTICS</h2><span>10′–21′ · HS ≥ 64</span></div><div class="period-tabs"><button class="chip active" data-days="7">7 DAYS</button><button class="chip" data-days="30">30 DAYS</button><button class="chip" data-days="3650">ALL TIME</button></div>
+<div class="section-title"><h2>📊 STATISTICS</h2><span>10′–21′ · HS ≥ 64</span></div><div class="period-tabs"><button class="chip active" data-days="today">TODAY</button><button class="chip" data-days="7">7 DAYS</button><button class="chip" data-days="30">30 DAYS</button><button class="chip" data-days="3650">ALL TIME</button></div>
 <div class="stats-grid"><div class="stat"><div class="label">Signals</div><div class="value" id="sSignals">—</div></div><div class="stat green"><div class="label">Goal</div><div class="value" id="sGoals">—</div></div><div class="stat red"><div class="label">No Goal</div><div class="value" id="sNoGoals">—</div></div><div class="stat amber"><div class="label">Success</div><div class="value" id="sSuccess">—</div></div></div>
 <div class="section-title"><h2>🗂 ARCHIVE</h2><span id="archiveMeta">BY DAY</span></div><div id="archive" class="archive"><div class="empty">Loading archive...</div></div>
 </main>
@@ -486,7 +486,7 @@ function isStrongWindow(item){
   return minute >= 19 && minute <= 20;
 }
 
-const BASE='/free-channel';let selectedDays=7;
+const BASE='/free-channel';let selectedDays='today';
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
 async function get(path){const r=await fetch(BASE+path,{cache:'no-store'});const t=await r.text();let d;try{d=JSON.parse(t)}catch{throw new Error('DATA API UNAVAILABLE')}if(!r.ok||d.success===false)throw new Error(d.error||('HTTP '+r.status));return d}
 function resultText(x){if(x.result==='GOAL')return '⚽ GOAL'+(x.goal_minute!=null?' '+x.goal_minute+"'":'');if(x.result==='NO_GOAL')return 'NO GOAL';return 'TRACKING'}
@@ -529,3 +529,33 @@ function json(data: any, status = 200): Response {
     }
   });
 }
+function sofiaDateKey(value){
+  const d = value ? new Date(value) : new Date();
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("en-CA",{
+    timeZone:"Europe/Sofia",
+    year:"numeric",
+    month:"2-digit",
+    day:"2-digit"
+  }).format(d);
+}
+
+function todaySofiaKey(){
+  return sofiaDateKey(new Date());
+}
+
+function isTodaySofia(item){
+  const value = item?.created_at || item?.entry_at || item?.timestamp || "";
+  return sofiaDateKey(value) === todaySofiaKey();
+}
+
+function completedPreviousDaysOnly(items){
+  const today = todaySofiaKey();
+  return (Array.isArray(items) ? items : []).filter(item => {
+    const value = item?.created_at || item?.entry_at || item?.timestamp || "";
+    const key = sofiaDateKey(value);
+    return key && key < today;
+  });
+}
+
+
