@@ -18,7 +18,7 @@
 //   GET /history?days=7
 // ============================================================
 
-const VERSION = "V1.2.0 PUBLIC CHANNEL SITE";
+const VERSION = "V1.3.0 FULL FILTER PUBLIC SITE";
 const APP_NAME = "hunter-free-channel";
 
 const MIN_ENTRY_MINUTE = 19;
@@ -396,7 +396,7 @@ function renderDashboard(): string {
 <style>
 :root{--bg:#0A1220;--panel:#101A2E;--panel2:#0B1526;--line:#1E2C48;--green:#34C77B;--green2:#1F7A4C;--amber:#F2A93B;--red:#E85D5D;--text:#E9EDF6;--muted:#8A96AE;--muted2:#566079}
 *{box-sizing:border-box}html,body{margin:0;padding:0}body{min-height:100vh;background:radial-gradient(1200px 500px at 15% -10%,rgba(52,199,123,.08),transparent 60%),radial-gradient(900px 400px at 90% 0%,rgba(242,169,59,.06),transparent 55%),var(--bg);color:var(--text);font-family:'Archivo',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
-.ticker{background:#050A14;border-bottom:1px solid var(--line);padding:9px 0;overflow:hidden;white-space:nowrap;position:sticky;top:0;z-index:50}.ticker-track{display:inline-block;padding-left:100%;animation:ticker 34s linear infinite;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted)}.ticker-track span{margin-right:45px}.ticker-track b{color:var(--green)}@keyframes ticker{to{transform:translateX(-100%)}}
+.ticker{background:#050A14;border-bottom:1px solid var(--line);padding:9px 0;overflow:hidden;white-space:nowrap;position:sticky;top:0;z-index:50}.ticker-track{display:inline-block;padding-left:100%;animation:ticker 34s linear infinite;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted)}.ticker-track span{margin-right:45px}.ticker-track b{color:var(--green)}}
 header,.wrap,footer{max-width:920px;margin:0 auto;padding-left:20px;padding-right:20px}header{padding-top:32px;padding-bottom:18px}.eyebrow{display:flex;align-items:center;gap:8px;margin-bottom:13px;color:var(--green);font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase}.live-dot{width:7px;height:7px;border-radius:50%;background:var(--red);animation:pulse 1.8s infinite}@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(232,93,93,.55)}70%{box-shadow:0 0 0 8px rgba(232,93,93,0)}100%{box-shadow:0 0 0 0 rgba(232,93,93,0)}}h1{margin:0 0 12px;font-family:'Archivo Black',sans-serif;font-size:clamp(30px,6vw,46px);line-height:1.02;letter-spacing:-.02em}h1 em{color:var(--green);font-style:normal}.subtitle{max-width:65ch;margin:0;color:var(--muted);font-size:14px;line-height:1.55}.info{margin-top:15px;padding:12px 14px;border:1px solid var(--line);border-left:3px solid var(--amber);border-radius:6px;background:rgba(242,169,59,.05);color:var(--muted);font-size:12px;line-height:1.55}.info b{color:var(--amber)}
 .wrap{padding-bottom:55px}.status{padding:11px 13px;border:1px solid var(--line);border-left:3px solid var(--green);border-radius:7px;background:var(--panel);color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:11px;margin-bottom:14px}.section-title{display:flex;justify-content:space-between;align-items:end;margin:22px 0 9px}.section-title h2{margin:0;font-size:15px}.section-title span{color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:9px}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.stat{padding:13px 11px;background:var(--panel);border:1px solid var(--line);border-radius:8px}.stat .label{color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:8px;text-transform:uppercase;letter-spacing:.06em}.stat .value{margin-top:6px;font-family:'Archivo Black',sans-serif;font-size:21px}.stat.green .value{color:var(--green)}.stat.red .value{color:var(--red)}.stat.amber .value{color:var(--amber)}
 .period-tabs{display:flex;gap:7px;margin:9px 0 12px;flex-wrap:wrap}.chip{border:1px solid var(--line);background:var(--panel);color:var(--muted);padding:7px 11px;border-radius:20px;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:10.5px}.chip.active{background:var(--green);border-color:var(--green);color:#07140D;font-weight:600}.list{display:flex;flex-direction:column;gap:6px}.signal-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:9px;min-height:60px;padding:10px 12px;background:var(--panel);border:1px solid var(--line);border-radius:8px;border-left:3px solid var(--amber)}.signal-row.goal{border-left-color:var(--green)}.signal-row.no-goal{border-left-color:var(--red)}.league{color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:8px;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.match{margin-top:4px;font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{margin-top:4px;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:8.5px}.hs{color:var(--amber);font-family:'IBM Plex Mono',monospace;font-size:11px;text-align:right;white-space:nowrap}.result{font-family:'Archivo Black',sans-serif;font-size:12px;text-align:right;white-space:nowrap}.goal .result{color:var(--green)}.no-goal .result{color:var(--red)}.tracking .result{color:var(--amber)}.empty{padding:24px 15px;text-align:center;color:var(--muted2);font-family:'IBM Plex Mono',monospace;font-size:11px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
@@ -440,26 +440,56 @@ header,.wrap,footer{max-width:920px;margin:0 auto;padding-left:20px;padding-righ
   margin-top:1px;
 }
 
+
+.strong-window-badge{
+  display:inline-flex;
+  align-items:center;
+  margin-left:6px;
+  padding:3px 6px;
+  border:1px solid rgba(242,169,59,.42);
+  border-radius:4px;
+  background:rgba(242,169,59,.07);
+  color:var(--amber);
+  font-family:'IBM Plex Mono',monospace;
+  font-size:8px;
+  font-weight:700;
+  letter-spacing:.06em;
+  vertical-align:middle;
+}
+
 </style>
 </head>
 <body>
-<div class="ticker"><div class="ticker-track"><span><b>● LIVE</b> HUNTER LIVE SIGNALS</span><span>STRONG · 19'–20'</span><span>HUNTER SCORE ≥ 64</span><span>15:00–23:59 SOFIA</span><span>READ ONLY · TELEGRAM SOON</span></div></div>
-<header><div class="eyebrow"><span class="live-dot"></span>LIVE · NEXT GOAL HUNTER · FREE</div><h1>Hunter <em>Free Channel</em></h1><p class="subtitle">Live football signals powered by the Next Goal Hunter system. Follow selected opportunities in real time and explore a transparent record of completed signals and historical performance.</p>
+<div class="ticker"><div class="ticker-track"><span><b>● LIVE</b> HUNTER LIVE SIGNALS</span><span>STRONG · 10'–21'</span><span>HUNTER SCORE ≥ 64</span><span>15:00–23:59 SOFIA</span><span>READ ONLY · TELEGRAM SOON</span></div></div>
+<header><div class="eyebrow"><span class="live-dot"></span>LIVE · NEXT GOAL HUNTER · FREE</div><h1>Hunter <em>Free Channel</em></h1><p class="subtitle">Live football signals powered by the Next Goal Hunter system. Track every qualifying 1H signal from the 10′–21′ window with Hunter Score ≥ 64, and explore transparent daily and all-time performance.</p>
 <div class="cta-row">
   <a class="cta cta-primary" href="#" aria-label="Join Free Telegram">Join Free Telegram</a>
   <a class="cta cta-secondary" href="#" aria-label="Get Premium">Get Premium</a>
   <div class="cta-note">Telegram and Premium access links will be available soon.</div>
 </div>
-<div class="info"><b>FREE FILTER:</b> само ENTRY 19'–20' · Hunter Score ≥ 64 · 15:00–23:59 Sofia. Resultsте GOAL / NO GOAL остават видими в архива.</div></header>
+<div class="info"><b>FREE FILTER:</b> само ENTRY 10'–21' · Hunter Score ≥ 64 · 15:00–23:59 Sofia. Resultsте GOAL / NO GOAL остават видими в архива.</div></header>
 <main class="wrap">
-<div id="status" class="status">⟳ Зареждане на Hunter данните...</div>
+<div id="status" class="status">⟳ Loading на Hunter данните...</div>
 <div class="section-title"><h2>🔥 LIVE SIGNALS</h2><span id="liveCount">0 ACTIVE</span></div><div id="liveList" class="list"><div class="empty">Проверка за активни STRONG сигнали...</div></div>
 <div class="section-title"><h2>📊 STATISTICS</h2><span>STRONG FILTER</span></div><div class="period-tabs"><button class="chip active" data-days="7">7 DAYS</button><button class="chip" data-days="30">30 DAYS</button><button class="chip" data-days="120">ALL TIME</button></div>
 <div class="stats-grid"><div class="stat"><div class="label">Signals</div><div class="value" id="sSignals">—</div></div><div class="stat green"><div class="label">Goal</div><div class="value" id="sGoals">—</div></div><div class="stat red"><div class="label">No Goal</div><div class="value" id="sNoGoals">—</div></div><div class="stat amber"><div class="label">Success</div><div class="value" id="sSuccess">—</div></div></div>
-<div class="section-title"><h2>🗂 ARCHIVE</h2><span id="archiveMeta">BY DAY</span></div><div id="archive" class="archive"><div class="empty">Зареждане на архива...</div></div>
+<div class="section-title"><h2>🗂 ARCHIVE</h2><span id="archiveMeta">BY DAY</span></div><div id="archive" class="archive"><div class="empty">Loading на архива...</div></div>
 </main>
-<footer><b>HUNTER LIVE SIGNALS</b> · STRONG 19'–20' · SCORE ≥64 · Europe/Sofia · данни от Goal Watch Tracker</footer>
+<footer>
+  <b>NEXT GOAL HUNTER</b>
+  · Live football signal tracking
+  · Main filter: 1H 0:0 · Entry 10′–21′ · Hunter Score ≥ 64
+  · Performance statistics and completed results are published transparently
+  <br><br>
+  <span>Past performance does not guarantee future results. Signals are provided for informational purposes.</span>
+</footer>
+
 <script>
+function isStrongWindow(item){
+  const minute = Number(item?.entry_minute ?? item?.minute ?? 0);
+  return minute >= 19 && minute <= 20;
+}
+
 const BASE='/free-channel';let selectedDays=7;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
 async function get(path){const r=await fetch(BASE+path,{cache:'no-store'});const t=await r.text();let d;try{d=JSON.parse(t)}catch{throw new Error('INVALID JSON')}if(!r.ok||d.success===false)throw new Error(d.error||('HTTP '+r.status));return d}
